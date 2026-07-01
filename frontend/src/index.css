@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+/* ---- design tokens (warm & approachable) ---- */
+@theme {
+  --font-display: 'EB Garamond', Palatino, "Book Antiqua", Georgia, serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, monospace;
+
+  /* surfaces */
+  --color-bg: #f7f4ee;          /* warm paper */
+  --color-surface: #ffffff;     /* cards */
+  --color-surface-sunk: #f1ede3;/* inset wells (split bars, tracks) */
+  --color-border: #e7e0d2;      /* soft warm hairline */
+
+  /* brand */
+  --color-accent: #5f8b6a;      /* sage green */
+  --color-accent-deep: #3f6b50; /* text-on-light green */
+  --color-accent-soft: #e8efe6; /* tinted green wash */
+
+  /* text (semantic names kept for backwards compat) */
+  --color-near-black: #2b2a26;  /* headings / hero numbers */
+  --color-text: #57534c;        /* body */
+  --color-gray-mid: #7c766c;    /* secondary */
+  --color-gray-tertiary: #9a948a;/* muted labels / units */
+
+  /* heat ramp (occupancy heatmap) */
+  --color-heat: #e58a3c;        /* warm amber */
+  --color-heat-hot: #d5513a;    /* terracotta */
+  --color-warn: #d98236;        /* nudges / attention */
+
+  --animate-fade-slide-in: fade-slide-in 0.6s ease-out both;
+  --animate-shimmer: shimmer 1.8s ease-in-out infinite;
+}
+
+@keyframes fade-slide-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes shimmer {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
+/* ---- base ---- */
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+::selection { background: #5f8b6a33; }
+
+/* soft, seamless default corners; individual components can override */
+:root { --radius: 14px; }

@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# --- IDE / OS ---
+.DS_Store
+.idea/
+.vscode/
+
+# --- Cownting data & artifacts (videos, frames, overlays, orthophoto, duckdb, ---
+# --- calibration): moved out-of-band, never via git ---
+data/
+*.duckdb
+*.duckdb.wal
+*.mp4
+*.MP4
+
+# --- Model weights & checkpoints (downloaded per-machine) ---
+*.pt
+*.onnx
+# SAM2 checkpoints for grounded_sam2
+checkpoints/
+# SAM2 hydra configs (NOT the app's config/ dir)
+configs/
+
+# --- Fine-tune / labeling pipeline outputs (also under data/, kept explicit) ---
+# ultralytics training runs (weights, plots, logs)
+runs/
+data/finetune/
+data/labeling/
+.fiftyone/
+wandb/
+
+# --- Frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# --- Local, machine-specific config (cownting.example.yaml stays tracked) ---
+config/cownting.yaml

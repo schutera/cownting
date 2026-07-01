@@ -1,0 +1,70 @@
+project: cownting
+
+# Start with a single camera. Add more entries later (camera_id is generic everywhere).
+cameras:
+  - id: camera_01
+    video: data/videos/camera_01.mp4
+    start: "2026-06-01T08:00:00"   # ISO time of frame 0; omit to use the file's mtime
+
+ingest:
+  target_fps: 1.0                  # frames/sec sampled from the video (1-3 is plenty)
+  time_bin_seconds: 2.0            # cross-camera alignment bin (matters once >1 camera)
+  save_frames: true                # write sampled frames to artifacts (needed for the seg view)
+
+detect:
+  backend: yolo                    # yolo | grounded_sam2
+  device: auto                     # auto -> cuda | mps | cpu
+  conf: 0.25
+  # --- yolo backend ---
+  yolo_weights: yolo11x-seg.pt     # auto-downloads on first use; runtime doesn't matter
+  class_names: [cow]               # COCO classes to keep
+  # --- grounded_sam2 backend (open-vocabulary zero-shot) ---
+  dino_model_id: IDEA-Research/grounding-dino-tiny
+  sam2_cfg: configs/sam2.1/sam2.1_hiera_s.yaml
+  sam2_checkpoint: checkpoints/sam2.1_hiera_small.pt
+  prompt: "cow."
+  box_threshold: 0.3
+  text_threshold: 0.25
+
+posture:
+  enabled: true
+  lying_elongation: 1.9            # minAreaRect major/minor >= this => 'lying' (coarse proxy)
+
+# --- Stage 1b: fine-tune / re-label loop (bootstrap -> CVAT correct -> train) ---
+label:                             # `cownting label-select` + `label-export`
+  workspace: data/labeling
+  n_select: 150                    # frames to hand-correct in CVAT
+  exclude_blind: true              # drop frames the quality gate tagged blind/dark
+  seed: 0
+  bootstrap_backend: grounded_sam2 # open-vocab labeler that seeds the masks
+  cvat_url: http://localhost:8080
+  anno_key: cownting_stage1b       # FiftyOne annotation-run key (push + pull)
+  label_field: cows
+
+finetune:                          # `cownting train` + `eval-detect`
+  dataset_dir: data/finetune/dataset
+  runs_dir: runs/finetune
+  run_name: cownting
+  base_weights: yolo11m-seg.pt     # start point; auto-downloads if absent
+  weights_out: data/finetune/cownting-seg.pt   # promoted best.pt -> set detect.yolo_weights to this
+  epochs: 100
+  imgsz: 1280                      # match inference resolution
+  batch: 4                         # bump on a bigger GPU
+  freeze: 0                        # backbone layers to freeze (0 = full fine-tune)
+  patience: 20
+  val_fraction: 0.2
+  split_by_time_block: true        # keep near-duplicate minutes out of the val set
+
+shade:
+  enabled: false                   # Stage 3 (observed-from-imagery); off in this build
+
+flags:
+  within_camera_tracking: false    # Stage 3 (motion/bouts)
+  global_reid: false               # Stage 4 (cross-camera/day identity)
+  pose_enabled: false              # Stage 4 (head-down grazing / lameness)
+
+paths:
+  artifacts_dir: data/artifacts
+  db_path: data/cownting.duckdb
+  calibration: data/calibration.json
+  orthophoto: null                 # path to a top-down site image; needed for the heatmap view

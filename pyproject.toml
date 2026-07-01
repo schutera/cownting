@@ -1,0 +1,35 @@
+[project]
+name = "cownting"
+version = "0.1.0"
+description = "Offline cow / solar-field analysis pipeline (segmentation + spatial mapping)"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+packages = [
+    "cownting",
+    "cownting.detect",
+    "cownting.ingest",
+    "cownting.calib",
+    "cownting.eval",
+    "cownting.app",
+    "cownting.scene",
+    "cownting.finetune",
+]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[project.optional-dependencies]
+# Open-vocabulary bootstrap labeler + annotation round-trip (Stage 1b).
+# sam2 is not on PyPI — install it separately (see docs/SETUP_WINDOWS.md).
+label = ["fiftyone>=1.0", "transformers>=4.41"]
+# Fine-tuning uses the core ultralytics dep; this pulls plotting/eval extras.
+finetune = ["matplotlib>=3.7"]
+
+[project.scripts]
+cownting = "cownting.cli:app"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

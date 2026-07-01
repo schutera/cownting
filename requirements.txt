@@ -1,0 +1,16 @@
+# Core (Stage 1 + 2 run on Apple Silicon / MPS, CUDA, or CPU)
+ultralytics>=8.3        # YOLO11-seg backend (default); pulls torch/torchvision
+duckdb>=1.0             # embedded analytics store
+dash>=2.16             # dashboard
+plotly>=5.20
+pandas>=2.0
+numpy>=1.26
+opencv-python>=4.9
+pillow>=10.0
+pydantic>=2.6
+pyyaml>=6.0
+typer>=0.12
+
+# Optional: grounded_sam2 backend (open-vocabulary zero-shot). Install only if used.
+# transformers>=4.41          # Grounding-DINO
+# git+https://github.com/facebookresearch/sam2.git   # SAM2 (also needs its checkpoints)
