@@ -18,6 +18,11 @@ class IngestCfg(BaseModel):
     target_fps: float = 1.0
     time_bin_seconds: float = 2.0
     save_frames: bool = True
+    # Time-lapse support. When set, each *sampled* frame advances real capture
+    # time by this many seconds (a Brinno grabs 1 frame/minute -> 60.0), so the
+    # per-frame timestamp is start + frame_idx * frame_interval_seconds. When
+    # None (default), timestamps use real-time playback: start + frame_idx / video_fps.
+    frame_interval_seconds: Optional[float] = None
 
 
 class DetectCfg(BaseModel):
@@ -42,19 +47,10 @@ class PostureCfg(BaseModel):
     lying_elongation: float = 1.9
 
 
-class QualityCfg(BaseModel):
-    enabled: bool = True
-    skip_blind_in_segment: bool = False      # default: still RUN detection on hazy frames
-    dark_brightness: float = 40.0            # mean V below -> 'dark' (night)
-    blind_lap_var: float = 10.0              # Laplacian variance below -> lens too occluded to trust a 0
-    roi: List[float] = Field(default_factory=lambda: [0.15, 0.35, 0.9, 0.7])  # x1,y1,x2,y2 fractions
-
-
 class LabelCfg(BaseModel):
     """Stage 1b: bootstrap-label selection + CVAT annotation round-trip."""
     workspace: str = "data/labeling"         # selections + export staging live here
     n_select: int = 150                      # frames to hand-correct
-    exclude_blind: bool = True               # drop frames the quality gate tagged blind/dark
     seed: int = 0                            # deterministic stratified sample
     # Grounded-SAM2 is the bootstrap labeler (see docs/SETUP_WINDOWS.md for install).
     bootstrap_backend: Literal["grounded_sam2", "yolo"] = "grounded_sam2"
@@ -80,8 +76,15 @@ class FinetuneCfg(BaseModel):
     split_by_time_block: bool = True              # avoid near-duplicate minutes leaking train->val
 
 
+class CalibCfg(BaseModel):
+    """3-stage warp calibration site defaults (per-camera values live in calibration.json)."""
+    h_center: Optional[float] = None     # panel-center / torque-tube height (m); optional size cue
+
+
 class ShadeCfg(BaseModel):
     enabled: bool = False
+    margin_px: float = 0.0  # px a ground point must sit inside a footprint edge to count as
+                            # sheltering; within it = boundary/uncertain (configurable)
 
 
 class FlagsCfg(BaseModel):
@@ -94,6 +97,9 @@ class PathsCfg(BaseModel):
     artifacts_dir: str = "data/artifacts"
     db_path: str = "data/cownting.duckdb"
     calibration: str = "data/calibration.json"
+    fence: str = "data/fence.json"               # site-wide cow-enclosure polygon (ortho px)
+    tiepoints: str = "data/tiepoints.json"       # cross-camera shared ground points (joint calib)
+    panels: str = "data/panels.json"             # solar-panel ground footprints (ortho + per-camera px)
     orthophoto: Optional[str] = None
 
 
@@ -103,9 +109,9 @@ class Config(BaseModel):
     ingest: IngestCfg = Field(default_factory=IngestCfg)
     detect: DetectCfg = Field(default_factory=DetectCfg)
     posture: PostureCfg = Field(default_factory=PostureCfg)
-    quality: QualityCfg = Field(default_factory=QualityCfg)
     label: LabelCfg = Field(default_factory=LabelCfg)
     finetune: FinetuneCfg = Field(default_factory=FinetuneCfg)
+    calib: CalibCfg = Field(default_factory=CalibCfg)
     shade: ShadeCfg = Field(default_factory=ShadeCfg)
     flags: FlagsCfg = Field(default_factory=FlagsCfg)
     paths: PathsCfg = Field(default_factory=PathsCfg)

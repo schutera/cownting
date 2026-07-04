@@ -1,7 +1,8 @@
 import type { Kpis } from "../lib/types";
 import { Panel, Stat, SplitBar } from "./ui";
-import { REST_COLOR, ACTIVE_COLOR } from "../lib/palette";
+import { REST_COLOR, ACTIVE_COLOR, SHELTER_COLOR, OPEN_COLOR } from "../lib/palette";
 import MiniTrend from "./MiniTrend";
+import ShelterTrend from "./ShelterTrend";
 
 function Rule() {
   return <div className="h-px bg-border my-5" />;
@@ -15,13 +16,17 @@ export default function KpiPanel({
   kpis,
   camera,
   trunc,
+  postureEnabled = true,
 }: {
   kpis: Kpis;
   camera: string;
   trunc: string;
+  postureEnabled?: boolean;
 }) {
   const resting = Math.round(kpis.pct_lying);
   const active = Math.max(0, 100 - resting);
+  const sheltering = Math.round(kpis.pct_sheltering);
+  const open = Math.max(0, 100 - sheltering);
 
   return (
     <Panel className="lg:sticky lg:top-24">
@@ -45,20 +50,43 @@ export default function KpiPanel({
         accent="var(--color-accent-deep)"
       />
 
+      {postureEnabled && (
+        <>
+          <Rule />
+
+          <div>
+            <div className="text-[13px] text-gray-mid mb-2.5">Resting vs. active</div>
+            <SplitBar fraction={resting / 100} leftColor={REST_COLOR} rightColor={ACTIVE_COLOR} />
+            <div className="flex items-center justify-between mt-2.5 text-[13px]">
+              <span className="flex items-center gap-1.5 text-gray-mid">
+                <Dot color={REST_COLOR} /> {resting}% resting
+              </span>
+              <span className="flex items-center gap-1.5 text-gray-mid">
+                {active}% active <Dot color={ACTIVE_COLOR} />
+              </span>
+            </div>
+          </div>
+        </>
+      )}
+
       <Rule />
 
       <div>
-        <div className="text-[13px] text-gray-mid mb-2.5">Resting vs. active</div>
-        <SplitBar fraction={resting / 100} leftColor={REST_COLOR} rightColor={ACTIVE_COLOR} />
+        <div className="text-[13px] text-gray-mid mb-2.5">Under panels vs. open</div>
+        <SplitBar fraction={sheltering / 100} leftColor={SHELTER_COLOR} rightColor={OPEN_COLOR} />
         <div className="flex items-center justify-between mt-2.5 text-[13px]">
           <span className="flex items-center gap-1.5 text-gray-mid">
-            <Dot color={REST_COLOR} /> {resting}% resting
+            <Dot color={SHELTER_COLOR} /> {sheltering}% sheltering
           </span>
           <span className="flex items-center gap-1.5 text-gray-mid">
-            {active}% active <Dot color={ACTIVE_COLOR} />
+            {open}% in the open <Dot color={OPEN_COLOR} />
           </span>
         </div>
       </div>
+
+      <Rule />
+
+      <ShelterTrend camera={camera} trunc={trunc} />
 
       <Rule />
 
@@ -68,8 +96,7 @@ export default function KpiPanel({
 
       <div className="text-[12px] text-gray-tertiary leading-relaxed">
         <div>
-          <span className="text-gray-mid">{kpis.valid_frames.toLocaleString()}</span> clear ·{" "}
-          <span className="text-gray-mid">{kpis.blind_frames.toLocaleString()}</span> unclear frames
+          <span className="text-gray-mid">{kpis.valid_frames.toLocaleString()}</span> clear frames
         </div>
         <div>
           <span className="text-gray-mid">{Math.round(kpis.pct_localized)}%</span> placed on the map

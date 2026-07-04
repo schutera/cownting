@@ -4,15 +4,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import cv2
+import numpy as np
 import pandas as pd
 
 from . import db
-from .calib import load_all, project_points
+from .calib import apply_transform, clip_to_extent, load_all, resolve_model
 from .config import Config
 from .detect import build_segmenter
 from .detect.overlay import render_overlay
 from .ingest import index_video
-from .scene.quality import assess_quality as _assess_frame
 
 
 def ingest(config: Config) -> int:
@@ -29,32 +29,6 @@ def ingest(config: Config) -> int:
     return total
 
 
-def assess_quality(config: Config) -> dict:
-    """Classify every frame (ok / foggy / dark) and store it in frame_quality.
-
-    Empty frames stay 'ok' — they are valid occupancy=0 measurements.
-    """
-    con = db.connect(config.paths.db_path)
-    db.init_db(con)
-    frames = db.all_frames(con)
-    if frames.empty:
-        con.close()
-        print("[quality] no frames — run ingest first")
-        return {}
-
-    rows = []
-    for _, fr in frames.iterrows():
-        img = cv2.imread(fr["frame_path"])
-        q = "missing" if img is None else _assess_frame(img, config.quality)[0]
-        rows.append(dict(camera_id=fr["camera_id"], frame_idx=int(fr["frame_idx"]), frame_quality=q))
-    dfq = pd.DataFrame(rows)
-    db.update_frame_quality(con, dfq)
-    con.close()
-    breakdown = dfq["frame_quality"].value_counts().to_dict()
-    print("[quality]", breakdown)
-    return breakdown
-
-
 def segment(config: Config, limit: int | None = None) -> int:
     """Run the segmenter on unprocessed frames; write detections + overlays.
 
@@ -64,8 +38,7 @@ def segment(config: Config, limit: int | None = None) -> int:
     con = db.connect(config.paths.db_path)
     db.init_db(con)
 
-    skip_blind = config.quality.enabled and config.quality.skip_blind_in_segment
-    pending = db.unprocessed_frames(con, skip_blind=skip_blind)
+    pending = db.unprocessed_frames(con)
     if limit:
         pending = pending.head(limit)
     if pending.empty:
@@ -96,8 +69,13 @@ def segment(config: Config, limit: int | None = None) -> int:
             )
             cam_cal = calib.get(fr["camera_id"])
             if cam_cal:
-                wx, wy = project_points(cam_cal["H"], [inst.ground_px])[0]
-                row["world_x"], row["world_y"] = float(wx), float(wy)
+                try:
+                    model = resolve_model(cam_cal)
+                    wx, wy = apply_transform(model, [inst.ground_px])[0]
+                    if np.isfinite(wx) and np.isfinite(wy):
+                        row["world_x"], row["world_y"] = float(wx), float(wy)
+                except Exception:  # noqa: BLE001 - a bad/legacy calib entry must not kill segmentation
+                    pass
             rows.append(row)
 
         if rows:
@@ -115,26 +93,70 @@ def segment(config: Config, limit: int | None = None) -> int:
 
 def localize(config: Config) -> int:
     """(Re)project every detection's ground point through the current calibration."""
+    from .calib.fence import load_fence, point_in_polygon
+
     con = db.connect(config.paths.db_path)
     calib = load_all(config.paths.calibration)
+    fence = load_fence(config.paths.fence)  # site-wide enclosure polygon (ortho px) or None
     if not calib:
-        print("[localize] no calibration found — run the Calibration tab first")
-        con.close()
-        return 0
+        # Don't early-return: the shelter/panel block below is calibration-free
+        # (image-space, per camera), so it must still run when only panels are drawn
+        # — the whole point of panels is that the cow→ortho calibration is unreliable.
+        # An empty `calib` makes the world loop a harmless no-op.
+        print("[localize] no calibration found — world coords skipped; shelter still runs")
 
     updated = 0
     for camera_id, cam_cal in calib.items():
+        try:
+            model = resolve_model(cam_cal)
+        except Exception:  # noqa: BLE001 - skip cameras with a broken/legacy-less entry
+            continue
         dets = con.execute(
             "SELECT detection_id, ground_px_x, ground_px_y FROM detections WHERE camera_id = ?",
             [camera_id],
         ).df()
         if dets.empty:
             continue
-        world = project_points(cam_cal["H"], dets[["ground_px_x", "ground_px_y"]].to_numpy())
-        dets["world_x"] = world[:, 0]
-        dets["world_y"] = world[:, 1]
+        world = apply_transform(model, dets[["ground_px_x", "ground_px_y"]].to_numpy())
+        extent = model.get("ortho_extent")
+        if extent is not None:
+            world = clip_to_extent(world, extent)
+        if fence is not None:
+            # Drop anything outside the cow enclosure (physical bound).
+            world[~point_in_polygon(world, fence)] = np.nan
+        # Out-of-hull / undistort-blowup points are non-finite; store as SQL NULL
+        # (not NaN), so the heatmap's `world_x IS NOT NULL` filter drops them.
+        wx = [float(v) if np.isfinite(v) else None for v in world[:, 0]]
+        wy = [float(v) if np.isfinite(v) else None for v in world[:, 1]]
+        dets["world_x"] = pd.array(wx, dtype=object)
+        dets["world_y"] = pd.array(wy, dtype=object)
         db.update_world(con, dets)
         updated += len(dets)
+
+    # Shelter (panel) assignment — image-space & per-camera, so it is INDEPENDENT of
+    # world_x/fence: compute for EVERY detection of a camera that has drawn footprints.
+    from .scene.panels import assign_panels, camera_panels, load_panels
+
+    panels = load_panels(config.paths.panels)
+    if panels is not None:
+        for camera_id in panels.get("cameras", {}):
+            if not camera_panels(panels, camera_id):
+                continue
+            sdets = con.execute(
+                "SELECT detection_id, ground_px_x, ground_px_y FROM detections WHERE camera_id = ?",
+                [camera_id],
+            ).df()
+            if sdets.empty:
+                continue
+            res = assign_panels(
+                sdets[["ground_px_x", "ground_px_y"]].to_numpy(),
+                camera_id, panels, config.shade.margin_px,
+            )
+            sdets["under_panel"] = pd.array(res["under_panel"], dtype=object)
+            sdets["near_infra"] = pd.array(res["boundary"], dtype=object)
+            sdets["panel_id"] = pd.array(res["panel_id"], dtype=object)
+            db.update_shelter(con, sdets)
+
     print(f"[localize] updated {updated} detections")
     con.close()
     return updated

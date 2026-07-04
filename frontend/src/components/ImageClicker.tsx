@@ -19,6 +19,14 @@ function clamp(v: number, lo: number, hi: number) {
  *
  * Placed markers keep a constant on-screen size regardless of zoom so precise
  * placement stays readable when zoomed in.
+ *
+ * Two modes:
+ * - "point" (default): every click calls `onPlace` with a natural-px point.
+ *   `points` are rendered as numbered markers. This is the existing API.
+ * - "polyline": every click calls `onPlace` to append a vertex to the *current*
+ *   line. Pass the finished lines via `lines` (each a list of natural-px pts)
+ *   and the in-progress vertices via `points`; both are drawn as connected
+ *   overlays with dots at each vertex.
  */
 export function ImageClicker({
   src,
@@ -29,6 +37,9 @@ export function ImageClicker({
   interactive = true,
   activeIndex,
   title,
+  mode = "point",
+  lines,
+  closed = false,
 }: {
   src: string;
   naturalWidth: number;
@@ -38,6 +49,9 @@ export function ImageClicker({
   interactive?: boolean;
   activeIndex?: number;
   title?: string;
+  mode?: "point" | "polyline";
+  lines?: number[][][]; // finished polylines (natural px), drawn behind `points`
+  closed?: boolean; // polyline mode: draw the current `points` and every guide `line` as closed rings
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -145,7 +159,12 @@ export function ImageClicker({
         <div className="mb-2 flex items-center justify-between">
           <SectionLabel>{title}</SectionLabel>
           <span className="font-mono text-[10px] text-gray-tertiary">
-            scroll to zoom · drag to pan{interactive ? " · click to place" : ""}
+            scroll to zoom · drag to pan
+            {interactive
+              ? mode === "polyline"
+                ? " · click to add vertices"
+                : " · click to place"
+              : ""}
           </span>
         </div>
       ) : null}
@@ -178,34 +197,115 @@ export function ImageClicker({
           }}
         >
           <img ref={imgRef} src={src} className="w-full block" draggable={false} />
-          <div className="absolute inset-0 pointer-events-none">
-            {points.map((p, i) => (
-              <div
-                key={i}
-                className="absolute"
-                style={{
-                  left: `${(p[0] / naturalWidth) * 100}%`,
-                  top: `${(p[1] / naturalHeight) * 100}%`,
-                  transform: `translate(-50%, -50%) scale(${invScale})`,
-                  transformOrigin: "center",
-                }}
+          {mode === "polyline" ? (
+            <div className="absolute inset-0 pointer-events-none">
+              {/* Connecting segments — SVG in natural-px viewBox so lines track
+                  the image at any zoom. Vector stroke is not scaled by the DOM
+                  transform, so counter-scale the width to keep it thin. */}
+              <svg
+                className="absolute inset-0 w-full h-full"
+                viewBox={`0 0 ${naturalWidth} ${naturalHeight}`}
+                preserveAspectRatio="none"
               >
+                {(lines ?? []).map((ln, li) =>
+                  ln.length >= 2 ? (
+                    // In polygon mode (`closed`), guide rings are stored open
+                    // (first != last), so append the first corner to draw the
+                    // closing edge; open polylines (fence/ground) stay open.
+                    <polyline
+                      key={li}
+                      points={(closed && ln.length >= 3 ? [...ln, ln[0]] : ln)
+                        .map((p) => `${p[0]},${p[1]}`)
+                        .join(" ")}
+                      fill="none"
+                      stroke={CHART_PRIMARY}
+                      strokeWidth={2 * invScale}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ) : null,
+                )}
+                {closed && points.length >= 3 ? (
+                  <polygon
+                    points={points.map((p) => `${p[0]},${p[1]}`).join(" ")}
+                    fill="#e76f51"
+                    fillOpacity={0.12}
+                    stroke="#e76f51"
+                    strokeWidth={2 * invScale}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                ) : points.length >= 2 ? (
+                  <polyline
+                    points={points.map((p) => `${p[0]},${p[1]}`).join(" ")}
+                    fill="none"
+                    stroke="#e76f51"
+                    strokeWidth={2 * invScale}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                ) : null}
+              </svg>
+              {/* Finished-line vertices (small sage dots). */}
+              {(lines ?? []).flatMap((ln, li) =>
+                ln.map((p, pi) => (
+                  <div
+                    key={`f-${li}-${pi}`}
+                    className="absolute"
+                    style={{
+                      left: `${(p[0] / naturalWidth) * 100}%`,
+                      top: `${(p[1] / naturalHeight) * 100}%`,
+                      transform: `translate(-50%, -50%) scale(${invScale})`,
+                      transformOrigin: "center",
+                    }}
+                  >
+                    <div style={vertexStyle(false)} />
+                  </div>
+                )),
+              )}
+              {/* Current line vertices (accent dots). */}
+              {points.map((p, i) => (
                 <div
-                  className="absolute font-mono text-[11px] text-near-black"
+                  key={`c-${i}`}
+                  className="absolute"
                   style={{
-                    left: "50%",
-                    bottom: "100%",
-                    transform: "translateX(-50%)",
-                    marginBottom: 3,
-                    lineHeight: 1,
+                    left: `${(p[0] / naturalWidth) * 100}%`,
+                    top: `${(p[1] / naturalHeight) * 100}%`,
+                    transform: `translate(-50%, -50%) scale(${invScale})`,
+                    transformOrigin: "center",
                   }}
                 >
-                  {i + 1}
+                  <div style={vertexStyle(true)} />
                 </div>
-                <div style={markerStyle(i === activeIndex)} />
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <div className="absolute inset-0 pointer-events-none">
+              {points.map((p, i) => (
+                <div
+                  key={i}
+                  className="absolute"
+                  style={{
+                    left: `${(p[0] / naturalWidth) * 100}%`,
+                    top: `${(p[1] / naturalHeight) * 100}%`,
+                    transform: `translate(-50%, -50%) scale(${invScale})`,
+                    transformOrigin: "center",
+                  }}
+                >
+                  <div
+                    className="absolute font-mono text-[11px] text-near-black"
+                    style={{
+                      left: "50%",
+                      bottom: "100%",
+                      transform: "translateX(-50%)",
+                      marginBottom: 3,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {i + 1}
+                  </div>
+                  <div style={markerStyle(i === activeIndex)} />
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {zoomed ? (
@@ -231,5 +331,16 @@ function markerStyle(active: boolean): CSSProperties {
     border: `2px solid ${active ? "#fff" : "#05261a"}`,
     borderRadius: "9999px",
     boxShadow: active ? "0 0 0 2px #e76f51" : "none",
+  };
+}
+
+// Small vertex dot for polyline mode. `current` = the line being drawn.
+function vertexStyle(current: boolean): CSSProperties {
+  return {
+    width: 7,
+    height: 7,
+    background: current ? "#e76f51" : CHART_PRIMARY,
+    border: "1.5px solid #fff",
+    borderRadius: "9999px",
   };
 }

@@ -41,7 +41,6 @@ detector is **YOLO11-seg** (COCO `cow`) on `device: auto` (→ MPS here).
 
 ```bash
 python -m cownting.cli ingest        # decode video → timestamped frames
-python -m cownting.cli quality       # flag blind (lens-occluded) frames
 python -m cownting.cli segment       # segment cows → detections + overlays
 python -m cownting.cli kpis          # quick summary
 python -m cownting.cli serve         # React app + API at http://127.0.0.1:8000
@@ -76,6 +75,15 @@ For the **heatmap**: set `paths.orthophoto` to a top-down site image, open the
 python -m cownting.cli localize      # project detections onto the orthophoto
 ```
 
+**Panel shelter (agrivoltaics).** In the **Calibration** tab's camera + ortho
+views, trace each solar panel's **ground footprint**. A cow counts as
+*sheltering* when its ground-contact point falls inside a footprint (image-space,
+calibration-free; `shade.margin_px` sets the boundary/uncertain band). This drives
+the **"Under panels"** KPI (`pct_sheltering`) and a shelter-vs-time-of-day trend,
+and the footprints double as height-0 ground anchors for per-camera and joint
+calibration. Panel/shadow *segmentation* and the sun-dependent *moving* shade map
+are still future (see `futurework.md`).
+
 (After `pip install -e .` the commands are just `cownting ingest`, etc.)
 
 ## Backends
@@ -109,10 +117,11 @@ Promote by pointing `detect.yolo_weights` at the new `.pt`, then re-run
 `segment` + `spotcheck` to confirm count MAE actually improved.
 
 ## What's deliberately not here yet
-Tracking/identity, pose (head-down grazing / lameness), shade-from-imagery,
-multi-camera fusion. All reserved in the schema and config flags, none built.
+Tracking/identity, pose (head-down grazing / lameness), panel/shadow segmentation
+and the sun-dependent *moving* shade map (static panel footprints ship; see above),
+multi-camera fusion. All reserved in the schema and config flags.
 
-## Quality check
+## Spot-check
 Produce a small `frame_path,manual_count` CSV and run
 `python -m cownting.cli spotcheck manual.csv` to see count MAE/bias — that tells
 you whether the zero-shot detector is good enough or you should fine-tune.

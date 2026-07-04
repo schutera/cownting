@@ -52,14 +52,6 @@ def ingest(config: str = CONFIG_OPT):
 
 
 @app.command()
-def quality(config: str = CONFIG_OPT):
-    """Classify each frame (ok/foggy/dark) so bad-optics frames leave the analytics."""
-    from .pipeline import assess_quality as run
-
-    run(_load(config))
-
-
-@app.command()
 def segment(config: str = CONFIG_OPT, limit: int = typer.Option(None, help="Only process N frames.")):
     """Run instance segmentation over unprocessed frames."""
     from .pipeline import segment as run

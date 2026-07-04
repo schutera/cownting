@@ -20,7 +20,13 @@ def _start_time(cam: CameraCfg) -> datetime:
 def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str) -> pd.DataFrame:
     """Sample frames, write them to artifacts, and return the frame index rows.
 
-    Per-frame timestamp = start + frame_idx / video_fps.
+    Per-frame timestamp:
+      * time-lapse (ingest.frame_interval_seconds set): start + frame_idx * frame_interval_seconds
+        — each captured frame is one interval of real time apart (e.g. a Brinno at
+        1 frame/minute -> 60.0), so 480 frames span 8 h, not the video's runtime.
+      * real-time video (frame_interval_seconds is None): start + frame_idx / video_fps.
+
+    `start` is the real capture start (CameraCfg.start when provided, else file mtime).
     """
     if not Path(cam.video).exists():
         raise FileNotFoundError(cam.video)
@@ -43,7 +49,12 @@ def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str) -> pd
             ok, frame = cap.retrieve()
             if not ok:
                 break
-            ts = start + timedelta(seconds=idx / vfps)
+            if ingest_cfg.frame_interval_seconds is not None:
+                # Time-lapse: idx is the raw capture number, so real time advances
+                # one interval per frame (independent of the file's playback fps).
+                ts = start + timedelta(seconds=idx * ingest_cfg.frame_interval_seconds)
+            else:
+                ts = start + timedelta(seconds=idx / vfps)
             frame_path = ""
             if ingest_cfg.save_frames:
                 frame_path = str(out_dir / f"{idx:08d}.jpg")

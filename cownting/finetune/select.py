@@ -25,16 +25,15 @@ _TIER_LABELS = ["empty", "low", "mid", "high"]
 
 
 def _frame_stats(config: Config) -> pd.DataFrame:
-    """One row per frame: quality + how many cows the zero-shot pass found."""
+    """One row per frame: how many cows the zero-shot pass found."""
     con = db.connect(config.paths.db_path, read_only=True)
     df = con.execute(
         """
         SELECT f.camera_id, f.frame_idx, f.ts, f.frame_path,
-               coalesce(f.frame_quality, 'ok')        AS quality,
                count(d.detection_id)                  AS n_det
         FROM frames f
         LEFT JOIN detections d ON d.frame_path = f.frame_path
-        GROUP BY 1, 2, 3, 4, 5
+        GROUP BY 1, 2, 3, 4
         ORDER BY f.camera_id, f.frame_idx
         """
     ).df()
@@ -48,11 +47,6 @@ def select_frames(config: Config) -> pd.DataFrame:
     df = _frame_stats(config)
     if df.empty:
         raise RuntimeError("no frames in the DB — run `cownting ingest` (and `segment`) first")
-
-    if cfg.exclude_blind:
-        df = df[~df["quality"].isin(["blind", "dark", "missing"])].copy()
-    if df.empty:
-        raise RuntimeError("every frame was excluded as blind/dark — relax label.exclude_blind")
 
     df["hour"] = pd.to_datetime(df["ts"]).dt.hour
     df["det_tier"] = pd.cut(df["n_det"], bins=_TIER_BINS, labels=_TIER_LABELS)

@@ -249,7 +249,6 @@ def _register_callbacks(app: Dash, config: Config) -> None:
             _kpi(k["valid_frames"], "valid frames"),
             _kpi(k["cows_per_frame"], "cows / valid frame", "alt"),
             _kpi(f"{k['pct_lying']}%", "lying"),
-            _kpi(k["blind_frames"], "blind frames", "warn"),
             _kpi(f"{k['pct_localized']}%", "localized"),
         ]
         if not cam:
