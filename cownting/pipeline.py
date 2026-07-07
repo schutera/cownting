@@ -4,15 +4,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import cv2
-import numpy as np
 import pandas as pd
 
 from . import db
-from .calib import apply_transform, clip_to_extent, load_all, resolve_model
 from .config import Config
 from .detect import build_segmenter
 from .detect.overlay import render_overlay
 from .ingest import index_video
+from .scene.regions import assign_regions, load_count_areas
 
 
 def ingest(config: Config) -> int:
@@ -32,8 +31,7 @@ def ingest(config: Config) -> int:
 def segment(config: Config, limit: int | None = None) -> int:
     """Run the segmenter on unprocessed frames; write detections + overlays.
 
-    If calibration already exists, world coords are filled at the same time;
-    otherwise run `localize` after calibrating.
+    Region assignment happens later in `localize`.
     """
     con = db.connect(config.paths.db_path)
     db.init_db(con)
@@ -47,7 +45,6 @@ def segment(config: Config, limit: int | None = None) -> int:
         return 0
 
     segmenter = build_segmenter(config.detect, config.posture)
-    calib = load_all(config.paths.calibration)
     overlay_dir = Path(config.paths.artifacts_dir) / "overlays"
 
     n_det = 0
@@ -67,15 +64,6 @@ def segment(config: Config, limit: int | None = None) -> int:
                 area_px=inst.area_px, ground_px_x=inst.ground_px[0], ground_px_y=inst.ground_px[1],
                 posture=inst.posture,
             )
-            cam_cal = calib.get(fr["camera_id"])
-            if cam_cal:
-                try:
-                    model = resolve_model(cam_cal)
-                    wx, wy = apply_transform(model, [inst.ground_px])[0]
-                    if np.isfinite(wx) and np.isfinite(wy):
-                        row["world_x"], row["world_y"] = float(wx), float(wy)
-                except Exception:  # noqa: BLE001 - a bad/legacy calib entry must not kill segmentation
-                    pass
             rows.append(row)
 
         if rows:
@@ -92,24 +80,14 @@ def segment(config: Config, limit: int | None = None) -> int:
 
 
 def localize(config: Config) -> int:
-    """(Re)project every detection's ground point through the current calibration."""
-    from .calib.fence import load_fence, point_in_polygon
-
+    """Assign every detection to a count area (image-space, per camera)."""
     con = db.connect(config.paths.db_path)
-    calib = load_all(config.paths.calibration)
-    fence = load_fence(config.paths.fence)  # site-wide enclosure polygon (ortho px) or None
-    if not calib:
-        # Don't early-return: the shelter/panel block below is calibration-free
-        # (image-space, per camera), so it must still run when only panels are drawn
-        # — the whole point of panels is that the cow→ortho calibration is unreliable.
-        # An empty `calib` makes the world loop a harmless no-op.
-        print("[localize] no calibration found — world coords skipped; shelter still runs")
+    areas = load_count_areas(config.paths.count_areas)
 
     updated = 0
-    for camera_id, cam_cal in calib.items():
-        try:
-            model = resolve_model(cam_cal)
-        except Exception:  # noqa: BLE001 - skip cameras with a broken/legacy-less entry
+    for camera_id in areas:
+        cam_areas = areas.get(camera_id, [])
+        if not cam_areas:
             continue
         dets = con.execute(
             "SELECT detection_id, ground_px_x, ground_px_y FROM detections WHERE camera_id = ?",
@@ -117,20 +95,11 @@ def localize(config: Config) -> int:
         ).df()
         if dets.empty:
             continue
-        world = apply_transform(model, dets[["ground_px_x", "ground_px_y"]].to_numpy())
-        extent = model.get("ortho_extent")
-        if extent is not None:
-            world = clip_to_extent(world, extent)
-        if fence is not None:
-            # Drop anything outside the cow enclosure (physical bound).
-            world[~point_in_polygon(world, fence)] = np.nan
-        # Out-of-hull / undistort-blowup points are non-finite; store as SQL NULL
-        # (not NaN), so the heatmap's `world_x IS NOT NULL` filter drops them.
-        wx = [float(v) if np.isfinite(v) else None for v in world[:, 0]]
-        wy = [float(v) if np.isfinite(v) else None for v in world[:, 1]]
-        dets["world_x"] = pd.array(wx, dtype=object)
-        dets["world_y"] = pd.array(wy, dtype=object)
-        db.update_world(con, dets)
+        region_ids = assign_regions(
+            dets[["ground_px_x", "ground_px_y"]].to_numpy(), cam_areas, camera_id,
+        )
+        dets["region_id"] = pd.array(region_ids, dtype=object)
+        db.update_region(con, dets[["detection_id", "region_id"]])
         updated += len(dets)
 
     # Shelter (panel) assignment — image-space & per-camera, so it is INDEPENDENT of

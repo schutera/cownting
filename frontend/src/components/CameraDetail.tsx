@@ -48,7 +48,7 @@ export default function CameraDetail({
           onClick={onClose}
           className="ml-auto font-mono text-[12px] text-gray-tertiary hover:text-near-black transition-colors duration-150"
         >
-          ← Heatmap
+          ← Map
         </button>
       </div>
 

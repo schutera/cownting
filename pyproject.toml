@@ -10,9 +10,7 @@ packages = [
     "cownting",
     "cownting.detect",
     "cownting.ingest",
-    "cownting.calib",
     "cownting.eval",
-    "cownting.app",
     "cownting.scene",
     "cownting.finetune",
 ]

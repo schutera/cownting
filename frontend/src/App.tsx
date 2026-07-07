@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
-import Calibration from "./pages/Calibration";
+import CountArea from "./pages/CountArea";
 
 function navClass({ isActive }: { isActive: boolean }): string {
   return (
@@ -26,15 +26,12 @@ export default function App() {
           <NavLink to="/" end className={navClass}>
             Dashboard
           </NavLink>
-          <NavLink to="/calibrate" className={navClass}>
-            Calibration
-          </NavLink>
         </nav>
       </div>
       <main className="max-w-[1400px] mx-auto px-6 sm:px-10 py-10 sm:py-12">
         <Routes>
           <Route path="/" element={<Dashboard />} />
-          <Route path="/calibrate" element={<Calibration />} />
+          <Route path="/count-area/:camera" element={<CountArea />} />
         </Routes>
       </main>
     </BrowserRouter>

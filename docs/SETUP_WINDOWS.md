@@ -10,12 +10,13 @@ in the pipeline changes — you just install the CUDA build of PyTorch.
 ## 0. Get the code and the data onto the box
 
 **Code** comes via git. **Data does not** — videos, frames, weights, the DuckDB
-file, the orthophoto, and calibration are all `.gitignore`d and must be copied
-out-of-band (USB / network share / `scp` / cloud drive):
+file, and the orthophoto are all `.gitignore`d and must be copied out-of-band
+(USB / network share / `scp` / cloud drive):
 
 ```
 data/<camera_N>/*.MP4        # source videos
-data/orthophoto.png          # for the heatmap (optional for Stage 1b)
+data/orthophoto.png          # for the AreaMap placement (optional for Stage 1b)
+data/count_areas.json        # traced count areas (optional; git-tracked if you keep it)
 config/cownting.yaml         # your machine-specific config (also gitignored)
 ```
 
@@ -130,7 +131,8 @@ cownting segment                 # re-detect all frames with the fine-tuned mode
 cownting spotcheck manual.csv    # count MAE / bias vs your hand counts — did recall improve?
 ```
 
-If it improved, re-run `localize` and you're done. If not, iterate: correct more
+If it improved, re-run `localize` (re-assigns count-area `region_id` + panel
+shelter on the new detections) and you're done. If not, iterate: correct more
 frames (especially the failure cases), or harden the selection, and retrain.
 
 ### Notes

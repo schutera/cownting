@@ -72,6 +72,6 @@ flags:
 paths:
   artifacts_dir: data/artifacts
   db_path: data/cownting.duckdb
-  calibration: data/calibration.json
-  orthophoto: null                 # path to a top-down site image; needed for the heatmap view
-  panels: data/panels.json         # per-camera + ortho panel footprints; drawn in the Calibration tab
+  count_areas: data/count_areas.json  # per-camera count-area polygons; drawn via the camera gear icon
+  orthophoto: null                    # path to a top-down site image; backdrop for the count-area map
+  panels: data/panels.json            # per-camera + ortho panel footprints (shelter test)

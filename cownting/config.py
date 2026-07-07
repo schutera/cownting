@@ -76,11 +76,6 @@ class FinetuneCfg(BaseModel):
     split_by_time_block: bool = True              # avoid near-duplicate minutes leaking train->val
 
 
-class CalibCfg(BaseModel):
-    """3-stage warp calibration site defaults (per-camera values live in calibration.json)."""
-    h_center: Optional[float] = None     # panel-center / torque-tube height (m); optional size cue
-
-
 class ShadeCfg(BaseModel):
     enabled: bool = False
     margin_px: float = 0.0  # px a ground point must sit inside a footprint edge to count as
@@ -96,10 +91,8 @@ class FlagsCfg(BaseModel):
 class PathsCfg(BaseModel):
     artifacts_dir: str = "data/artifacts"
     db_path: str = "data/cownting.duckdb"
-    calibration: str = "data/calibration.json"
-    fence: str = "data/fence.json"               # site-wide cow-enclosure polygon (ortho px)
-    tiepoints: str = "data/tiepoints.json"       # cross-camera shared ground points (joint calib)
     panels: str = "data/panels.json"             # solar-panel ground footprints (ortho + per-camera px)
+    count_areas: str = "data/count_areas.json"   # named counting regions (camera + ortho polygons)
     orthophoto: Optional[str] = None
 
 
@@ -111,7 +104,6 @@ class Config(BaseModel):
     posture: PostureCfg = Field(default_factory=PostureCfg)
     label: LabelCfg = Field(default_factory=LabelCfg)
     finetune: FinetuneCfg = Field(default_factory=FinetuneCfg)
-    calib: CalibCfg = Field(default_factory=CalibCfg)
     shade: ShadeCfg = Field(default_factory=ShadeCfg)
     flags: FlagsCfg = Field(default_factory=FlagsCfg)
     paths: PathsCfg = Field(default_factory=PathsCfg)

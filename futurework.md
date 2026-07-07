@@ -37,8 +37,8 @@ position, associate on *identity*:
   currently hold stale values from the removed prototype — ignore; a ReID stage
   would overwrite them.)*
 - Robustness *today* (without ReID) comes from **temporal aggregation** — the
-  dashboard heatmap already accumulates a trailing window — and from the planned
-  detector **fine-tune** (Stage 1b), not from tracking.
+  count-area windowing already accumulates a trailing window of frames — and from
+  the planned detector **fine-tune** (Stage 1b), not from tracking.
 - Higher-fidelity motion would need a higher frame rate than the time-lapse
   provides; ReID sidesteps that by keying on identity, not motion.
 
@@ -63,9 +63,9 @@ single oblique view).
 
 **Notes / prereqs.**
 - Pose is far more robust than the current elongation proxy, but the **fisheye +
-  oblique view** distorts limb geometry — undistort the crop (the calibration
-  already solves a lens model) before/within pose inference, and treat angles as
-  view-dependent until multi-camera fusion.
+  oblique view** distorts limb geometry — treat keypoint angles as
+  view-dependent, and normalise them per camera (e.g. learn the distortion from
+  the pose data itself) rather than assuming a metric camera model.
 - Behaviour *dynamics* (grazing bouts, gait) want identity-consistent sequences
   → best paired with the **ReID** work above (behaviour per individual over
   time), though instantaneous per-frame posture works without it.
@@ -75,13 +75,12 @@ single oblique view).
 ## Solar-panel segmentation (shade & agrivoltaics)
 
 **Status:** partially implemented. Phase 1 — static **per-camera panel ground
-footprints** — is **done**: footprints are traced per camera in the Calibration
-tab, a cow is `under_panel` when its ground-contact point falls inside a footprint
-(image-space, calibration-free, with a configurable `shade.margin_px` band for
-boundary/uncertain), a `pct_sheltering` KPI + a shelter-vs-time-of-day trend are
-surfaced, and the same footprints double as height-0 ground anchors for per-camera
-**and** joint calibration. What remains future is panel/shadow **segmentation** and
-the **sun-dependent moving shade map** below.
+footprints** — is **done**: footprints are traced per camera, a cow is
+`under_panel` when its ground-contact point falls inside a footprint (image-space,
+calibration-free, with a configurable `shade.margin_px` band for
+boundary/uncertain), and a `pct_sheltering` KPI + a shelter-vs-time-of-day trend
+are surfaced. What remains future is panel/shadow **segmentation** and the
+**sun-dependent moving shade map** below.
 
 **Still future — panel/shadow segmentation.**
 - Add a **panel** (and optionally **shadow**) class to the segmentation model
@@ -103,13 +102,19 @@ the **sun-dependent moving shade map** below.
   panel row N at noon").
 
 **Notes.** Gate the moving-shade stage behind the existing `flags`/`shade.enabled`.
-Fisheye distortion applies as elsewhere — undistort before projecting panel masks
-to the ortho.
+Since Cownting is now calibration-free, the shade map lives in **image space** too
+— compute shadow footprints per camera (segmented or geometric) and test cow
+ground points against them, exactly like the panel footprints.
 
 ## Other open items
-- **Cow-size depth cue** — apparent size → range along the viewing ray, an
-  independent depth estimate to complement the calibration warp's bearing
-  (`area_px`/bbox already stored, so revisitable on existing data).
-- **Fish-eye + sloped-terrain calibration accuracy** — re-calibrate the weak
-  cameras (02 ~44 px, 05 ~31 px); flag underdetermined fits (camera 01's "0.0"
-  reproj is exactly-determined, not accurate); fence-in-camera correspondences.
+- **Cow-size depth cue** — apparent size → rough range along the viewing ray, an
+  independent depth estimate (`area_px`/bbox already stored, so revisitable on
+  existing data). Could add a coarse near/far sense to count areas without
+  reintroducing full metric calibration.
+- **Metric world coordinates (dropped, revisitable)** — the earlier orthophoto
+  homography / fisheye + sloped-terrain calibration was **removed** in favour of
+  hand-traced image-space **count areas**, which proved more robust than the
+  fragile polynomial warp (cubic extrapolation blew up on the wide cameras). If a
+  future need demands true metric positions (e.g. distances, densities per m²),
+  this is where a proper multi-view / structure-from-motion calibration would slot
+  back in — as an *addition*, not a prerequisite for counting.

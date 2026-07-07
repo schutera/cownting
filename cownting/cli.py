@@ -3,7 +3,6 @@
 Typical flow:
     cownting ingest                  # video -> sampled timestamped frames
     cownting segment                 # frames -> instance segmentation + overlays
-    cownting dashboard               # open the dashboard; use the Calibration tab
     cownting localize                # project detections through the saved homography
     cownting kpis                    # print a quick summary
     cownting spotcheck manual.csv    # predicted-vs-manual count error
@@ -144,19 +143,6 @@ def serve(config: str = CONFIG_OPT, host: str = "127.0.0.1", port: int = 8000):
     from .api import create_app
 
     uvicorn.run(create_app(_load(config)), host=host, port=port)
-
-
-@app.command()
-def dashboard(
-    config: str = CONFIG_OPT,
-    host: str = "127.0.0.1",
-    port: int = 8050,
-    debug: bool = False,
-):
-    """Launch the dashboard (Overview / Segmentation / Heatmap / Calibration)."""
-    from .app import run_dashboard
-
-    run_dashboard(_load(config), host=host, port=port, debug=debug)
 
 
 if __name__ == "__main__":

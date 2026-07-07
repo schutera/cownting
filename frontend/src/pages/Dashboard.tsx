@@ -2,13 +2,12 @@ import { useEffect, useState } from "react";
 import type { Site, TimelineData } from "../lib/types";
 import { getSite, getTimeline } from "../lib/api";
 import { SectionLabel } from "../components/ui";
-import { Heatmap } from "../components/Heatmap";
+import { AreaMap } from "../components/AreaMap";
+import TrendsStrip from "../components/TrendsStrip";
 import KpiPanel from "../components/KpiPanel";
 import CameraSegStack from "../components/CameraSegStack";
 import CameraDetail from "../components/CameraDetail";
 import { TimeScrubber } from "../components/TimeScrubber";
-
-const WINDOW_MIN = 15; // heatmap accumulates the trailing 15 frames (~last 15 min)
 
 // Homepage layout: heatmap hero in the centre, aggregated KPIs on the right,
 // per-camera segmentation on the left. Side panels stack under the hero on
@@ -85,7 +84,7 @@ export default function Dashboard() {
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Day scrubber — drives the segmentations and the ±window heatmap */}
+      {/* Day scrubber — drives the segmentations and the single-frame occupancy map */}
       {timeline && frame !== null ? (
         <TimeScrubber
           timeline={timeline}
@@ -93,7 +92,6 @@ export default function Dashboard() {
           onFrame={setFrame}
           allDay={allDay}
           onAllDay={setAllDay}
-          windowMin={WINDOW_MIN}
         />
       ) : null}
 
@@ -105,8 +103,8 @@ export default function Dashboard() {
             {focusCam
               ? `${focusCam} · segmentation`
               : heatmapFrame === null
-                ? "Where the herd spends its day"
-                : "Where the herd is around this time"}
+                ? "Where the herd is (latest frame)"
+                : "Where the herd is at this time"}
           </h2>
           {focusCam ? (
             <CameraDetail
@@ -116,20 +114,18 @@ export default function Dashboard() {
               onClose={() => setFocusCam(null)}
             />
           ) : null}
-          {/* Kept mounted (hidden) so returning to the heatmap doesn't refetch/redraw. */}
+          {/* Kept mounted (hidden) so returning to the map doesn't refetch/redraw. */}
           <div className={focusCam ? "hidden" : ""}>
-            <Heatmap frame={heatmapFrame} windowMin={WINDOW_MIN} fence={site.fence ?? undefined} panels={site.panels?.ortho ?? undefined} cameras={site.cameras} hidden={hidden} />
+            <AreaMap frame={heatmapFrame} cameras={site.cameras} hidden={hidden} />
           </div>
+
+          {/* Time-series trends live here now, under the timeline + orthophoto. */}
+          <TrendsStrip camera={camera} trunc="hour" />
         </section>
 
-        {/* Right side panel — aggregated KPIs */}
+        {/* Right side panel — static, fully-aggregated KPIs only */}
         <div className="lg:col-start-3 lg:row-start-1">
-          <KpiPanel
-            kpis={site.kpis}
-            camera={camera}
-            trunc="hour"
-            postureEnabled={site.posture_enabled}
-          />
+          <KpiPanel kpis={site.kpis} postureEnabled={site.posture_enabled} />
         </div>
 
         {/* Left side panel — per-camera instance segmentation at the slider time */}

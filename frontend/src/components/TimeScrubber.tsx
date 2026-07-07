@@ -1,6 +1,6 @@
 import type { TimelineData } from "../lib/types";
 import { SectionLabel } from "./ui";
-import { CHART_PRIMARY, CHART_MUTED } from "../lib/palette";
+import { CHART_MUTED } from "../lib/palette";
 
 // Frame axis -> clock. The Brinno time-lapse runs ~1 frame/minute and frame 0
 // reads ~06:00 in the burn-in, so map frame_idx -> 06:00 + idx minutes. (These
@@ -17,8 +17,8 @@ export function clockOfFrame(frameIdx: number): string {
 
 /**
  * Day scrubber: drag through the day to drive the per-camera segmentations and
- * the ±window heatmap. The strip behind the slider shows total cows per minute
- * (summed across cameras); the lit band is the current heatmap window.
+ * the single-frame occupancy map. The strip behind the slider shows total cows
+ * per minute (summed across cameras); the current frame is lit.
  */
 export function TimeScrubber({
   timeline,
@@ -26,14 +26,12 @@ export function TimeScrubber({
   onFrame,
   allDay,
   onAllDay,
-  windowMin = 30,
 }: {
   timeline: TimelineData;
   frame: number;
   onFrame: (frameIdx: number) => void;
   allDay: boolean;
   onAllDay: (v: boolean) => void;
-  windowMin?: number;
 }) {
   const frames = timeline.frames;
   if (frames.length === 0) return null;
@@ -49,7 +47,7 @@ export function TimeScrubber({
             {clockOfFrame(frame)}
           </span>
           <span className="font-mono text-[11px] text-gray-tertiary">
-            frame {frame} · heatmap · last {windowMin} min
+            frame {frame}
           </span>
         </div>
         <label className="flex items-center gap-2 font-mono text-[11px] text-gray-tertiary cursor-pointer select-none">
@@ -58,7 +56,7 @@ export function TimeScrubber({
             checked={allDay}
             onChange={(e) => onAllDay(e.target.checked)}
           />
-          whole-day heatmap
+          whole day
         </label>
       </div>
 
@@ -66,8 +64,7 @@ export function TimeScrubber({
       <div className="mt-3 flex items-end gap-px h-10">
         {frames.map((f, i) => {
           const c = timeline.counts[i] ?? 0;
-          const inWindow = !allDay && f <= frame && f >= frame - windowMin;
-          const isCurrent = f === frame;
+          const isCurrent = !allDay && f === frame;
           return (
             <div
               key={f}
@@ -75,12 +72,8 @@ export function TimeScrubber({
               className="flex-1 min-w-0 cursor-pointer"
               style={{
                 height: `${8 + (c / maxCount) * 92}%`,
-                background: isCurrent
-                  ? "#e76f51"
-                  : inWindow
-                    ? CHART_PRIMARY
-                    : CHART_MUTED,
-                opacity: isCurrent ? 1 : inWindow ? 0.9 : 0.3,
+                background: isCurrent ? "#e76f51" : CHART_MUTED,
+                opacity: isCurrent ? 1 : 0.3,
               }}
               title={`${clockOfFrame(f)} · ${c} cows`}
             />

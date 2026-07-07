@@ -3,15 +3,12 @@ import type {
   CountRow,
   PostureRow,
   FrameRow,
-  HeatmapData,
   TimelineData,
-  Line,
-  FenceLink,
-  GroundLine,
-  TiePoint,
   PanelSet,
   ShelterRow,
-  PerPointError,
+  Areas,
+  PostureBreakdown,
+  AreaSummaryRow,
 } from "./types";
 
 async function j<T>(url: string, init?: RequestInit): Promise<T> {
@@ -36,14 +33,6 @@ export function getFrames(camera: string): Promise<FrameRow[]> {
   return j<FrameRow[]>(`/api/frames?camera=${camera}`);
 }
 
-export function getHeatmap(frame?: number | null, window = 30): Promise<HeatmapData> {
-  const q =
-    frame === undefined || frame === null
-      ? ""
-      : `?frame=${frame}&window=${window}`;
-  return j<HeatmapData>(`/api/heatmap${q}`);
-}
-
 export function getTimeline(): Promise<TimelineData> {
   return j<TimelineData>("/api/timeline");
 }
@@ -60,70 +49,45 @@ export function refImg(camera: string): string {
   return `/api/img/reference/${camera}`;
 }
 
-export interface CalibrationPayload {
-  camera: string;
-  method: "center_pillar";
-  image_size: [number, number]; // camera reference image natural [w, h]
-  lines: Line[];
-  ground_lines: GroundLine[];
-  // Panel footprint correspondences: each entry is [cam_ring, ortho_ring] tracing
-  // one panel's height-0 ground footprint (matched vertex order) — ground anchors.
-  panel_lines: FenceLink[];
-}
-
-export interface CalibrationResult {
-  camera: string;
-  method: string;
-  reproj_error: number;
-  max_residual: number;
-  line_residual: number;
-  per_point_error: PerPointError;
-  n_ground_lines: number;
-  n_panel: number;
-  n_lines: number;
-}
-
-export function saveCalibration(payload: CalibrationPayload): Promise<CalibrationResult> {
-  return j<CalibrationResult>("/api/calibration", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
 export function runLocalize(): Promise<{ updated: number }> {
   return j<{ updated: number }>("/api/localize", { method: "POST" });
 }
 
-export interface JointCameraDiag {
-  reproj_error: number; max_residual: number; line_residual: number; n_shared: number; method: string;
-}
-export interface JointResult {
-  cameras: string[];
-  global: { cross_camera_px: number; max_cross_camera_px: number; n_shared_corners: number; n_pairs: number };
-  per_camera: Record<string, JointCameraDiag>;
-  updated: number;
-}
-export function runJointCalibration(): Promise<JointResult> {
-  return j<JointResult>("/api/calibration/joint", { method: "POST" });
+export function getAreas(): Promise<Areas> {
+  return j<Areas>("/api/areas");
 }
 
-export function saveFence(
-  polygon: number[][],
-): Promise<{ n_vertices: number; updated: number }> {
-  return j<{ n_vertices: number; updated: number }>("/api/fence", {
+export function saveAreas(areas: Areas): Promise<{ ok: boolean }> {
+  return j<{ ok: boolean }>("/api/areas", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ polygon }),
+    body: JSON.stringify({ areas }),
   });
 }
 
-export function saveTiePoints(tiepoints: TiePoint[]): Promise<{ n: number }> {
-  return j<{ n: number }>("/api/tiepoints", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ tiepoints }),
-  });
+export interface AreaCounts {
+  counts: Record<string, number>;
+  postures: Record<string, PostureBreakdown>;
+  frame: number | null;
+}
+
+export function getAreaCounts(frame?: number): Promise<AreaCounts> {
+  const q = frame === undefined || frame === null ? "" : `?frame=${frame}`;
+  return j<AreaCounts>(`/api/area-counts${q}`);
+}
+
+export function getAreaSummary(): Promise<AreaSummaryRow[]> {
+  return j<AreaSummaryRow[]>("/api/area-summary");
+}
+
+export function getAreaCountsOverTime(
+  camera?: string,
+  trunc = "hour",
+): Promise<{ series: { t: string; region_id: string; cows: number }[] }> {
+  const q = camera ? `?camera=${camera}&trunc=${trunc}` : `?trunc=${trunc}`;
+  return j<{ series: { t: string; region_id: string; cows: number }[] }>(
+    `/api/area-counts/over-time${q}`,
+  );
 }
 
 export function savePanels(

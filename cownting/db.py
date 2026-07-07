@@ -20,9 +20,9 @@ DET_COLS = [
     "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "area_px",
     "ground_px_x", "ground_px_y", "posture",
     # --- reserved for later stages (nullable) ---
-    "world_x", "world_y", "track_id", "global_id",
+    "track_id", "global_id",
     "motion", "in_shade", "near_infra", "cluster_size",
-    "under_panel", "panel_id",
+    "under_panel", "panel_id", "region_id",
 ]
 
 
@@ -59,17 +59,18 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
             area_px     DOUBLE,
             ground_px_x DOUBLE, ground_px_y DOUBLE,
             posture     VARCHAR,
-            world_x     DOUBLE, world_y DOUBLE,
             track_id    BIGINT, global_id BIGINT,
             motion      VARCHAR,
             in_shade    BOOLEAN, near_infra BOOLEAN, cluster_size INTEGER,
-            under_panel BOOLEAN, panel_id VARCHAR
+            under_panel BOOLEAN, panel_id VARCHAR,
+            region_id   VARCHAR
         );
         """
     )
     # Forward-compat: add shelter columns to DBs created before this feature.
     con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS under_panel BOOLEAN")
     con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS panel_id VARCHAR")
+    con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS region_id VARCHAR")
 
 
 # --------------------------------------------------------------------------- writes
@@ -102,20 +103,20 @@ def mark_processed(con, camera_id: str, frame_idx: int, overlay_path: str | None
     )
 
 
-def update_world(con, df: pd.DataFrame) -> None:
-    """df: detection_id, world_x, world_y."""
+def update_region(con, df: pd.DataFrame) -> None:
+    """df: detection_id, region_id."""
     if df.empty:
         return
-    con.register("df_w", df[["detection_id", "world_x", "world_y"]])
+    con.register("df_r", df[["detection_id", "region_id"]])
     con.execute(
         """
         UPDATE detections AS d
-        SET world_x = w.world_x, world_y = w.world_y
-        FROM df_w AS w
-        WHERE d.detection_id = w.detection_id
+        SET region_id = r.region_id
+        FROM df_r AS r
+        WHERE d.detection_id = r.detection_id
         """
     )
-    con.unregister("df_w")
+    con.unregister("df_r")
 
 
 def update_shelter(con, df: pd.DataFrame) -> None:
@@ -163,25 +164,44 @@ def kpi_summary(con) -> dict:
     row = con.execute(
         """
         SELECT
-            (SELECT count(*) FROM frames WHERE processed)              AS frames,
+            (SELECT count(*) FROM frames WHERE processed)                 AS frames,
             -- valid = any processed frame
-            (SELECT count(*) FROM frames WHERE processed)              AS valid_frames,
-            (SELECT count(*) FROM detections)                          AS detections,
-            (SELECT count(*) FROM detections WHERE posture = 'lying')  AS lying,
-            (SELECT count(*) FROM detections WHERE world_x IS NOT NULL) AS localized,
-            (SELECT count(*) FROM detections WHERE under_panel)         AS sheltering
+            (SELECT count(*) FROM frames WHERE processed)                 AS valid_frames,
+            (SELECT count(*) FROM detections)                             AS detections,
+            (SELECT count(*) FROM detections WHERE posture = 'standing')  AS standing,
+            (SELECT count(*) FROM detections WHERE posture = 'lying')     AS lying,
+            (SELECT count(*) FROM detections WHERE under_panel)            AS sheltering
         """
     ).fetchone()
-    frames, valid_frames, dets, lying, localized, sheltering = row
+    frames, valid_frames, dets, standing, lying, sheltering = row
     return {
         "frames": int(frames or 0),
         "valid_frames": int(valid_frames or 0),
         "detections": int(dets or 0),
+        "standing": int(standing or 0),
+        "lying": int(lying or 0),
+        "sheltering": int(sheltering or 0),
         "cows_per_frame": round((dets / valid_frames), 2) if valid_frames else 0.0,
         "pct_lying": round(100 * lying / dets, 1) if dets else 0.0,
-        "pct_localized": round(100 * localized / dets, 1) if dets else 0.0,
         "pct_sheltering": round(100 * sheltering / dets, 1) if dets else 0.0,
     }
+
+
+def area_summary(con) -> pd.DataFrame:
+    """Whole-day totals per count area, split by posture. Feeds the static
+    per-area KPI list (cows spotted + standing/lying) on the right rail."""
+    return con.execute(
+        """
+        SELECT region_id,
+               count(*)                                       AS total,
+               count(*) FILTER (WHERE posture = 'standing')   AS standing,
+               count(*) FILTER (WHERE posture = 'lying')      AS lying
+        FROM detections
+        WHERE region_id IS NOT NULL
+        GROUP BY region_id
+        ORDER BY total DESC
+        """
+    ).df()
 
 
 def counts_over_time(con, camera_id: str, trunc: str = "hour") -> pd.DataFrame:
@@ -214,6 +234,21 @@ def shelter_over_time(con, camera_id: str | None, trunc: str = "hour") -> pd.Dat
         sql += " WHERE camera_id = ?"
         params.append(camera_id)
     sql += " GROUP BY 1 ORDER BY 1"
+    return con.execute(sql, params).df()
+
+
+def area_counts_over_time(con, camera: str | None = None, trunc: str = "hour") -> pd.DataFrame:
+    # Detection-based: cows per count-area per bucket. camera None -> all cameras.
+    sql = """
+        SELECT date_trunc(?, ts) AS t, region_id, count(*) AS cows
+        FROM detections
+        WHERE region_id IS NOT NULL
+    """
+    params = [trunc]
+    if camera is not None:
+        sql += " AND camera_id = ?"
+        params.append(camera)
+    sql += " GROUP BY 1, 2 ORDER BY 1, 2"
     return con.execute(sql, params).df()
 
 

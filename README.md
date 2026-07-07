@@ -4,21 +4,25 @@ Offline computer-vision pipeline for analyzing cows on a solar field from
 prerecorded camera video. Built to run on this Mac (Apple Silicon / MPS), and
 on CUDA or CPU unchanged.
 
-**Pipeline:** `video → instance segmentation → facts (DuckDB) → dashboard`,
-plus a Stage-2 orthophoto calibration that unlocks the spatial **heatmap**.
+**Pipeline:** `video → instance segmentation → facts (DuckDB) → dashboard`.
 
 ```
-video file ─▶ ingest ─▶ segment ─▶ [calibrate in dashboard] ─▶ localize
-                 │           │                                      │
-            frames table  detections (masks→ground point,      world_x/y
-                          posture, score, …)                   (orthophoto px)
-                                       └────────────▶ Dash dashboard ◀───────┘
-                              Overview · Segmentation · Heatmap · Calibration
+video file ─▶ ingest ─▶ segment ─▶ localize ─▶ serve
+                 │           │          │           │
+            frames table  detections  region_id +   React app + API
+                          (masks→ground point,  shelter (both
+                           posture, score, …)   image-space, no calibration)
 ```
 
-The DuckDB `detections` table already carries every later-stage column
-(`world_x/y`, `track_id`, `global_id`, `in_shade`, …), written NULL for now —
-so identity, pose and shade are additive, not rewrites.
+`localize` is **calibration-free**: it assigns each detection to a **count area**
+(`region_id`) and to a panel **shelter** footprint, both by testing the cow's
+ground-contact point against hand-traced image-space polygons. Named **count
+areas** replace the old orthophoto heatmap (see
+**[docs/COUNT_AREAS.md](docs/COUNT_AREAS.md)**).
+
+The DuckDB `detections` table already carries the later-stage identity/pose
+columns (`track_id`, `global_id`, `in_shade`, …), written NULL for now — so
+identity, pose and shade are additive, not rewrites.
 
 ## Install
 
@@ -42,6 +46,7 @@ detector is **YOLO11-seg** (COCO `cow`) on `device: auto` (→ MPS here).
 ```bash
 python -m cownting.cli ingest        # decode video → timestamped frames
 python -m cownting.cli segment       # segment cows → detections + overlays
+python -m cownting.cli localize      # assign count-area region_id + panel shelter
 python -m cownting.cli kpis          # quick summary
 python -m cownting.cli serve         # React app + API at http://127.0.0.1:8000
 ```
@@ -62,27 +67,27 @@ python -m cownting.cli serve                 # API on :8000
 cd frontend && npm run dev                    # UI on :5173 (proxies /api → :8000)
 ```
 
-The dashboard is a single page — KPIs, a big **occupancy heatmap** over the
-orthophoto, activity trends, and a segmentation reviewer — plus a **Calibration**
-tab that nudges you when a camera is uncalibrated. (The old Dash UI,
+The dashboard is a single page — KPIs, an **AreaMap** (per-area cow counts as
+aura badges placed on the orthophoto), **AreaTrends** (per-area counts over
+time), activity trends, and a segmentation reviewer. (The old Dash UI,
 `cownting dashboard`, is superseded by `serve`.)
 
-For the **heatmap**: set `paths.orthophoto` to a top-down site image, open the
-**Calibration** tab, click ≥4 matched point pairs (camera frame ↔ orthophoto),
-**Compute & save**, then:
+**Count areas (replace the heatmap).** Instead of calibrating and projecting a
+pixel heatmap, you trace a few named **areas** per camera. Open a camera's
+**gear icon** → `/count-area/:camera`, draw each area's footprint on the camera
+frame (this `camera_polygon` does the counting) and its placement on the
+orthophoto (`ortho_polygon`, display only), and save. Cownting counts cows whose
+ground-contact point falls inside each area — no lens model, no ground-truth
+points. Full detail in **[docs/COUNT_AREAS.md](docs/COUNT_AREAS.md)**. Set
+`paths.orthophoto` to a top-down site image for the AreaMap placement.
 
-```bash
-python -m cownting.cli localize      # project detections onto the orthophoto
-```
-
-**Panel shelter (agrivoltaics).** In the **Calibration** tab's camera + ortho
-views, trace each solar panel's **ground footprint**. A cow counts as
-*sheltering* when its ground-contact point falls inside a footprint (image-space,
-calibration-free; `shade.margin_px` sets the boundary/uncertain band). This drives
-the **"Under panels"** KPI (`pct_sheltering`) and a shelter-vs-time-of-day trend,
-and the footprints double as height-0 ground anchors for per-camera and joint
-calibration. Panel/shadow *segmentation* and the sun-dependent *moving* shade map
-are still future (see `futurework.md`).
+**Panel shelter (agrivoltaics).** Trace each solar panel's **ground footprint**.
+A cow counts as *sheltering* when its ground-contact point falls inside a
+footprint (image-space, calibration-free; `shade.margin_px` sets the
+boundary/uncertain band). This drives the **"Under panels"** KPI
+(`pct_sheltering`) and a shelter-vs-time-of-day trend. Panel/shadow
+*segmentation* and the sun-dependent *moving* shade map are still future (see
+`futurework.md`).
 
 (After `pip install -e .` the commands are just `cownting ingest`, etc.)
 
