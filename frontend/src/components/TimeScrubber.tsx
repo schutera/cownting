@@ -16,9 +16,11 @@ export function clockOfFrame(frameIdx: number): string {
 }
 
 /**
- * Day scrubber: drag through the day to drive the per-camera segmentations and
- * the single-frame occupancy map. The strip behind the slider shows total cows
- * per minute (summed across cameras); the current frame is lit.
+ * Day scrubber, laid out as a single header row so it can live in the sticky
+ * header and be dragged from anywhere. Drag through the day to drive the
+ * per-camera segmentations and the single-frame occupancy map. The strip behind
+ * the slider shows total cows per minute (summed across cameras); the current
+ * frame is lit.
  */
 export function TimeScrubber({
   timeline,
@@ -39,18 +41,18 @@ export function TimeScrubber({
   const maxCount = Math.max(1, ...timeline.counts);
 
   return (
-    <div className="bg-surface border border-border px-4 py-3 animate-fade-slide-in">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-baseline gap-3">
+    <div className="border-t border-border px-6 sm:px-10 py-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-baseline gap-2">
           <SectionLabel>TIME OF DAY</SectionLabel>
-          <span className="font-display text-2xl text-near-black tabular-nums">
+          <span className="font-display text-xl text-near-black tabular-nums leading-none">
             {clockOfFrame(frame)}
           </span>
-          <span className="font-mono text-[11px] text-gray-tertiary">
+          <span className="font-mono text-[10px] text-gray-tertiary hidden sm:inline">
             frame {frame}
           </span>
         </div>
-        <label className="flex items-center gap-2 font-mono text-[11px] text-gray-tertiary cursor-pointer select-none">
+        <label className="flex items-center gap-2 font-mono text-[10px] text-gray-tertiary cursor-pointer select-none">
           <input
             type="checkbox"
             checked={allDay}
@@ -61,7 +63,7 @@ export function TimeScrubber({
       </div>
 
       {/* activity strip — total cows per minute; click a bar to jump there */}
-      <div className="mt-3 flex items-end gap-px h-10">
+      <div className="mt-1.5 flex items-end gap-px h-9">
         {frames.map((f, i) => {
           const c = timeline.counts[i] ?? 0;
           const isCurrent = !allDay && f === frame;
@@ -87,12 +89,8 @@ export function TimeScrubber({
         max={frames.length - 1}
         value={index}
         onChange={(e) => onFrame(frames[Number(e.target.value)])}
-        className="w-full mt-2 accent-[#e76f51]"
+        className="w-full mt-1 accent-[#e76f51]"
       />
-      <div className="flex justify-between font-mono text-[10px] text-gray-tertiary">
-        <span>{clockOfFrame(frames[0])}</span>
-        <span>{clockOfFrame(frames[frames.length - 1])}</span>
-      </div>
     </div>
   );
 }

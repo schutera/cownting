@@ -4,11 +4,10 @@ import type {
   PostureRow,
   FrameRow,
   TimelineData,
-  PanelSet,
-  ShelterRow,
   Areas,
   PostureBreakdown,
   AreaSummaryRow,
+  DaySeries,
 } from "./types";
 
 async function j<T>(url: string, init?: RequestInit): Promise<T> {
@@ -35,6 +34,10 @@ export function getFrames(camera: string): Promise<FrameRow[]> {
 
 export function getTimeline(): Promise<TimelineData> {
   return j<TimelineData>("/api/timeline");
+}
+
+export function getDaySeries(): Promise<DaySeries> {
+  return j<DaySeries>("/api/day-series");
 }
 
 export function frameImg(camera: string, frameIdx: number, kind: "overlay" | "raw" = "overlay"): string {
@@ -65,9 +68,23 @@ export function saveAreas(areas: Areas): Promise<{ ok: boolean }> {
   });
 }
 
+// Panel (shelter) areas — same polygon shape as count areas, separate storage.
+export function getPanelAreas(): Promise<Areas> {
+  return j<Areas>("/api/panel-areas");
+}
+
+export function savePanelAreas(areas: Areas): Promise<{ ok: boolean }> {
+  return j<{ ok: boolean }>("/api/panel-areas", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ areas }),
+  });
+}
+
 export interface AreaCounts {
   counts: Record<string, number>;
   postures: Record<string, PostureBreakdown>;
+  sheltering: Record<string, number>; // per-region cows under a panel (unit-block indicator)
   frame: number | null;
 }
 
@@ -90,16 +107,3 @@ export function getAreaCountsOverTime(
   );
 }
 
-export function savePanels(
-  set: PanelSet,
-): Promise<{ n_ortho: number; n_cameras: number; updated: number }> {
-  return j<{ n_ortho: number; n_cameras: number; updated: number }>("/api/panels", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ortho: set.ortho, cameras: set.cameras }),
-  });
-}
-
-export function getShelter(camera: string, trunc: string): Promise<ShelterRow[]> {
-  return j<ShelterRow[]>(`/api/shelter?camera=${camera}&trunc=${trunc}`);
-}

@@ -76,12 +76,6 @@ class FinetuneCfg(BaseModel):
     split_by_time_block: bool = True              # avoid near-duplicate minutes leaking train->val
 
 
-class ShadeCfg(BaseModel):
-    enabled: bool = False
-    margin_px: float = 0.0  # px a ground point must sit inside a footprint edge to count as
-                            # sheltering; within it = boundary/uncertain (configurable)
-
-
 class FlagsCfg(BaseModel):
     within_camera_tracking: bool = False
     global_reid: bool = False
@@ -91,8 +85,8 @@ class FlagsCfg(BaseModel):
 class PathsCfg(BaseModel):
     artifacts_dir: str = "data/artifacts"
     db_path: str = "data/cownting.duckdb"
-    panels: str = "data/panels.json"             # solar-panel ground footprints (ortho + per-camera px)
     count_areas: str = "data/count_areas.json"   # named counting regions (camera + ortho polygons)
+    panel_areas: str = "data/panel_areas.json"   # shelter regions: a cow inside one = under a panel
     orthophoto: Optional[str] = None
 
 
@@ -104,7 +98,6 @@ class Config(BaseModel):
     posture: PostureCfg = Field(default_factory=PostureCfg)
     label: LabelCfg = Field(default_factory=LabelCfg)
     finetune: FinetuneCfg = Field(default_factory=FinetuneCfg)
-    shade: ShadeCfg = Field(default_factory=ShadeCfg)
     flags: FlagsCfg = Field(default_factory=FlagsCfg)
     paths: PathsCfg = Field(default_factory=PathsCfg)
 

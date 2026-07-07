@@ -17,14 +17,6 @@ from . import db
 from .config import Config
 from .pipeline import localize as run_localize
 from .scene import regions
-from .scene.panels import load_panels, save_panels
-
-
-class PanelsReq(BaseModel):
-    # ortho[k] = {"id": str, "centerline": [[x,y],...]} on the orthophoto (site-wide)
-    ortho: list[dict] = []
-    # cameras[cam] = [{"id": str, "centerline": [[x,y],...], "width": float}, ...] in image px
-    cameras: dict[str, list[dict]] = {}
 
 
 class AreasReq(BaseModel):
@@ -48,7 +40,13 @@ def create_app(config: Config) -> FastAPI:
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     def con():
-        return db.connect(config.paths.db_path, read_only=True)
+        # Read-write, NOT read_only: DuckDB rejects opening a second connection to
+        # the same file with a different mode in one process ("Can't open a
+        # connection ... with a different configuration"). The save path
+        # (run_localize) needs a writer, so a read_only reader open at the same
+        # moment (e.g. the dashboard polling during a save) would make that write
+        # connection fail and 500 the POST. Everyone shares one mode.
+        return db.connect(config.paths.db_path)
 
     # ------------------------------------------------------------------ data
     @app.get("/api/site")
@@ -69,8 +67,7 @@ def create_app(config: Config) -> FastAPI:
             ortho = {"url": "/api/img/orthophoto", "width": w, "height": h}
         return {"cameras": cams, "kpis": kpis, "orthophoto": ortho,
                 "references": refs,
-                "posture_enabled": config.posture.enabled,
-                "panels": load_panels(config.paths.panels)}
+                "posture_enabled": config.posture.enabled}
 
     @app.get("/api/counts")
     def counts(camera: str, trunc: str = "hour"):
@@ -106,25 +103,58 @@ def create_app(config: Config) -> FastAPI:
         run_localize(config)
         return {"ok": True}
 
+    @app.get("/api/panel-areas")
+    def get_panel_areas():
+        """Shelter regions (same polygon shape as count areas). A cow inside one
+        is 'under a panel'."""
+        return regions.load_count_areas(config.paths.panel_areas)
+
+    @app.post("/api/panel-areas")
+    def set_panel_areas(req: AreasReq):
+        regions.save_count_areas(config.paths.panel_areas, req.areas)
+        run_localize(config)
+        return {"ok": True}
+
     @app.get("/api/area-counts")
     def area_counts(frame: int | None = None):
-        """Cow counts per region AT A SINGLE FRAME, split by posture. The count is
-        the cows present in each area at exactly `frame_idx == frame` — it does NOT
-        accumulate over a window. When `frame` is omitted, the latest frame is used.
+        """Cow counts per region, split by posture, for the occupancy map.
+
+        With `frame`: the cows present in each area at exactly `frame_idx == frame`
+        (does NOT accumulate over a window). Without `frame` (the map's "whole day"
+        toggle): the whole-day PEAK simultaneous occupancy per area — NOT the latest
+        frame, which at dusk is empty and used to blank the map.
 
         Returns `counts` (total per region) plus `postures`
         (`{region_id: {standing, lying, unknown}}`) for the per-area composition
-        ring on the map. Posture is the reused mask-elongation proxy; NULL -> unknown.
+        ring, and `sheltering` (`{region_id: n}`) = that area's cows under a panel,
+        for the unit-block indicator. Posture is the reused proxy; NULL -> unknown.
         """
         c = con()
         if frame is None:
-            row = c.execute("SELECT max(frame_idx) FROM frames").fetchone()
-            frame = int(row[0]) if row and row[0] is not None else None
+            df = db.area_counts_whole_day(c)
+            c.close()
+            counts = {r.region_id: int(r.peak) for r in df.itertuples()}
+            sheltering = {r.region_id: int(r.sheltering) for r in df.itertuples()}
+            postures = {
+                r.region_id: {
+                    "standing": int(r.standing),
+                    "lying": int(r.lying),
+                    "unknown": int(r.unknown),
+                }
+                for r in df.itertuples()
+            }
+            return {
+                "counts": counts,
+                "postures": postures,
+                "sheltering": sheltering,
+                "frame": None,
+            }
         rows = (
             []
             if frame is None
             else c.execute(
-                "SELECT d.region_id, coalesce(d.posture, 'unknown') AS posture, count(*) "
+                "SELECT d.region_id, coalesce(d.posture, 'unknown') AS posture, "
+                "       count(*) AS n, count(*) FILTER (WHERE d.under_panel) AS shel "
                 "FROM detections d "
                 "JOIN frames f ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path "
                 "WHERE d.region_id IS NOT NULL AND f.frame_idx = ? "
@@ -135,12 +165,30 @@ def create_app(config: Config) -> FastAPI:
         c.close()
         counts: dict[str, int] = {}
         postures: dict[str, dict[str, int]] = {}
-        for rid, posture, n in rows:
+        sheltering: dict[str, int] = {}
+        for rid, posture, n, shel in rows:
             n = int(n)
             counts[rid] = counts.get(rid, 0) + n
+            sheltering[rid] = sheltering.get(rid, 0) + int(shel or 0)
             slot = postures.setdefault(rid, {"standing": 0, "lying": 0, "unknown": 0})
             slot[posture if posture in slot else "unknown"] += n
-        return {"counts": counts, "postures": postures, "frame": frame}
+        return {"counts": counts, "postures": postures, "sheltering": sheltering, "frame": frame}
+
+    @app.get("/api/day-series")
+    def day_series():
+        """Per-frame metric arrays (summed across cameras) for the time-of-day bar
+        strips: frames + total / standing / lying / sheltering / open. Same frame
+        axis as the scrubber's activity strip."""
+        c = con()
+        df = db.day_series(c)
+        c.close()
+        keys = ["total", "standing", "lying", "sheltering", "open"]
+        if df.empty:
+            return {"frames": [], **{k: [] for k in keys}}
+        return {
+            "frames": [int(x) for x in df["frame_idx"].tolist()],
+            **{k: [int(x) for x in df[k].tolist()] for k in keys},
+        }
 
     @app.get("/api/area-summary")
     def area_summary():
@@ -210,16 +258,7 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(404, "image missing")
         return FileResponse(path)
 
-    # ------------------------------------------------------------------ panels
-    @app.post("/api/panels")
-    def set_panels(req: PanelsReq):
-        """Save the solar-panel footprints (site-wide ortho + per-camera image px),
-        then re-localize so per-detection shelter flags are recomputed."""
-        save_panels(config.paths.panels, {"ortho": req.ortho, "cameras": req.cameras})
-        n_cameras = sum(len(v) for v in req.cameras.values())
-        return {"n_ortho": len(req.ortho), "n_cameras": n_cameras,
-                "updated": run_localize(config)}
-
+    # ------------------------------------------------------------------ shelter
     @app.get("/api/shelter")
     def shelter(camera: str = "all", trunc: str = "hour"):
         """Sheltering (under-panel) counts over time. `camera='all'` (or missing)

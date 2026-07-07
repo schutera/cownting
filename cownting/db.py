@@ -120,14 +120,15 @@ def update_region(con, df: pd.DataFrame) -> None:
 
 
 def update_shelter(con, df: pd.DataFrame) -> None:
-    """df: detection_id, under_panel, near_infra, panel_id."""
+    """df: detection_id, under_panel, panel_id (panel areas are polygons, so there
+    is no band boundary flag — near_infra stays NULL)."""
     if df.empty:
         return
-    con.register("df_s", df[["detection_id", "under_panel", "near_infra", "panel_id"]])
+    con.register("df_s", df[["detection_id", "under_panel", "panel_id"]])
     con.execute(
         """
         UPDATE detections AS d
-        SET under_panel = s.under_panel, near_infra = s.near_infra, panel_id = s.panel_id
+        SET under_panel = s.under_panel, panel_id = s.panel_id
         FROM df_s AS s
         WHERE d.detection_id = s.detection_id
         """
@@ -187,6 +188,30 @@ def kpi_summary(con) -> dict:
     }
 
 
+def day_series(con) -> pd.DataFrame:
+    """Per-frame counts summed across cameras, for the time-of-day bar strips:
+    total in view + standing/lying + sheltering. Shares the frame axis with the
+    scrubber's activity strip (LEFT JOIN so zero-cow frames keep their slot).
+
+    `sheltering` (under_panel TRUE) and `open` (under_panel FALSE) are the two
+    halves of the under-panel share; they exclude cows on cameras with no panel
+    areas (under_panel NULL), exactly as standing/lying exclude unknown posture."""
+    return con.execute(
+        """
+        SELECT f.frame_idx AS frame_idx,
+               count(d.detection_id)                                     AS total,
+               count(d.detection_id) FILTER (WHERE d.posture='standing')  AS standing,
+               count(d.detection_id) FILTER (WHERE d.posture='lying')     AS lying,
+               count(d.detection_id) FILTER (WHERE d.under_panel)         AS sheltering,
+               count(d.detection_id) FILTER (WHERE d.under_panel = false) AS "open"
+        FROM frames f
+        LEFT JOIN detections d
+          ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path
+        GROUP BY f.frame_idx ORDER BY f.frame_idx
+        """
+    ).df()
+
+
 def area_summary(con) -> pd.DataFrame:
     """Whole-day totals per count area, split by posture. Feeds the static
     per-area KPI list (cows spotted + standing/lying) on the right rail."""
@@ -195,11 +220,52 @@ def area_summary(con) -> pd.DataFrame:
         SELECT region_id,
                count(*)                                       AS total,
                count(*) FILTER (WHERE posture = 'standing')   AS standing,
-               count(*) FILTER (WHERE posture = 'lying')      AS lying
+               count(*) FILTER (WHERE posture = 'lying')      AS lying,
+               count(*) FILTER (WHERE under_panel)            AS sheltering
         FROM detections
         WHERE region_id IS NOT NULL
         GROUP BY region_id
         ORDER BY total DESC
+        """
+    ).df()
+
+
+def area_counts_whole_day(con) -> pd.DataFrame:
+    """Whole-day occupancy per count area for the map's "whole day" toggle.
+
+    `peak` is the max cows present in the area *at the same instant* (max over
+    frames of the per-frame count) — the natural whole-day analog of the single-
+    frame badge, and unlike a cumulative sum it stays a small, readable integer.
+    standing/lying/unknown are whole-day cumulative counts, used only for the
+    posture ring's proportions; `sheltering` is the peak simultaneous under-panel
+    count. Empty frame => no rows (not a blank latest frame).
+    """
+    return con.execute(
+        """
+        WITH per_frame AS (
+            SELECT d.region_id AS region_id, f.frame_idx AS frame_idx,
+                   count(*)                             AS cnt,
+                   count(*) FILTER (WHERE d.under_panel) AS shel
+            FROM detections d
+            JOIN frames f ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path
+            WHERE d.region_id IS NOT NULL
+            GROUP BY d.region_id, f.frame_idx
+        ),
+        peak AS (
+            SELECT region_id, max(cnt) AS peak, max(shel) AS sheltering
+            FROM per_frame GROUP BY region_id
+        ),
+        posture AS (
+            SELECT region_id,
+                   count(*) FILTER (WHERE coalesce(posture, 'unknown') = 'standing') AS standing,
+                   count(*) FILTER (WHERE coalesce(posture, 'unknown') = 'lying')     AS lying,
+                   count(*) FILTER (WHERE coalesce(posture, 'unknown')
+                                          NOT IN ('standing', 'lying'))               AS unknown
+            FROM detections WHERE region_id IS NOT NULL GROUP BY region_id
+        )
+        SELECT p.region_id, p.peak, p.sheltering, o.standing, o.lying, o.unknown
+        FROM peak p JOIN posture o USING (region_id)
+        ORDER BY p.peak DESC
         """
     ).df()
 

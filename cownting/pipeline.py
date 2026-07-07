@@ -84,6 +84,10 @@ def localize(config: Config) -> int:
     con = db.connect(config.paths.db_path)
     areas = load_count_areas(config.paths.count_areas)
 
+    # Reset assignments first so shrinking/removing an area (or a whole camera's
+    # areas) clears stale region_id / shelter flags — recomputed fresh below.
+    con.execute("UPDATE detections SET region_id = NULL, under_panel = NULL, panel_id = NULL")
+
     updated = 0
     for camera_id in areas:
         cam_areas = areas.get(camera_id, [])
@@ -102,29 +106,25 @@ def localize(config: Config) -> int:
         db.update_region(con, dets[["detection_id", "region_id"]])
         updated += len(dets)
 
-    # Shelter (panel) assignment — image-space & per-camera, so it is INDEPENDENT of
-    # world_x/fence: compute for EVERY detection of a camera that has drawn footprints.
-    from .scene.panels import assign_panels, camera_panels, load_panels
-
-    panels = load_panels(config.paths.panels)
-    if panels is not None:
-        for camera_id in panels.get("cameras", {}):
-            if not camera_panels(panels, camera_id):
-                continue
-            sdets = con.execute(
-                "SELECT detection_id, ground_px_x, ground_px_y FROM detections WHERE camera_id = ?",
-                [camera_id],
-            ).df()
-            if sdets.empty:
-                continue
-            res = assign_panels(
-                sdets[["ground_px_x", "ground_px_y"]].to_numpy(),
-                camera_id, panels, config.shade.margin_px,
-            )
-            sdets["under_panel"] = pd.array(res["under_panel"], dtype=object)
-            sdets["near_infra"] = pd.array(res["boundary"], dtype=object)
-            sdets["panel_id"] = pd.array(res["panel_id"], dtype=object)
-            db.update_shelter(con, sdets)
+    # Shelter assignment — polygon "panel areas": the SAME per-camera, image-space
+    # point-in-polygon test as count areas. A cow whose ground point falls inside
+    # any of a camera's panel-area polygons counts as under a panel.
+    panel_areas = load_count_areas(config.paths.panel_areas)
+    for camera_id, cam_pareas in panel_areas.items():
+        if not cam_pareas:
+            continue
+        sdets = con.execute(
+            "SELECT detection_id, ground_px_x, ground_px_y FROM detections WHERE camera_id = ?",
+            [camera_id],
+        ).df()
+        if sdets.empty:
+            continue
+        pids = assign_regions(
+            sdets[["ground_px_x", "ground_px_y"]].to_numpy(), cam_pareas, camera_id,
+        )
+        sdets["under_panel"] = pd.array([p is not None for p in pids], dtype=object)
+        sdets["panel_id"] = pd.array(pids, dtype=object)
+        db.update_shelter(con, sdets)
 
     print(f"[localize] updated {updated} detections")
     con.close()

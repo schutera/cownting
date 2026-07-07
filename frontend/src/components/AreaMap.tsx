@@ -36,6 +36,8 @@ export function AreaMap({
   const [counts, setCounts] = useState<Record<string, number>>({});
   // Per-area posture composition (standing/lying/unknown) driving the badge ring.
   const [postures, setPostures] = useState<Record<string, PostureBreakdown>>({});
+  // Per-area cows under a panel — drawn as unit blocks stacked above the circle.
+  const [sheltering, setSheltering] = useState<Record<string, number>>({});
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -64,6 +66,7 @@ export function AreaMap({
         if (!alive) return;
         setCounts(d.counts ?? {});
         setPostures(d.postures ?? {});
+        setSheltering(d.sheltering ?? {});
       })
       .catch(() => {
         /* counts are optional — the map still renders the area outlines */
@@ -109,24 +112,36 @@ export function AreaMap({
     const sy = h / oh;
     const base = Math.min(w, h);
 
+    // --- Pass 1: gather one drawable per visible area, anchored at its ortho
+    // polygon centroid, plus its per-render pulse / delta hue (time-fixed for
+    // this frame). `x/y` start at the anchor and get nudged apart below.
+    type Item = {
+      area: (typeof areas)[string][number];
+      rid: string;
+      poly: number[][];
+      ax: number; // anchor (true centroid) — where the leader line starts
+      ay: number;
+      x: number; // drawn badge position (relaxed to avoid overlaps)
+      y: number;
+      count: number;
+      pulse: number;
+      auraColor: string;
+    };
+    const items: Item[] = [];
     Object.entries(areas).forEach(([cam, list]) => {
       if (hidden?.has(cam)) return;
       list.forEach((area) => {
         const poly = area.ortho_polygon;
         if (!poly || poly.length < 3) return;
         const rid = `${cam}::${area.id}`;
-        const count = counts[rid] ?? 0;
-
-        // Polygon centroid (simple vertex average — areas are convex-ish).
         let sxSum = 0;
         let sySum = 0;
         poly.forEach((p) => {
           sxSum += p[0];
           sySum += p[1];
         });
-        const cx = (sxSum / poly.length) * sx;
-        const cy = (sySum / poly.length) * sy;
-
+        const ax = (sxSum / poly.length) * sx;
+        const ay = (sySum / poly.length) * sy;
         // Decaying pulse factor (0..1) for a short bump after a change.
         const start = pulseStartRef.current[rid];
         let pulse = 0;
@@ -134,102 +149,218 @@ export function AreaMap({
           const t = (now - start) / PULSE_MS;
           if (t >= 0 && t < 1) pulse = Math.sin(Math.PI * t) * (1 - t);
         }
-
         // Aura hue by delta vs the previous render.
         const d = deltaRef.current[rid] ?? 0;
         const auraColor = d > 0 ? HEAT_HOT : d < 0 ? SHELTER_COLOR : CHART_MUTED;
-
-        // Radius/opacity grow with the count; the pulse nudges both.
-        const auraR =
-          (base * 0.05 + Math.sqrt(count) * base * 0.03) * (1 + 0.25 * pulse);
-        const auraA =
-          Math.min(0.55, 0.12 + count * 0.05) * (1 + 0.4 * pulse);
-        if (count > 0 || pulse > 0) {
-          ctx.globalCompositeOperation = "lighter";
-          const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, auraR);
-          grad.addColorStop(0, hexToRgba(auraColor, auraA));
-          grad.addColorStop(1, hexToRgba(auraColor, 0));
-          ctx.fillStyle = grad;
-          ctx.beginPath();
-          ctx.arc(cx, cy, auraR, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.globalCompositeOperation = "source-over";
-        }
-
-        // Area outline (dashed, tinted by the same delta hue).
-        ctx.strokeStyle = hexToRgba(auraColor, 0.85);
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([5, 3]);
-        ctx.beginPath();
-        poly.forEach((p, i) => {
-          const px = p[0] * sx;
-          const py = p[1] * sy;
-          if (i === 0) ctx.moveTo(px, py);
-          else ctx.lineTo(px, py);
+        items.push({
+          area,
+          rid,
+          poly,
+          ax,
+          ay,
+          x: ax,
+          y: ay,
+          count: counts[rid] ?? 0,
+          pulse,
+          auraColor,
         });
-        ctx.closePath();
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Count badge — dark disc, delta-tinted ring, integer count centred.
-        const badgeR = (base * 0.028 + 6) * (1 + 0.15 * pulse);
-        ctx.beginPath();
-        ctx.arc(cx, cy, badgeR, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(38,40,45,0.92)";
-        ctx.fill();
-        ctx.strokeStyle = hexToRgba(auraColor, 0.95);
-        ctx.lineWidth = 2;
-        ctx.stroke();
-
-        // Posture composition ring around the badge: three arcs sized by the
-        // standing / resting / unknown split for this area (reused proxy).
-        const pb = postures[rid];
-        const pbTotal = pb ? pb.standing + pb.lying + pb.unknown : 0;
-        let ringOuter = badgeR; // used to place the name label clear of the ring
-        if (pb && count > 0 && pbTotal > 0) {
-          const segs = [
-            { v: pb.standing, c: ACTIVE_COLOR }, // amber — standing / active
-            { v: pb.lying, c: REST_COLOR }, // sage — lying / resting
-            { v: pb.unknown, c: CHART_MUTED }, // muted — unclassified
-          ].filter((s) => s.v > 0);
-          const ringW = Math.max(2.5, badgeR * 0.3);
-          const ringR = badgeR + ringW * 0.5 + 3;
-          ringOuter = ringR + ringW * 0.5;
-          const gap = segs.length > 1 ? 0.1 : 0; // small angular gap between arcs
-          const span = Math.PI * 2 - gap * segs.length;
-          let a0 = -Math.PI / 2 + gap / 2; // start at 12 o'clock
-          ctx.lineWidth = ringW;
-          ctx.lineCap = "butt";
-          segs.forEach((s) => {
-            const sweep = (s.v / pbTotal) * span;
-            ctx.beginPath();
-            ctx.strokeStyle = hexToRgba(s.c, 0.95);
-            ctx.arc(cx, cy, ringR, a0, a0 + sweep);
-            ctx.stroke();
-            a0 += sweep + gap;
-          });
-        }
-
-        ctx.fillStyle = "#ffffff";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.font = `600 ${Math.round(
-          badgeR * 0.95,
-        )}px ui-sans-serif, system-ui, sans-serif`;
-        ctx.fillText(String(count), cx, cy);
-
-        // Area name label under the badge (clearing the ring), soft shadow.
-        ctx.save();
-        ctx.shadowColor = "rgba(0,0,0,0.6)";
-        ctx.shadowBlur = 3;
-        ctx.fillStyle = "rgba(255,255,255,0.92)";
-        ctx.font = `500 ${Math.round(
-          Math.max(10, base * 0.018),
-        )}px ui-sans-serif, system-ui, sans-serif`;
-        ctx.fillText(area.name, cx, cy + ringOuter + 9);
-        ctx.restore();
       });
     });
+
+    // Uniform badge footprint (badge disc + posture ring + a band for the name
+    // label). Camera views overlap on the ortho, so several centroids can land
+    // within a badge's width — relax the badge POSITIONS apart (outlines stay
+    // put) so no two discs/labels collide, keeping each near its own area.
+    const badgeR0 = base * 0.028 + 6;
+    const ringW0 = Math.max(2.5, badgeR0 * 0.3);
+    const ringOuter0 = badgeR0 + ringW0 + 3;
+    const labelBand = base * 0.02 + 8;
+    const sep = 2 * ringOuter0 + labelBand; // min center-to-center distance
+    const margin = ringOuter0 + 4;
+    for (let iter = 0; iter < 80; iter++) {
+      for (let i = 0; i < items.length; i++) {
+        for (let k = i + 1; k < items.length; k++) {
+          const A = items[i];
+          const B = items[k];
+          const dx = B.x - A.x;
+          const dy = B.y - A.y;
+          let dist = Math.hypot(dx, dy);
+          if (dist >= sep) continue;
+          let nx: number;
+          let ny: number;
+          if (dist < 0.001) {
+            // Coincident centroids — separate along a deterministic direction.
+            const ang = i * 2.3999632; // golden angle, no RNG (RNG is unavailable)
+            nx = Math.cos(ang);
+            ny = Math.sin(ang);
+            dist = 0;
+          } else {
+            nx = dx / dist;
+            ny = dy / dist;
+          }
+          const push = (sep - dist) / 2;
+          A.x -= nx * push;
+          A.y -= ny * push;
+          B.x += nx * push;
+          B.y += ny * push;
+        }
+      }
+      // Gentle spring back toward the true centroid + clamp inside the canvas,
+      // so badges settle as close to their areas as the no-overlap rule allows.
+      for (const it of items) {
+        it.x += (it.ax - it.x) * 0.04;
+        it.y += (it.ay - it.y) * 0.04;
+        it.x = Math.max(margin, Math.min(w - margin, it.x));
+        it.y = Math.max(margin, Math.min(h - margin, it.y));
+      }
+    }
+
+    // --- Pass 2: auras (additive glow) for all areas first, so a neighbour's
+    // glow never washes over another badge.
+    ctx.globalCompositeOperation = "lighter";
+    for (const it of items) {
+      const auraR =
+        (base * 0.05 + Math.sqrt(it.count) * base * 0.03) * (1 + 0.25 * it.pulse);
+      const auraA = Math.min(0.55, 0.12 + it.count * 0.05) * (1 + 0.4 * it.pulse);
+      if (it.count > 0 || it.pulse > 0) {
+        const grad = ctx.createRadialGradient(it.x, it.y, 0, it.x, it.y, auraR);
+        grad.addColorStop(0, hexToRgba(it.auraColor, auraA));
+        grad.addColorStop(1, hexToRgba(it.auraColor, 0));
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(it.x, it.y, auraR, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalCompositeOperation = "source-over";
+
+    // --- Pass 3: area outlines (dashed) at their true polygons.
+    for (const it of items) {
+      ctx.strokeStyle = hexToRgba(it.auraColor, 0.85);
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 3]);
+      ctx.beginPath();
+      it.poly.forEach((p, i) => {
+        const px = p[0] * sx;
+        const py = p[1] * sy;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // --- Pass 4: leader lines from each moved badge back to its centroid.
+    for (const it of items) {
+      const moved = Math.hypot(it.x - it.ax, it.y - it.ay);
+      if (moved <= badgeR0 * 0.5) continue;
+      ctx.strokeStyle = "rgba(255,255,255,0.4)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath();
+      ctx.moveTo(it.ax, it.ay);
+      ctx.lineTo(it.x, it.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(it.ax, it.ay, 2, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.55)";
+      ctx.fill();
+    }
+
+    // --- Pass 5: badges (disc + posture ring + panel blocks + count + label).
+    for (const it of items) {
+      const { area, rid, pulse, auraColor, count } = it;
+      const cx = it.x;
+      const cy = it.y;
+
+      // Count badge — dark disc, delta-tinted ring, integer count centred.
+      const badgeR = (base * 0.028 + 6) * (1 + 0.15 * pulse);
+      ctx.beginPath();
+      ctx.arc(cx, cy, badgeR, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(38,40,45,0.92)";
+      ctx.fill();
+      ctx.strokeStyle = hexToRgba(auraColor, 0.95);
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Posture composition ring around the badge: three arcs sized by the
+      // standing / resting / unknown split for this area (reused proxy).
+      const pb = postures[rid];
+      const pbTotal = pb ? pb.standing + pb.lying + pb.unknown : 0;
+      let ringOuter = badgeR; // used to place the name label clear of the ring
+      if (pb && count > 0 && pbTotal > 0) {
+        const segs = [
+          { v: pb.standing, c: ACTIVE_COLOR }, // amber — standing / active
+          { v: pb.lying, c: REST_COLOR }, // sage — lying / resting
+          { v: pb.unknown, c: CHART_MUTED }, // muted — unclassified
+        ].filter((s) => s.v > 0);
+        const ringW = Math.max(2.5, badgeR * 0.3);
+        const ringR = badgeR + ringW * 0.5 + 3;
+        ringOuter = ringR + ringW * 0.5;
+        const gap = segs.length > 1 ? 0.1 : 0; // small angular gap between arcs
+        const span = Math.PI * 2 - gap * segs.length;
+        let a0 = -Math.PI / 2 + gap / 2; // start at 12 o'clock
+        ctx.lineWidth = ringW;
+        ctx.lineCap = "butt";
+        segs.forEach((s) => {
+          const sweep = (s.v / pbTotal) * span;
+          ctx.beginPath();
+          ctx.strokeStyle = hexToRgba(s.c, 0.95);
+          ctx.arc(cx, cy, ringR, a0, a0 + sweep);
+          ctx.stroke();
+          a0 += sweep + gap;
+        });
+      }
+
+      // Panel indicator — a vertical stack of unit blocks above the circle, one
+      // teal rectangle per cow under a panel in this area (this camera's shelter).
+      const shel = sheltering[rid] ?? 0;
+      if (shel > 0) {
+        const blockW = badgeR * 1.25;
+        const blockH = Math.max(2.5, base * 0.011);
+        const blockGap = Math.max(1.5, blockH * 0.55);
+        const maxBlocks = 16;
+        const nBlocks = Math.min(shel, maxBlocks);
+        let by = cy - ringOuter - 6 - blockH; // top edge of the lowest block
+        for (let m = 0; m < nBlocks; m++) {
+          ctx.fillStyle = hexToRgba(SHELTER_COLOR, 0.92);
+          ctx.fillRect(cx - blockW / 2, by, blockW, blockH);
+          by -= blockH + blockGap;
+        }
+        if (shel > maxBlocks) {
+          ctx.save();
+          ctx.shadowColor = "rgba(0,0,0,0.6)";
+          ctx.shadowBlur = 3;
+          ctx.fillStyle = hexToRgba(SHELTER_COLOR, 0.98);
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+          ctx.font = `600 ${Math.round(Math.max(9, base * 0.014))}px ui-sans-serif, system-ui, sans-serif`;
+          ctx.fillText(String(shel), cx, by - 1);
+          ctx.restore();
+        }
+      }
+
+      ctx.fillStyle = "#ffffff";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.font = `600 ${Math.round(
+        badgeR * 0.95,
+      )}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.fillText(String(count), cx, cy);
+
+      // Area name label under the badge (clearing the ring), soft shadow.
+      ctx.save();
+      ctx.shadowColor = "rgba(0,0,0,0.6)";
+      ctx.shadowBlur = 3;
+      ctx.fillStyle = "rgba(255,255,255,0.92)";
+      ctx.font = `500 ${Math.round(
+        Math.max(10, base * 0.018),
+      )}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.fillText(area.name, cx, cy + ringOuter + 9);
+      ctx.restore();
+    }
   }
 
   // Animation loop: keeps redrawing while any badge is mid-pulse, then parks.
@@ -258,7 +389,7 @@ export function AreaMap({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [areas, counts, postures, cameras, hidden]);
+  }, [areas, counts, postures, sheltering, cameras, hidden]);
 
   if (!areas) {
     return (
@@ -298,7 +429,7 @@ export function AreaMap({
           ? "No count areas yet — add one on a camera to start counting"
           : `${shownTotal} cow${shownTotal === 1 ? "" : "s"} across ${nAreas} area${
               nAreas === 1 ? "" : "s"
-            } · this frame`}
+            } · ${frame == null ? "peak, whole day" : "this frame"}`}
       </div>
       {nAreas > 0 ? (
         <div className="flex items-center gap-3 mt-1.5 text-[11px] text-gray-tertiary">

@@ -135,12 +135,51 @@ def eval_detect(
     evaluate(_load(config), weights=weights)
 
 
+def _run_test_gate() -> bool:
+    """Run `python -m tests` before serving. Returns True to proceed, False to
+    abort. If the tests/ dir is absent (e.g. an installed build without it), the
+    gate is skipped with a note rather than blocking."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    if not (root / "tests").is_dir():
+        typer.echo("serve: no tests/ dir found — skipping pre-boot test gate.")
+        return True
+    typer.echo("serve: running test gate (`python -m tests`) before boot…")
+    rc = subprocess.run([sys.executable, "-m", "tests"], cwd=str(root)).returncode
+    if rc != 0:
+        typer.secho(
+            "serve: ABORTED — tests failed. Fix them, or boot anyway with "
+            "`serve --skip-tests`.",
+            fg=typer.colors.RED,
+        )
+        return False
+    typer.secho("serve: test gate passed.", fg=typer.colors.GREEN)
+    return True
+
+
 @app.command()
-def serve(config: str = CONFIG_OPT, host: str = "127.0.0.1", port: int = 8000):
-    """Run the FastAPI backend + serve the built React frontend (frontend/dist)."""
+def serve(
+    config: str = CONFIG_OPT,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    skip_tests: bool = typer.Option(
+        False, "--skip-tests", help="Boot without running the pre-boot test gate."
+    ),
+):
+    """Run the FastAPI backend + serve the built React frontend (frontend/dist).
+
+    Runs the test suite first and refuses to boot if it fails (override with
+    --skip-tests), so a broken API contract never silently ships to the browser.
+    """
     import uvicorn
 
     from .api import create_app
+
+    if not skip_tests and not _run_test_gate():
+        raise typer.Exit(1)
 
     uvicorn.run(create_app(_load(config)), host=host, port=port)
 

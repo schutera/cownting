@@ -1,11 +1,21 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { Areas, CountArea as Area, Site } from "../lib/types";
-import { getAreas, getSite, orthoImg, refImg, saveAreas } from "../lib/api";
+import {
+  getAreas,
+  getPanelAreas,
+  getSite,
+  orthoImg,
+  refImg,
+  saveAreas,
+  savePanelAreas,
+} from "../lib/api";
 import { ImageClicker } from "../components/ImageClicker";
 import { Button, Card, SectionLabel } from "../components/ui";
+import { SHELTER_COLOR } from "../lib/palette";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
+type Mode = "count" | "panel";
 
 /**
  * Per-camera count-area editor. A count area is a named region drawn twice: its
@@ -23,29 +33,53 @@ export default function CountArea() {
   const { camera = "" } = useParams();
 
   const [site, setSite] = useState<Site | null>(null);
-  const [allAreas, setAllAreas] = useState<Areas>({});
+  // Two independent per-camera polygon sets: count areas (tally cows) and panel
+  // areas (a cow inside one is 'under a panel'). `mode` picks which is edited.
+  const [countMap, setCountMap] = useState<Areas>({});
+  const [panelMap, setPanelMap] = useState<Areas>({});
+  const [mode, setMode] = useState<Mode>("count");
   const [areas, setAreas] = useState<Area[]>([]);
   const [active, setActive] = useState(0);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveErr, setSaveErr] = useState<string | null>(null);
 
+  const isPanel = mode === "panel";
+
   useEffect(() => {
     let alive = true;
     setLoadErr(null);
-    Promise.all([getSite(), getAreas()])
-      .then(([s, a]) => {
+    Promise.all([getSite(), getAreas(), getPanelAreas()])
+      .then(([s, cnt, pnl]) => {
         if (!alive) return;
         setSite(s);
-        setAllAreas(a);
-        setAreas(a[camera] ?? []);
+        setCountMap(cnt);
+        setPanelMap(pnl);
+        setAreas((mode === "count" ? cnt : pnl)[camera] ?? []);
         setActive(0);
       })
       .catch((e) => alive && setLoadErr(String(e)));
     return () => {
       alive = false;
     };
+    // Only reload from the server on camera change; mode switches are local.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera]);
+
+  const activeMap = isPanel ? panelMap : countMap;
+  const setActiveMap = isPanel ? setPanelMap : setCountMap;
+
+  // Swap edit target, committing the current mode's in-memory edits first so a
+  // toggle never drops unsaved work.
+  function switchMode(m: Mode) {
+    if (m === mode) return;
+    setActiveMap((prev) => ({ ...prev, [camera]: areas }));
+    const nextMap = m === "panel" ? panelMap : countMap;
+    setMode(m);
+    setAreas(nextMap[camera] ?? []);
+    setActive(0);
+    setSaveState("idle");
+  }
 
   const ref = site?.references?.[camera] ?? null;
   const ortho = site?.orthophoto ?? null;
@@ -79,7 +113,7 @@ export default function CountArea() {
   }
 
   function addArea() {
-    const name = defaultName(areas);
+    const name = defaultName(areas, isPanel ? `${camera} panel` : camera);
     const id = uniqueSlug(name, areas);
     setAreas((prev) => [...prev, { id, name, camera_polygon: [], ortho_polygon: [] }]);
     setActive(areas.length);
@@ -103,10 +137,10 @@ export default function CountArea() {
     // Fill in / normalize any id that drifted (empty name etc.) and keep them
     // unique within this camera before persisting.
     const normalized = withUniqueIds(areas);
-    const fullMap: Areas = { ...allAreas, [camera]: normalized };
+    const fullMap: Areas = { ...activeMap, [camera]: normalized };
     try {
-      await saveAreas(fullMap);
-      setAllAreas(fullMap);
+      await (isPanel ? savePanelAreas : saveAreas)(fullMap);
+      setActiveMap(fullMap);
       setAreas(normalized);
       setSaveState("saved");
     } catch (e) {
@@ -122,20 +156,33 @@ export default function CountArea() {
 
   return (
     <div className="animate-fade-slide-in">
-      <div className="mb-6 flex items-center justify-between gap-4">
+      <div className="mb-6 flex items-start justify-between gap-4">
         <div>
           <Link to="/" className="font-mono text-[11px] text-gray-tertiary hover:text-accent">
             ← Dashboard
           </Link>
           <h1 className="font-sans text-2xl text-near-black mt-2">
-            Count areas · <span className="text-accent">{camera}</span>
+            {isPanel ? "Panel areas" : "Count areas"} ·{" "}
+            <span className="text-accent">{camera}</span>
           </h1>
           <p className="text-[13px] text-text mt-1 max-w-3xl">
-            Draw a region on the <strong>camera frame</strong> (left) — its polygon is
-            what counts cows. Draw the matching region on the <strong>orthophoto</strong>{" "}
-            (right) to place it on the map. Both belong to the same selected area.
+            {isPanel ? (
+              <>
+                Draw the <strong>shade under a panel</strong> on the{" "}
+                <strong>camera frame</strong> (left) — a cow whose ground point falls
+                inside it counts as <strong>under a panel</strong>. Draw the matching shape
+                on the <strong>orthophoto</strong> (right) for the map.
+              </>
+            ) : (
+              <>
+                Draw a region on the <strong>camera frame</strong> (left) — its polygon is
+                what counts cows. Draw the matching region on the{" "}
+                <strong>orthophoto</strong> (right) to place it on the map.
+              </>
+            )}
           </p>
         </div>
+        <ModeToggle mode={mode} onMode={switchMode} />
       </div>
 
       {loadErr ? (
@@ -192,7 +239,7 @@ export default function CountArea() {
           );
         })}
         <Button variant="ghost" onClick={addArea}>
-          + Add area
+          + Add {isPanel ? "panel" : "area"}
         </Button>
       </div>
 
@@ -204,8 +251,8 @@ export default function CountArea() {
               <ImageClicker
                 title={
                   activeArea
-                    ? `Camera frame — ${activeArea.name} (counts here)`
-                    : "Camera frame — add an area to begin"
+                    ? `Camera frame — ${activeArea.name} (${isPanel ? "under panel" : "counts here"})`
+                    : `Camera frame — add ${isPanel ? "a panel area" : "an area"} to begin`
                 }
                 src={refImg(camera)}
                 naturalWidth={ref.width}
@@ -268,7 +315,11 @@ export default function CountArea() {
 
       <div className="mt-6 flex flex-wrap items-center gap-4">
         <Button onClick={save} disabled={saveState === "saving"}>
-          {saveState === "saving" ? "Saving…" : "Save count areas"}
+          {saveState === "saving"
+            ? "Saving…"
+            : isPanel
+              ? "Save panel areas"
+              : "Save count areas"}
         </Button>
         <span className="font-mono text-[11px] text-gray-tertiary">
           {areas.length} area{areas.length === 1 ? "" : "s"} · {totalVerts} point
@@ -281,6 +332,33 @@ export default function CountArea() {
           <span className="font-mono text-[11px] text-[#e76f51]">Save failed — {saveErr}</span>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+/** Segmented toggle: edit count areas (tally cows) vs panel areas (shelter). */
+function ModeToggle({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
+  return (
+    <div className="inline-flex border border-border rounded overflow-hidden shrink-0">
+      <button
+        onClick={() => onMode("count")}
+        className={
+          "px-3 py-1.5 text-[12px] font-mono transition-colors " +
+          (mode === "count" ? "bg-accent text-white" : "text-gray-tertiary hover:text-accent")
+        }
+      >
+        count areas
+      </button>
+      <button
+        onClick={() => onMode("panel")}
+        className={
+          "px-3 py-1.5 text-[12px] font-mono transition-colors " +
+          (mode === "panel" ? "text-white" : "text-gray-tertiary hover:text-gray-mid")
+        }
+        style={mode === "panel" ? { background: SHELTER_COLOR } : undefined}
+      >
+        panel areas
+      </button>
     </div>
   );
 }
@@ -336,12 +414,14 @@ function uniqueSlug(name: string, areas: Area[], skip = -1): string {
   return `${base}-${k}`;
 }
 
-/** Default "Area N" name not already taken. */
-function defaultName(areas: Area[]): string {
+/** Default name after the camera; numbered only when a camera has several. */
+function defaultName(areas: Area[], camera: string): string {
+  const base = camera || "area";
   const used = new Set(areas.map((a) => a.name));
-  let k = areas.length + 1;
-  while (used.has(`Area ${k}`)) k++;
-  return `Area ${k}`;
+  if (!used.has(base)) return base;
+  let k = 2;
+  while (used.has(`${base} ${k}`)) k++;
+  return `${base} ${k}`;
 }
 
 /** Re-derive unique ids from names right before persisting. */

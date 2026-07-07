@@ -108,26 +108,25 @@ def test_update_shelter_round_trip():
         ids = _det_ids(con, "camera_01")
         check("update_shelter: 3 detections inserted", len(ids) == 3, f"ids={ids}")
 
-        # Row 0: under panel A. Row 1: boundary/uncertain (near_infra). Row 2: open, no panel.
+        # Panel areas are polygons (no band boundary flag): row0 under panel A, rest open.
         upd = pd.DataFrame({
             "detection_id": ids,
             "under_panel": [True, False, False],
-            "near_infra": [False, True, False],
             "panel_id": ["A", None, None],
         })
         db.update_shelter(con, upd)
 
         got = con.execute(
-            "SELECT detection_id, under_panel, near_infra, panel_id "
+            "SELECT detection_id, under_panel, panel_id "
             "FROM detections ORDER BY detection_id"
         ).fetchall()
-        by_id = {r[0]: (r[1], r[2], r[3]) for r in got}
+        by_id = {r[0]: (r[1], r[2]) for r in got}
         check("update_shelter: row0 under_panel=True, panel_id=A",
-              by_id[ids[0]] == (True, False, "A"), str(by_id[ids[0]]))
-        check("update_shelter: row1 near_infra=True (boundary), not under_panel",
-              by_id[ids[1]] == (False, True, None), str(by_id[ids[1]]))
-        check("update_shelter: row2 open (all False/None)",
-              by_id[ids[2]] == (False, False, None), str(by_id[ids[2]]))
+              by_id[ids[0]] == (True, "A"), str(by_id[ids[0]]))
+        check("update_shelter: row1 open (not under_panel, no id)",
+              by_id[ids[1]] == (False, None), str(by_id[ids[1]]))
+        check("update_shelter: row2 open (not under_panel, no id)",
+              by_id[ids[2]] == (False, None), str(by_id[ids[2]]))
 
         # Targeting: only the intended rows changed; empty df is a no-op.
         db.update_shelter(con, upd.iloc[0:0])
@@ -153,7 +152,6 @@ def test_kpi_summary_pct_sheltering():
         upd = pd.DataFrame({
             "detection_id": ids,
             "under_panel": [True, True, False, False],
-            "near_infra": [False, False, False, False],
             "panel_id": ["A", "B", None, None],
         })
         db.update_shelter(con, upd)
@@ -199,7 +197,6 @@ def test_shelter_over_time():
         upd = pd.DataFrame({
             "detection_id": ids_cam1 + ids_cam2,
             "under_panel": [True, False, True, True],
-            "near_infra": [False, False, False, False],
             "panel_id": ["A", None, "A", "A"],
         })
         db.update_shelter(con, upd)
