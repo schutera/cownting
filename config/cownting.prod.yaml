@@ -1,0 +1,44 @@
+project: cownting
+
+# On a server deployment cameras are added by UPLOADING video in the dashboard
+# (each upload builds its own per-camera config for that day's batch), so the
+# static camera list is intentionally empty here.
+cameras: []
+
+ingest:
+  target_fps: 1.0
+  time_bin_seconds: 2.0
+  # Time-lapse only (e.g. a Brinno at 1 frame/min -> 60). Leave null for normal
+  # real-time video. Uploads read each file's own capture time regardless.
+  frame_interval_seconds: null
+  save_frames: true
+
+detect:
+  backend: yolo
+  device: auto                     # -> cpu on this (CPU-only) server
+  conf: 0.25
+  yolo_weights: yolo11x-seg.pt     # must match the Dockerfile YOLO_WEIGHTS arg
+  class_names: [cow]
+
+posture:
+  enabled: true
+  lying_elongation: 1.9
+
+flags:
+  pose_enabled: false              # pose stage needs transformers+scipy (see requirements)
+
+auth:
+  enabled: true
+  session_max_age: 43200           # session cookie lifetime, seconds (12h)
+  # Flip to true once served over HTTPS (a domain in CADDY_SITE_ADDRESS) so the
+  # session cookie is only sent over TLS. Keep false for plain-HTTP (:80) access,
+  # otherwise the browser withholds the cookie and login won't stick.
+  https_only: false
+
+paths:
+  artifacts_dir: data/artifacts
+  db_path: data/cownting.duckdb
+  archive_db_path: data/cownting_archive.duckdb
+  count_areas: data/count_areas.json
+  panel_areas: data/panel_areas.json
+  orthophoto: null                 # set to a top-down site image (under data/) for the AreaMap

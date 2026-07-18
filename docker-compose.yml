@@ -1,0 +1,55 @@
+# Cownting production stack: the app (uvicorn) behind Caddy (auto-HTTPS proxy).
+#
+#   1. cp .env.example .env         # then fill in the secrets
+#   2. docker compose up -d --build
+#
+# The app itself is NOT published to the host — all traffic goes through Caddy on
+# 80/443. Uncomment the cownting `ports:` block to reach it directly for testing.
+
+services:
+  cownting:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Must match detect.yolo_weights in config/cownting.prod.yaml.
+        YOLO_WEIGHTS: yolo11x-seg.pt
+    image: cownting:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Session-cookie signing key + first-boot admin creds (see .env).
+      COWNTING_SECRET: ${COWNTING_SECRET:?set COWNTING_SECRET in .env}
+      COWNTING_ADMIN_USER: ${COWNTING_ADMIN_USER:-admin}
+      COWNTING_ADMIN_PASSWORD: ${COWNTING_ADMIN_PASSWORD:?set COWNTING_ADMIN_PASSWORD in .env}
+    volumes:
+      # DuckDB, artifacts (frames/overlays), uploads, count/panel areas — all
+      # live under data/, so this one bind mount is the entire persistent state.
+      - ./data:/app/data
+      # Edit the prod config on the host without rebuilding the image.
+      - ./config/cownting.prod.yaml:/app/config/cownting.prod.yaml:ro
+    expose:
+      - "8000"
+    # Reach the app directly (bypassing Caddy) for a quick local test:
+    # ports:
+    #   - "8000:8000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - cownting
+    environment:
+      # A domain (cownting.example.com) -> automatic HTTPS. ":80" -> plain HTTP.
+      CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

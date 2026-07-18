@@ -1,0 +1,49 @@
+# Keep the build context small and reproducible. The image builds the frontend
+# itself and downloads model weights during build, so none of the local, heavy,
+# or machine-specific artifacts below should be shipped into the context.
+
+# --- VCS / IDE / OS ---
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+
+# --- Python envs & caches ---
+.venv
+venv
+**/__pycache__
+**/*.pyc
+*.egg-info
+
+# --- Data, DB, videos, artifacts (mounted as a volume at runtime, never baked) ---
+data/
+*.duckdb
+*.duckdb.*
+*.mp4
+*.MP4
+*.mov
+*.MOV
+
+# --- Model weights (downloaded in the image build) ---
+*.pt
+*.onnx
+checkpoints/
+runs/
+wandb/
+.fiftyone/
+
+# --- Frontend: source is copied in, but node_modules/dist are rebuilt in-image ---
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# --- Local machine config & secrets (prod config is config/cownting.prod.yaml) ---
+config/cownting.yaml
+.env
+
+# --- Not needed at runtime ---
+tests/
+docs/
+*.md
+!DEPLOY.md

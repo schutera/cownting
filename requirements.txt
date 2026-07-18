@@ -1,8 +1,6 @@
 # Core (Stage 1 + 2 run on Apple Silicon / MPS, CUDA, or CPU)
 ultralytics>=8.3        # YOLO11-seg backend (default); pulls torch/torchvision
 duckdb>=1.0             # embedded analytics store
-dash>=2.16             # dashboard
-plotly>=5.20
 pandas>=2.0
 numpy>=1.26
 opencv-python>=4.9
@@ -10,6 +8,21 @@ pillow>=10.0
 pydantic>=2.6
 pyyaml>=6.0
 typer>=0.12
+
+# Web server: FastAPI JSON/image API + serves the built React app (cownting serve).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9   # required for the multipart video upload endpoint
+itsdangerous>=2.2         # signs the session cookie (starlette SessionMiddleware)
+
+# NOTE: the legacy Dash dashboard (dash/plotly) is superseded by `cownting serve`
+# and is no longer imported anywhere — intentionally dropped from the runtime deps.
+
+# Optional: pose stage (flags.pose_enabled) — zero-shot ViTPose++ AP-10K animal
+# keypoints -> standing/lying. Install only if used. scipy is required by the
+# ViTPose image processor's affine transform.
+# transformers>=4.49          # ViTPose (also Grounding-DINO for grounded_sam2)
+# scipy>=1.11
 
 # Optional: grounded_sam2 backend (open-vocabulary zero-shot). Install only if used.
 # transformers>=4.41          # Grounding-DINO

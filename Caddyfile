@@ -1,0 +1,17 @@
+# Reverse proxy for Cownting.
+#
+# CADDY_SITE_ADDRESS (from .env) decides the mode:
+#   - a domain, e.g. cownting.example.com  -> automatic HTTPS (Let's Encrypt)
+#   - ":80"                                -> plain HTTP (testing / behind another proxy)
+
+{$CADDY_SITE_ADDRESS} {
+	# Camera videos can be multi-GB; lift Caddy's request-body limit for uploads.
+	# (The upload endpoint returns immediately and processes in the background, so
+	# no long proxy read-timeout is needed — only a large enough body.)
+	request_body {
+		max_size 10GB
+	}
+
+	encode zstd gzip
+	reverse_proxy cownting:8000
+}

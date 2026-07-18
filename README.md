@@ -91,6 +91,20 @@ boundary/uncertain band). This drives the **"Under panels"** KPI
 
 (After `pip install -e .` the commands are just `cownting ingest`, etc.)
 
+## Deploy (server)
+
+Run the whole thing on a Linux server as a Docker Compose stack — the FastAPI
+app behind a Caddy reverse proxy with automatic HTTPS, CPU-only inference, and a
+single `./data` volume for all state:
+
+```bash
+cp .env.example .env          # set COWNTING_SECRET, admin password, your domain
+docker compose up -d --build  # builds the frontend + image, boots the stack
+```
+
+Full walkthrough (secrets, HTTPS, backups, account management, GPU notes) in
+**[DEPLOY.md](DEPLOY.md)**.
+
 ## Backends
 
 | backend         | what it is                                  | on this Mac |
