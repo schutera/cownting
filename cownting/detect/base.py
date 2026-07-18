@@ -15,6 +15,7 @@ class Instance:
     ground_px: Tuple[float, float]            # ground-contact point (image px)
     posture: Optional[str] = None             # 'lying' | 'standing' | None
     mask: Optional[np.ndarray] = None         # bool HxW, not persisted to the DB
+    keypoints: Optional[np.ndarray] = None    # (K,3) x,y,conf in image px; pose stage only, not persisted
 
 
 class Segmenter(Protocol):

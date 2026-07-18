@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { DaySeries as Series } from "../lib/types";
 import { getDaySeries } from "../lib/api";
 import { SectionLabel } from "./ui";
-import { clockOfFrame } from "./TimeScrubber";
+import { clockOf } from "./TimeScrubber";
 import { ACTIVE_COLOR, REST_COLOR, SHELTER_COLOR, OPEN_COLOR } from "../lib/palette";
 
 const CURRENT = "#e76f51"; // terracotta — matches the scrubber's lit frame
@@ -16,11 +16,9 @@ const CURRENT = "#e76f51"; // terracotta — matches the scrubber's lit frame
  */
 export default function DaySeries({
   frame,
-  allDay,
   onFrame,
 }: {
   frame: number | null;
-  allDay: boolean;
   onFrame: (f: number) => void;
 }) {
   const [series, setSeries] = useState<Series | null>(null);
@@ -48,28 +46,28 @@ export default function DaySeries({
         <ShareStrip
           title="POSTURE"
           frames={series.frames}
+          times={series.times}
           a={{ values: series.standing, color: ACTIVE_COLOR, label: "standing" }}
           b={{ values: series.lying, color: REST_COLOR, label: "resting" }}
           emptyText="no posture data"
           frame={frame}
-          allDay={allDay}
           onFrame={onFrame}
         />
         <ShareStrip
           title="UNDER PANELS"
           frames={series.frames}
+          times={series.times}
           a={{ values: series.sheltering, color: SHELTER_COLOR, label: "under panels" }}
           b={{ values: series.open, color: OPEN_COLOR, label: "open" }}
           emptyText="no panel areas drawn yet"
           frame={frame}
-          allDay={allDay}
           onFrame={onFrame}
         />
       </div>
 
       <div className="flex justify-between font-mono text-[10px] text-gray-tertiary mt-2">
-        <span>{clockOfFrame(series.frames[0])}</span>
-        <span>{clockOfFrame(series.frames[series.frames.length - 1])}</span>
+        <span>{clockOf(series.times[0])}</span>
+        <span>{clockOf(series.times[series.times.length - 1])}</span>
       </div>
     </div>
   );
@@ -109,20 +107,20 @@ function Hover({ i, n, children }: { i: number; n: number; children: React.React
 function ShareStrip({
   title,
   frames,
+  times,
   a,
   b,
   emptyText,
   frame,
-  allDay,
   onFrame,
 }: {
   title: string;
   frames: number[];
+  times: string[];
   a: { values: number[]; color: string; label: string };
   b: { values: number[]; color: string; label: string };
   emptyText: string;
   frame: number | null;
-  allDay: boolean;
   onFrame: (f: number) => void;
 }) {
   const [hover, setHover] = useState<number | null>(null);
@@ -154,8 +152,8 @@ function ShareStrip({
         {hover !== null ? (
           <Hover i={hover} n={n}>
             {ha + hb > 0
-              ? `${clockOfFrame(frames[hover])} · ${ha} ${a.label} · ${hb} ${b.label}`
-              : `${clockOfFrame(frames[hover])} · no cows`}
+              ? `${clockOf(times[hover])} · ${ha} ${a.label} · ${hb} ${b.label}`
+              : `${clockOf(times[hover])} · no cows`}
           </Hover>
         ) : null}
         <div
@@ -168,7 +166,7 @@ function ShareStrip({
             const av = a.values[i] ?? 0;
             const bv = b.values[i] ?? 0;
             const tot = av + bv;
-            const isCurrent = !allDay && f === frame;
+            const isCurrent = f === frame;
             return (
               <div
                 key={f}

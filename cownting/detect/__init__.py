@@ -18,4 +18,12 @@ def build_segmenter(detect_cfg: DetectCfg, posture_cfg: PostureCfg) -> Segmenter
     raise ValueError(f"unknown backend: {detect_cfg.backend}")
 
 
-__all__ = ["Instance", "Segmenter", "build_segmenter"]
+def build_pose_estimator(pose_cfg):
+    """Lazy factory for the optional pose stage (keeps torch/transformers imports
+    out of the module load path when `flags.pose_enabled` is off)."""
+    from .pose import build_pose_estimator as _build
+
+    return _build(pose_cfg)
+
+
+__all__ = ["Instance", "Segmenter", "build_segmenter", "build_pose_estimator"]

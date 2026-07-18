@@ -14,10 +14,18 @@ from ..config import CameraCfg, IngestCfg
 def _start_time(cam: CameraCfg) -> datetime:
     if cam.start:
         return datetime.fromisoformat(cam.start)
-    return datetime.fromtimestamp(os.path.getmtime(cam.video))
+    # No explicit start: read the capture time from the file itself — the
+    # container creation_time, else the burned-in Brinno bar (see
+    # ingest.capture_time), else the file's mtime.
+    from .capture_time import read_burned_timestamp, read_container_time
+
+    return (read_container_time(cam.video)
+            or read_burned_timestamp(cam.video)
+            or datetime.fromtimestamp(os.path.getmtime(cam.video)))
 
 
-def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str) -> pd.DataFrame:
+def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str,
+                dataset_id: str | None = None) -> pd.DataFrame:
     """Sample frames, write them to artifacts, and return the frame index rows.
 
     Per-frame timestamp:
@@ -27,6 +35,11 @@ def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str) -> pd
       * real-time video (frame_interval_seconds is None): start + frame_idx / video_fps.
 
     `start` is the real capture start (CameraCfg.start when provided, else file mtime).
+
+    Frames are written under a per-dataset subdir (<artifacts>/<dataset_id>/frames/
+    <cam>/) when `dataset_id` is given, so a second day's frame_idx range for the
+    same camera can't overwrite the first on disk and frame_path stays globally
+    unique. When None (legacy single-day flow), the old flat layout is kept.
     """
     if not Path(cam.video).exists():
         raise FileNotFoundError(cam.video)
@@ -37,7 +50,8 @@ def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str) -> pd
     vfps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     step = max(1, round(vfps / max(ingest_cfg.target_fps, 1e-6)))
     start = _start_time(cam)
-    out_dir = Path(artifacts_dir) / "frames" / cam.id
+    base = Path(artifacts_dir) / dataset_id if dataset_id else Path(artifacts_dir)
+    out_dir = base / "frames" / cam.id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
@@ -61,6 +75,7 @@ def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str) -> pd
                 cv2.imwrite(frame_path, frame)
             rows.append(
                 dict(
+                    dataset_id=dataset_id,
                     camera_id=cam.id,
                     frame_idx=idx,
                     ts=ts,

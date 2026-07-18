@@ -23,6 +23,7 @@ export default function CameraSegStack({
   onExpand,
   focused,
   frame,
+  frameMap,
   hidden,
   onToggleHidden,
 }: {
@@ -32,6 +33,9 @@ export default function CameraSegStack({
   onExpand?: (camera: string) => void;
   focused?: string | null;
   frame?: number | null;
+  // Per-camera frame_idx for the selected instant (frame). `frame` is a timestamp
+  // bucket, not a frame_idx; a camera absent here has no footage at that instant.
+  frameMap?: Record<string, number>;
   hidden?: Set<string>;
   onToggleHidden?: (camera: string) => void;
 }) {
@@ -39,7 +43,7 @@ export default function CameraSegStack({
   const navigate = useNavigate();
 
   const shownIdxFor = (cam: string): number | undefined =>
-    frame != null ? frame : state[cam]?.frame?.frame_idx;
+    frame != null ? frameMap?.[cam] : state[cam]?.frame?.frame_idx;
 
   useEffect(() => {
     let alive = true;

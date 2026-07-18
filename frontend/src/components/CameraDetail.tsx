@@ -14,14 +14,16 @@ export default function CameraDetail({
   camera,
   frameIdx,
   meta,
+  poseEnabled = false,
   onClose,
 }: {
   camera: string;
   frameIdx: number | null;
   meta?: ImgMeta; // reference dims → zoom/pan viewer; falls back to a scaled <img>
+  poseEnabled?: boolean; // show the Pose (keypoint skeleton) layer toggle
   onClose: () => void;
 }) {
-  const [kind, setKind] = useState<"overlay" | "raw">("overlay");
+  const [kind, setKind] = useState<"overlay" | "raw" | "pose">("overlay");
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -43,6 +45,11 @@ export default function CameraDetail({
           <Chip active={kind === "raw"} onClick={() => setKind("raw")}>
             Raw
           </Chip>
+          {poseEnabled ? (
+            <Chip active={kind === "pose"} onClick={() => setKind("pose")}>
+              Pose
+            </Chip>
+          ) : null}
         </div>
         <button
           onClick={onClose}

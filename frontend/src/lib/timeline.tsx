@@ -18,8 +18,6 @@ type TimelineCtx = {
   timeline: TimelineData | null;
   frame: number | null;
   setFrame: (frameIdx: number) => void;
-  allDay: boolean;
-  setAllDay: (v: boolean) => void;
 };
 
 const Ctx = createContext<TimelineCtx | null>(null);
@@ -27,7 +25,6 @@ const Ctx = createContext<TimelineCtx | null>(null);
 export function TimelineProvider({ children }: { children: ReactNode }) {
   const [timeline, setTimeline] = useState<TimelineData | null>(null);
   const [frame, setFrame] = useState<number | null>(null);
-  const [allDay, setAllDay] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -47,7 +44,7 @@ export function TimelineProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ timeline, frame, setFrame, allDay, setAllDay }}>
+    <Ctx.Provider value={{ timeline, frame, setFrame }}>
       {children}
     </Ctx.Provider>
   );

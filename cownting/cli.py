@@ -43,11 +43,20 @@ def init_db(config: str = CONFIG_OPT):
 
 
 @app.command()
-def ingest(config: str = CONFIG_OPT):
+def ingest(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(None, help="Override the dataset id (default: capture-day slug)."),
+    day: str = typer.Option(None, help="Override the capture day (ISO 'YYYY-MM-DD')."),
+):
     """Decode each camera's video into timestamped, fps-subsampled frames."""
     from .pipeline import ingest as run
 
-    run(_load(config))
+    cfg = _load(config)
+    if dataset:
+        cfg.dataset.id = dataset
+    if day:
+        cfg.dataset.day = day
+    run(cfg)
 
 
 @app.command()
@@ -59,11 +68,84 @@ def segment(config: str = CONFIG_OPT, limit: int = typer.Option(None, help="Only
 
 
 @app.command()
-def localize(config: str = CONFIG_OPT):
-    """Project detections to world coordinates using the saved calibration."""
+def localize(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(None, help="Scope reassignment to one dataset (default: whole DB)."),
+):
+    """Assign each detection to a count area + panel shelter (image-space)."""
     from .pipeline import localize as run
 
-    run(_load(config))
+    run(_load(config), dataset_id=dataset)
+
+
+@app.command()
+def pose(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(None, help="Scope to one dataset (default: whole DB)."),
+    limit: int = typer.Option(None, help="Only pose N frames (preview)."),
+):
+    """Estimate keypoints -> posture (standing/lying/grazing/unknown) over stored
+    detections. Reuses existing bboxes + frames, so it does NOT re-segment.
+    Requires flags.pose_enabled."""
+    from .pipeline import pose as run
+
+    run(_load(config), dataset_id=dataset, limit=limit)
+
+
+@app.command()
+def datasets(config: str = CONFIG_OPT):
+    """List the data-packages (days) in the DB with their frame/detection counts."""
+    from . import db
+
+    cfg = _load(config)
+    con = db.connect(cfg.paths.db_path, read_only=True)
+    df = db.datasets(con)
+    con.close()
+    if df.empty:
+        typer.echo("No datasets yet. Run `cownting migrate` to backfill existing data, or `cownting ingest`.")
+        return
+    typer.echo(df.to_string(index=False))
+
+
+@app.command()
+def migrate(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(None, help="dataset_id for the existing rows (default: derived capture day)."),
+    day: str = typer.Option(None, help="ISO day 'YYYY-MM-DD' for the existing rows (default: derived)."),
+    label: str = typer.Option(None, help="Human label (default: a friendly 'Mon DD, YYYY')."),
+):
+    """Backfill a pre-dataset DB: stamp all existing frames+detections as one
+    day-0 data-package so multi-day features light up without re-ingesting."""
+    from . import db
+    from .config import resolve_dataset
+
+    cfg = _load(config)
+    if dataset:
+        cfg.dataset.id = dataset
+    if day:
+        cfg.dataset.day = day
+    if label:
+        cfg.dataset.label = label
+    ds_id, ds_day, ds_label = resolve_dataset(cfg)
+
+    con = db.connect(cfg.paths.db_path)
+    db.init_db(con)  # applies the dataset_id ALTERs + creates the datasets table
+    con.execute("UPDATE frames SET dataset_id = ? WHERE dataset_id IS NULL", [ds_id])
+    con.execute("UPDATE detections SET dataset_id = ? WHERE dataset_id IS NULL", [ds_id])
+    db.upsert_dataset(con, ds_id, ds_day, ds_label, status="localized")
+    frames_now = con.execute("SELECT count(*) FROM frames WHERE dataset_id = ?", [ds_id]).fetchone()[0]
+    dets_now = con.execute("SELECT count(*) FROM detections WHERE dataset_id = ?", [ds_id]).fetchone()[0]
+    con.close()
+    typer.echo(f"Migrated existing data -> dataset {ds_id!r} ({ds_label}): "
+               f"{frames_now} frames, {dets_now} detections stamped.")
+
+
+@app.command()
+def process(config: str = CONFIG_OPT, limit: int = typer.Option(None, help="Only segment N frames.")):
+    """Run the whole batch end to end: ingest -> segment -> localize."""
+    from .pipeline import process as run
+
+    run(_load(config), limit=limit)
 
 
 @app.command()
@@ -133,6 +215,102 @@ def eval_detect(
     from .finetune import evaluate
 
     evaluate(_load(config), weights=weights)
+
+
+user_app = typer.Typer(help="Manage dashboard login accounts (recovery / scripting).")
+app.add_typer(user_app, name="user")
+
+
+@user_app.command("list")
+def user_list(config: str = CONFIG_OPT):
+    """List login accounts and their roles."""
+    from . import auth, db
+
+    cfg = _load(config)
+    con = db.connect(cfg.paths.db_path)
+    auth.init_auth(con)
+    users = auth.list_users(con)
+    con.close()
+    if not users:
+        typer.echo("No users yet. `cownting serve` seeds a bootstrap admin on first boot.")
+        return
+    for u in users:
+        typer.echo(f"{u['role']:>6}  {u['username']}")
+
+
+@user_app.command("add")
+def user_add(
+    username: str,
+    config: str = CONFIG_OPT,
+    role: str = typer.Option(
+        "user", "--role",
+        help="Account role: user (view only), poweruser (upload/download/delete), or admin.",
+    ),
+    admin: bool = typer.Option(False, "--admin", help="Shorthand for --role admin."),
+    password: str = typer.Option(None, help="Password (prompted securely if omitted)."),
+):
+    """Create a login account."""
+    from . import auth, db
+
+    role = "admin" if admin else role
+    if role not in auth.ROLES:
+        typer.secho(f"error: role must be one of {', '.join(auth.ROLES)}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    cfg = _load(config)
+    if password is None:
+        password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    con = db.connect(cfg.paths.db_path)
+    auth.init_auth(con)
+    try:
+        auth.create_user(con, username, password, role=role)
+    except ValueError as e:
+        con.close()
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    con.close()
+    typer.secho(f"created {role} {username!r}.", fg=typer.colors.GREEN)
+
+
+@user_app.command("passwd")
+def user_passwd(
+    username: str,
+    config: str = CONFIG_OPT,
+    password: str = typer.Option(None, help="New password (prompted securely if omitted)."),
+):
+    """Reset an account's password (use this if you're locked out)."""
+    from . import auth, db
+
+    cfg = _load(config)
+    if password is None:
+        password = typer.prompt("New password", hide_input=True, confirmation_prompt=True)
+    con = db.connect(cfg.paths.db_path)
+    auth.init_auth(con)
+    try:
+        auth.set_password(con, username, password)
+    except ValueError as e:
+        con.close()
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    con.close()
+    typer.secho(f"password updated for {username!r}.", fg=typer.colors.GREEN)
+
+
+@user_app.command("delete")
+def user_delete(username: str, config: str = CONFIG_OPT):
+    """Delete a login account (refuses to remove the last admin)."""
+    from . import auth, db
+
+    cfg = _load(config)
+    con = db.connect(cfg.paths.db_path)
+    auth.init_auth(con)
+    try:
+        auth.delete_user(con, username)
+    except ValueError as e:
+        con.close()
+        typer.secho(f"error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    con.close()
+    typer.secho(f"deleted {username!r}.", fg=typer.colors.GREEN)
 
 
 def _run_test_gate() -> bool:
