@@ -3,6 +3,20 @@
 Shipped work, newest first. Keep this current: when a future-work item lands,
 move it here with the date it shipped and a one-line "what it means for the user".
 
+## 2026-07-18 — Server deployment + resilient upload progress
+
+- **Deploy on a server** — one-command Docker Compose stack (FastAPI app behind a
+  Caddy auto-HTTPS proxy, CPU-only inference, a single `./data` volume for all
+  state). See [DEPLOY.md](DEPLOY.md). Fixed two blockers found on the way: the web
+  deps were installed-but-undeclared in `requirements.txt`, and a macOS-only
+  Tailwind binary broke the Linux frontend build.
+- **Upload progress survives anything** — a day's detection progress bar now
+  reflects server-side work for *every* client, not just the tab that started it:
+  refresh the page, open a second tab, or be another user and the running upload
+  reconnects its bar. Progress also survives a server restart (an interrupted day
+  is flagged so you can re-upload to finish it), and the upload shows an
+  "Uploading…" state while the clips stream up.
+
 ## 2026-07-18 — First feedback round (16.07) response
 
 Response to the first-feedback-round epics (data upload + model + interactive

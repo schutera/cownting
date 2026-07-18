@@ -168,6 +168,14 @@ export function getUploadJob(jobId: string): Promise<UploadJob> {
   return j<UploadJob>(`/api/uploads/${jobId}`);
 }
 
+// Every known upload job, newest first (active first). Used on mount to reconnect
+// the progress bar to an upload still processing on the server — the job store is
+// process-wide, so it works after a refresh, in another tab, or for another user.
+// (The endpoint ignores the ?dataset param j() appends.)
+export function listUploadJobs(): Promise<UploadJob[]> {
+  return j<UploadJob[]>("/api/uploads");
+}
+
 // Delete a day from the dashboard. The backend does NOT destroy it — it moves the
 // day's rows into an archive DB, so it vanishes from every view but is preserved.
 // `confirm` must equal the capture day as ddmmyy (typed by the user); the server

@@ -2,16 +2,25 @@
 
 Single-box MVP of the roadmap's upload epic (DU2/DU3): a POST lands one video per
 camera, a background thread runs the offline batch scoped to the new day, and a
-job record exposes stage/progress so the frontend can show a progress bar. The
-job registry is in-memory — fine for one serve box; a restart drops job history
-(the processed data itself is durable in DuckDB). Persistence is a later concern.
+job record exposes stage/progress so the frontend can show a progress bar.
+
+The job registry is an in-memory dict in the single serve process, so it's shared
+across every request/client — any browser (a refresh, a second tab, another user)
+can list the running jobs and reconnect to the progress bar, not just the tab that
+started the upload. It's also mirrored to a small JSON file (throttled) so a server
+restart doesn't silently strip the progress bar off an in-flight day: on boot the
+snapshot is reloaded and any job that was mid-flight is marked interrupted (the
+processed rows themselves are durable in DuckDB — re-upload the day to finish it).
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
+import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -47,15 +56,77 @@ class Job:
     error: Optional[str] = None
     frames: int = 0
     detections: int = 0
+    created_at: float = field(default_factory=time.time)  # epoch secs; newest-first ordering
 
 
 _JOBS: dict[str, Job] = {}
 _LOCK = threading.Lock()
 
+ACTIVE = {"queued", "running"}
+
+# JSON snapshot of _JOBS for restart-recovery. Set once via recover_jobs(config)
+# at app boot; None means "not persisting" (e.g. tests) and every write is a no-op.
+_STORE_PATH: Optional[Path] = None
+_last_flush = 0.0
+
+
+def _persist(force: bool = False) -> None:
+    """Mirror _JOBS to the JSON store. Throttled to ~once/sec unless `force` (stage
+    boundaries / terminal states persist immediately) so the per-frame segment
+    progress doesn't hammer the disk. Caller must hold _LOCK."""
+    global _last_flush
+    if _STORE_PATH is None:
+        return
+    now = time.time()
+    if not force and now - _last_flush < 1.0:
+        return
+    _last_flush = now
+    try:
+        tmp = _STORE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps([asdict(j) for j in _JOBS.values()]))
+        os.replace(tmp, _STORE_PATH)  # atomic swap so a crash mid-write can't corrupt it
+    except OSError:
+        pass  # persistence is best-effort; never fail a job over a disk hiccup
+
+
+def recover_jobs(config: Config) -> None:
+    """Point the job store at data/upload_jobs.json and reload any prior snapshot.
+
+    Called once at app boot. Jobs that were still queued/running when the process
+    died can't resume (their worker thread is gone), so they're marked failed —
+    'interrupted' — rather than left forever pretending to run. Idempotent."""
+    global _STORE_PATH
+    _STORE_PATH = Path(config.paths.db_path).parent / "upload_jobs.json"
+    if not _STORE_PATH.exists():
+        return
+    try:
+        raw = json.loads(_STORE_PATH.read_text())
+    except (OSError, ValueError):
+        return
+    fields = {f for f in Job.__dataclass_fields__}
+    with _LOCK:
+        for d in raw:
+            job = Job(**{k: v for k, v in d.items() if k in fields})
+            if job.status in ACTIVE:
+                job.status = "failed"
+                job.error = "interrupted by a server restart"
+                job.message = "Interrupted by a server restart — re-upload this day to finish it."
+            _JOBS[job.job_id] = job
+        _persist(force=True)
+
 
 def get_job(job_id: str) -> Optional[Job]:
     with _LOCK:
         return _JOBS.get(job_id)
+
+
+def list_jobs() -> list[dict]:
+    """Every known job, newest first — active ones lead so the frontend can spot a
+    running upload and reconnect its progress bar after a refresh / from any tab."""
+    with _LOCK:
+        jobs = sorted(_JOBS.values(),
+                      key=lambda j: (j.status in ACTIVE, j.created_at), reverse=True)
+        return [asdict(j) for j in jobs]
 
 
 def job_dict(job: Job) -> dict:
@@ -67,6 +138,9 @@ def _update(job: Job, **fields) -> None:
     with _LOCK:
         for k, v in fields.items():
             setattr(job, k, v)
+        # Terminal + stage transitions persist immediately; per-frame progress is
+        # throttled inside _persist so segmentation doesn't thrash the disk.
+        _persist(force=job.status in ("done", "failed") or "stage" in fields)
 
 
 def start_upload_job(
@@ -81,6 +155,7 @@ def start_upload_job(
     job = Job(job_id=uuid.uuid4().hex, dataset_id=dataset_id, label=label)
     with _LOCK:
         _JOBS[job.job_id] = job
+        _persist(force=True)
     threading.Thread(
         target=_run, args=(job, base, saved, dataset_id, day, label), daemon=True
     ).start()

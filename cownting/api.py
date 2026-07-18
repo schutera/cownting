@@ -141,6 +141,10 @@ def create_app(config: Config) -> FastAPI:
     # so serve never 500s on a pre-dataset DB. Idempotent (CREATE/ALTER IF NOT EXISTS).
     _boot = db.connect(config.paths.db_path)
     db.init_db(_boot)
+    # Reload any upload-job snapshot from a prior process so an in-flight day's
+    # progress bar survives a restart (interrupted jobs are marked failed, not
+    # left pretending to run). Also fixes the job store's on-disk location.
+    uploads_mod.recover_jobs(config)
     if auth_on:
         # Users live in the same DuckDB; guarantee one admin so a fresh install
         # is reachable (bootstrap creds via COWNTING_ADMIN_* env, else admin/admin).
@@ -657,6 +661,14 @@ def create_app(config: Config) -> FastAPI:
 
         job = uploads_mod.start_upload_job(config, saved, iso_day, iso_day, the_label)
         return JSONResponse(status_code=202, content=uploads_mod.job_dict(job))
+
+    @app.get("/api/uploads")
+    def list_uploads():
+        """All known upload jobs, newest first (active ones lead). Lets any client
+        — a page refresh, a second tab, another user — discover a running upload
+        and reconnect its progress bar; the job store is process-wide, not tied to
+        the tab that started it."""
+        return uploads_mod.list_jobs()
 
     @app.get("/api/uploads/{job_id}")
     def upload_status(job_id: str):

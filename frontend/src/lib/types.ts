@@ -26,7 +26,7 @@ export interface UploadJob {
   status:"queued"|"running"|"done"|"failed";
   stage:"queued"|"ingesting"|"segmenting"|"localizing"|"done";
   progress:number; message:string; error:string|null;
-  frames:number; detections:number;
+  frames:number; detections:number; created_at:number;
 }
 export interface CountRow { t:string; frames:number; detections:number; cows_per_frame:number|null; }
 export type PostureRow = { t:string } & Record<string, number|string>;

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useDataset } from "../lib/dataset";
-import { uploadVideos, getUploadJob, CaptureDayRequiredError } from "../lib/api";
+import { uploadVideos, getUploadJob, listUploadJobs, CaptureDayRequiredError } from "../lib/api";
 import type { UploadJob } from "../lib/types";
 import { Button, SectionLabel } from "./ui";
 
@@ -76,6 +76,9 @@ export function UploadPanel() {
   const { setDataset, refresh } = useDataset();
   const [zones, setZones] = useState<Zone[]>(() => makeZones(DEFAULT_ZONES));
   const [job, setJob] = useState<UploadJob | null>(null);
+  // True while the POST is in flight (files streaming up), before the job exists —
+  // so the surface shows continuous feedback instead of a dead wait on a big file.
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragKey, setDragKey] = useState<number | null>(null);
   // Fallback path: the backend couldn't read the capture day from the video
@@ -89,7 +92,27 @@ export function UploadPanel() {
     if (timer.current) window.clearTimeout(timer.current);
   }, []);
 
-  const busy = job !== null && job.status !== "done" && job.status !== "failed";
+  // Reconnect on mount: processing runs server-side and the job store is
+  // process-wide, so if a day is still being detected (after a refresh, in a new
+  // tab, or started by someone else) pick it up and resume the progress bar.
+  useEffect(() => {
+    let cancelled = false;
+    listUploadJobs()
+      .then((jobs) => {
+        if (cancelled) return;
+        const active = jobs.find((jb) => jb.status === "queued" || jb.status === "running");
+        if (active) {
+          setJob(active);
+          poll(active.job_id);
+        }
+      })
+      .catch(() => {/* no jobs / transient — just show the empty upload form */});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const busy =
+    submitting || (job !== null && job.status !== "done" && job.status !== "failed");
 
   function setName(key: number, camera: string) {
     setZones((zs) => zs.map((z) => (z.key === key ? { ...z, camera } : z)));
@@ -135,6 +158,7 @@ export function UploadPanel() {
     }
     // Only sent on the fallback path, once the picker is showing.
     if (needDay && day) form.append("day", day);
+    setSubmitting(true);
     try {
       const started = await uploadVideos(form);
       setJob(started);
@@ -146,6 +170,8 @@ export function UploadPanel() {
         return;
       }
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -244,8 +270,10 @@ export function UploadPanel() {
         </label>
       ) : null}
 
-      {busy && job ? (
+      {job && busy ? (
         <Progress job={job} />
+      ) : submitting ? (
+        <Uploading />
       ) : (
         <div className="flex items-center gap-4 mt-7 flex-wrap">
           <Button onClick={submit} disabled={!canUpload}>
@@ -261,6 +289,26 @@ export function UploadPanel() {
         </p>
       ) : null}
     </section>
+  );
+}
+
+/** Pre-job feedback: the clips are streaming to the server. Once the server has
+ *  them it returns the job and <Progress> takes over (ingest → detect → place). */
+function Uploading() {
+  return (
+    <div className="mt-8 max-w-xl">
+      <div className="flex items-baseline justify-between">
+        <span className="font-display text-5xl text-near-black tabular-nums leading-none">···</span>
+        <span className="text-[13px] text-gray-mid">Uploading</span>
+      </div>
+      <div className="h-2 w-full rounded-full bg-surface-sunk overflow-hidden mt-4">
+        <div className="h-full w-1/3 bg-accent/60 rounded-full animate-pulse" />
+      </div>
+      <p className="text-[13px] text-gray-mid mt-3">Sending your footage to the server…</p>
+      <p className="text-[12px] text-gray-tertiary mt-1">
+        Large clips take a moment — detection starts automatically once they land.
+      </p>
+    </div>
   );
 }
 
