@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { useDataset } from "../lib/dataset";
 import type { Areas, CountArea as Area, Site } from "../lib/types";
 import {
   getAreas,
@@ -30,7 +31,8 @@ type Mode = "count" | "panel";
  * camera's list back into the full site-wide areas map and persists it.
  */
 export default function CountArea() {
-  const { camera = "" } = useParams();
+  const { dataset: routeDataset = "", camera = "" } = useParams();
+  const { dataset: currentDataset, setDataset } = useDataset();
 
   const [site, setSite] = useState<Site | null>(null);
   // Two independent per-camera polygon sets: count areas (tally cows) and panel
@@ -46,7 +48,17 @@ export default function CountArea() {
 
   const isPanel = mode === "panel";
 
+  // Deep-link / refresh safe: sync the app's selected day to the one in the URL
+  // BEFORE fetching, so getAreas()/getPanelAreas() (which append ?dataset) scope
+  // to the dataset this editor is for — not whatever day happened to be selected.
   useEffect(() => {
+    if (routeDataset && routeDataset !== currentDataset) setDataset(routeDataset);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeDataset, currentDataset]);
+
+  useEffect(() => {
+    // Wait until the app's dataset matches the URL so the fetch is scoped right.
+    if (!routeDataset || currentDataset !== routeDataset) return;
     let alive = true;
     setLoadErr(null);
     Promise.all([getSite(), getAreas(), getPanelAreas()])
@@ -62,9 +74,9 @@ export default function CountArea() {
     return () => {
       alive = false;
     };
-    // Only reload from the server on camera change; mode switches are local.
+    // Reload on camera or dataset change; mode switches are local.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [camera]);
+  }, [camera, routeDataset, currentDataset]);
 
   const activeMap = isPanel ? panelMap : countMap;
   const setActiveMap = isPanel ? setPanelMap : setCountMap;

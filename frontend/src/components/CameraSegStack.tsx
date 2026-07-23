@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useDataset } from "../lib/dataset";
 import type { FrameRow } from "../lib/types";
 import { getFrames, frameImg } from "../lib/api";
 import { Panel, SectionLabel } from "./ui";
@@ -41,6 +42,7 @@ export default function CameraSegStack({
 }) {
   const [state, setState] = useState<Record<string, CamState>>({});
   const navigate = useNavigate();
+  const { dataset } = useDataset();
 
   const shownIdxFor = (cam: string): number | undefined =>
     frame != null ? frameMap?.[cam] : state[cam]?.frame?.frame_idx;
@@ -130,13 +132,13 @@ export default function CameraSegStack({
                   onClick={(e) => {
                     e.stopPropagation();
                     e.preventDefault();
-                    navigate(`/count-area/${cam}`);
+                    if (dataset) navigate(`/count-area/${dataset}/${cam}`);
                   }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.stopPropagation();
                       e.preventDefault();
-                      navigate(`/count-area/${cam}`);
+                      if (dataset) navigate(`/count-area/${dataset}/${cam}`);
                     }
                   }}
                   title={`Edit count areas for ${cam}`}

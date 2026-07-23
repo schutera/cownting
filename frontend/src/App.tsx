@@ -145,7 +145,7 @@ function AppInner() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/data" element={<DataOverview />} />
-          <Route path="/count-area/:camera" element={<CountArea />} />
+          <Route path="/count-area/:dataset/:camera" element={<CountArea />} />
           <Route
             path="/admin"
             element={
