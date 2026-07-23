@@ -10,7 +10,9 @@ ingest:
   time_bin_seconds: 2.0
   # Time-lapse only (e.g. a Brinno at 1 frame/min -> 60). Leave null for normal
   # real-time video. Uploads read each file's own capture time regardless.
-  frame_interval_seconds: null
+  # Uploaded footage is a 1-frame/minute time-lapse: keep every captured frame
+  # (no target_fps subsampling) and space them 60 s apart in real time.
+  frame_interval_seconds: 60.0
   save_frames: true
 
 detect:
@@ -33,7 +35,7 @@ auth:
   # Flip to true once served over HTTPS (a domain in CADDY_SITE_ADDRESS) so the
   # session cookie is only sent over TLS. Keep false for plain-HTTP (:80) access,
   # otherwise the browser withholds the cookie and login won't stick.
-  https_only: false
+  https_only: true
 
 paths:
   artifacts_dir: data/artifacts
