@@ -42,6 +42,18 @@ def save_count_areas(path, data) -> None:
         json.dump(data, f, indent=2)
 
 
+def dataset_area_path(config, dataset_id, kind):
+    """Resolve the area file for a dataset (kind: "count" or "panel").
+
+    Per-dataset areas live under data/areas/<dataset_id>/ — a sibling of
+    artifacts/, NOT under artifacts/<dataset_id>/ which pipeline.ingest rmtrees on
+    re-ingest. `dataset_id` None falls back to the legacy flat config path."""
+    legacy = config.paths.count_areas if kind == "count" else config.paths.panel_areas
+    if dataset_id is None:
+        return Path(legacy)
+    return Path(config.paths.artifacts_dir).parent / "areas" / dataset_id / f"{kind}_areas.json"
+
+
 def assign_regions(ground_px, areas, camera_id) -> list:
     """For each ground point, return the composite region id of the first containing area, else None.
 

@@ -603,6 +603,14 @@ def shelter_over_time(con, camera_id: str | None, trunc: str = "hour", dataset_i
 
 def area_counts_over_time(con, camera: str | None = None, trunc: str = "hour", dataset_id: str | None = None) -> pd.DataFrame:
     # Detection-based: cows per count-area per bucket. camera None -> all cameras.
+    # region_id = "camera::area" carries NO dataset component, so a whole-DB group by
+    # region_id would silently MERGE the same-named area across days (each upload
+    # re-frames the camera, so one id spans different physical areas). This read is
+    # always region-grouped, so when no dataset is given we scope to the latest
+    # package rather than merge. A pre-migration DB has no packages (latest_dataset
+    # None) and stays whole-DB, exactly as before.
+    if dataset_id is None:
+        dataset_id = latest_dataset(con)
     sql = """
         SELECT date_trunc(?, ts) AS t, region_id, count(*) AS cows
         FROM detections
@@ -716,6 +724,13 @@ def crosstab(con, primary: str, breakdown: str | None = None, *,
 
     p = feat.resolve(primary)
     b = feat.resolve(breakdown) if breakdown else None
+    # region_id = "camera::area" carries NO dataset component, so grouping by it with
+    # no dataset scope would silently MERGE the same-named area across days. When a
+    # region feature is one of the grouped axes and no dataset was given (e.g. the
+    # "all" toggle), scope to the latest package rather than merge. Non-region pivots
+    # keep whole-DB behaviour; a pre-migration DB (latest_dataset None) stays whole-DB.
+    if dataset_id is None and (p.key == "region" or (b is not None and b.key == "region")):
+        dataset_id = latest_dataset(con)
     needs_frames = p.needs_frames or (b is not None and b.needs_frames) or frame is not None
 
     sel = [f"{p.sql} AS prim", (f"{b.sql} AS brk" if b else "NULL AS brk"),

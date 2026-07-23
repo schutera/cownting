@@ -14,7 +14,7 @@ from .detect import build_pose_estimator, build_segmenter
 from .detect.base import Instance
 from .detect.overlay import render_overlay, render_pose_overlay
 from .ingest import index_video
-from .scene.regions import assign_regions, load_count_areas
+from .scene import regions
 
 
 def ingest(config: Config) -> int:
@@ -113,27 +113,28 @@ def segment(config: Config, limit: int | None = None,
     return n_det
 
 
-def localize(config: Config, dataset_id: str | None = None) -> int:
-    """Assign every detection to a count area (image-space, per camera).
+def _localize_one(con, config: Config, ds: str | None) -> int:
+    """Reset + reassign count and panel areas for a single partition `ds`.
 
-    Whole-DB by default (count/panel areas are per-camera and day-independent, so
-    reassigning every day is correct and idempotent). Pass `dataset_id` to scope
-    the reset + reassignment to one package (faster; used by the per-dataset
-    process path)."""
-    con = db.connect(config.paths.db_path)
-    areas = load_count_areas(config.paths.count_areas)
-
-    scope = " AND dataset_id = ?" if dataset_id is not None else ""
-    reset_scope = " WHERE dataset_id = ?" if dataset_id is not None else ""
-    dsp = [dataset_id] if dataset_id is not None else []
+    Loads ds's OWN area files via regions.dataset_area_path (ds None -> the legacy
+    flat config paths). Strictly scoped to `ds` — a real id keys on dataset_id = ?,
+    while ds None keys on the pre-dataset partition (dataset_id IS NULL) — so the
+    fan-out can localize each dataset without disturbing any other partition.
+    Returns the number of detections whose count-area assignment was recomputed."""
+    if ds is not None:
+        scope, reset_scope, dsp = " AND dataset_id = ?", " WHERE dataset_id = ?", [ds]
+    else:
+        scope, reset_scope, dsp = " AND dataset_id IS NULL", " WHERE dataset_id IS NULL", []
 
     # Reset assignments first so shrinking/removing an area (or a whole camera's
-    # areas) clears stale region_id / shelter flags — recomputed fresh below.
+    # areas) clears stale region_id / shelter flags — recomputed fresh below. A
+    # missing area file loads as {} -> nothing reassigned -> a clean reset, no crash.
     con.execute(
         f"UPDATE detections SET region_id = NULL, under_panel = NULL, panel_id = NULL{reset_scope}",
         dsp,
     )
 
+    areas = regions.load_count_areas(regions.dataset_area_path(config, ds, "count"))
     updated = 0
     for camera_id in areas:
         cam_areas = areas.get(camera_id, [])
@@ -145,7 +146,7 @@ def localize(config: Config, dataset_id: str | None = None) -> int:
         ).df()
         if dets.empty:
             continue
-        region_ids = assign_regions(
+        region_ids = regions.assign_regions(
             dets[["ground_px_x", "ground_px_y"]].to_numpy(), cam_areas, camera_id,
         )
         dets["region_id"] = pd.array(region_ids, dtype=object)
@@ -155,7 +156,7 @@ def localize(config: Config, dataset_id: str | None = None) -> int:
     # Shelter assignment — polygon "panel areas": the SAME per-camera, image-space
     # point-in-polygon test as count areas. A cow whose ground point falls inside
     # any of a camera's panel-area polygons counts as under a panel.
-    panel_areas = load_count_areas(config.paths.panel_areas)
+    panel_areas = regions.load_count_areas(regions.dataset_area_path(config, ds, "panel"))
     for camera_id, cam_pareas in panel_areas.items():
         if not cam_pareas:
             continue
@@ -165,17 +166,51 @@ def localize(config: Config, dataset_id: str | None = None) -> int:
         ).df()
         if sdets.empty:
             continue
-        pids = assign_regions(
+        pids = regions.assign_regions(
             sdets[["ground_px_x", "ground_px_y"]].to_numpy(), cam_pareas, camera_id,
         )
         sdets["under_panel"] = pd.array([p is not None for p in pids], dtype=object)
         sdets["panel_id"] = pd.array(pids, dtype=object)
         db.update_shelter(con, sdets)
 
-    if dataset_id is not None:
-        db.set_dataset_status(con, dataset_id, "localized")
+    if ds is not None:
+        db.set_dataset_status(con, ds, "localized")
+    return updated
+
+
+def localize(config: Config, dataset_id: str | None = None) -> int:
+    """Assign every detection to a count area (image-space, per camera, per dataset).
+
+    Count/panel areas are stored PER DATASET (data/areas/<dataset_id>/), not
+    globally per camera: different uploads reposition the same-named cameras, so a
+    single global polygon per camera no longer holds. Each dataset is reset and
+    reassigned against ITS OWN area files.
+
+    `dataset_id` given -> localize only that package. `dataset_id` None -> fan out
+    over every dataset (each against its own files), PLUS one legacy pass over the
+    pre-dataset partition (dataset_id IS NULL) using the flat
+    config.paths.count_areas/panel_areas, run only while such detections still
+    exist. Returns the total number of detections whose count-area assignment was
+    recomputed."""
+    con = db.connect(config.paths.db_path)
+    try:
+        if dataset_id is not None:
+            updated = _localize_one(con, config, dataset_id)
+        else:
+            updated = 0
+            for ds in db.datasets(con)["dataset_id"]:
+                updated += _localize_one(con, config, ds)
+            # Legacy shim: assign pre-dataset detections (dataset_id IS NULL) from
+            # the flat area files — only when such rows still exist, so a fully
+            # migrated DB skips it and the per-dataset passes above are untouched.
+            has_legacy = con.execute(
+                "SELECT 1 FROM detections WHERE dataset_id IS NULL LIMIT 1"
+            ).fetchone()
+            if has_legacy is not None:
+                updated += _localize_one(con, config, None)
+    finally:
+        con.close()
     print(f"[localize] updated {updated} detections")
-    con.close()
     return updated
 
 
@@ -261,7 +296,8 @@ def process(config: Config, limit: int | None = None) -> dict[str, int]:
     n_frames = ingest(config)
     n_det = segment(config, limit=limit)
     n_pose = pose(config) if config.flags.pose_enabled else 0
-    n_loc = localize(config)
+    # A new upload localizes only itself against its own per-dataset area files.
+    n_loc = localize(config, dataset_id=resolve_dataset(config)[0])
     print(f"[process] {n_frames} frames -> {n_det} detections -> "
           f"{n_pose} reposed -> {n_loc} localized")
     return {"frames": n_frames, "detections": n_det, "posed": n_pose, "localized": n_loc}

@@ -146,8 +146,8 @@ class PathsCfg(BaseModel):
     artifacts_dir: str = "data/artifacts"
     db_path: str = "data/cownting.duckdb"
     archive_db_path: str = "data/cownting_archive.duckdb"  # deleted days move here (not destroyed)
-    count_areas: str = "data/count_areas.json"   # named counting regions (camera + ortho polygons)
-    panel_areas: str = "data/panel_areas.json"   # shelter regions: a cow inside one = under a panel
+    count_areas: str = "data/count_areas.json"   # LEGACY flat fallback: used only when dataset_id is None; per-dataset areas live under data/areas/<dataset_id>/
+    panel_areas: str = "data/panel_areas.json"   # LEGACY flat fallback: used only when dataset_id is None; per-dataset areas live under data/areas/<dataset_id>/
     orthophoto: Optional[str] = None
 
 

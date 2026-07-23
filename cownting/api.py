@@ -289,6 +289,9 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(400, "confirmation does not match the day's date (ddmmyy)")
         moved = db.archive_dataset(c, dataset_id, config.paths.archive_db_path)
         c.close()
+        # The day's per-dataset area files live under data/areas/<id>/ (a sibling of
+        # artifacts/); drop them too so a re-upload of this id starts area-clean.
+        shutil.rmtree(Path(config.paths.artifacts_dir).parent / "areas" / dataset_id, ignore_errors=True)
         return {"ok": True, "dataset_id": dataset_id, "detections_archived": moved}
 
     # ------------------------------------------------------------------ data
@@ -346,25 +349,48 @@ def create_app(config: Config) -> FastAPI:
         return _records(df[["frame_idx", "ts"]])
 
     @app.get("/api/areas")
-    def get_areas():
-        return regions.load_count_areas(config.paths.count_areas)
+    def get_areas(dataset: str | None = None):
+        # Areas are per-dataset now: the same camera name is re-framed by each
+        # upload, so a camera's polygon only means anything within the package it
+        # was drawn on. ds None (pre-migration DB, no packages) -> legacy flat file.
+        c = con()
+        ds = resolve_ds(c, dataset)
+        c.close()
+        return regions.load_count_areas(regions.dataset_area_path(config, ds, "count"))
 
     @app.post("/api/areas", dependencies=[Depends(require_poweruser)])
-    def set_areas(req: AreasReq):
-        regions.save_count_areas(config.paths.count_areas, req.areas)
-        run_localize(config)
+    def set_areas(req: AreasReq, dataset: str | None = None):
+        c = con()
+        ds = resolve_ds(c, dataset)
+        has_dataset = db.latest_dataset(c) is not None
+        c.close()
+        # Refuse to write into the flat legacy file while packages exist — such an
+        # edit would silently belong to no dataset. Force the caller to name one.
+        if ds is None and has_dataset:
+            raise HTTPException(400, "dataset required to edit areas")
+        regions.save_count_areas(regions.dataset_area_path(config, ds, "count"), req.areas)
+        run_localize(config, dataset_id=ds)
         return {"ok": True}
 
     @app.get("/api/panel-areas")
-    def get_panel_areas():
+    def get_panel_areas(dataset: str | None = None):
         """Shelter regions (same polygon shape as count areas). A cow inside one
-        is 'under a panel'."""
-        return regions.load_count_areas(config.paths.panel_areas)
+        is 'under a panel'. Per-dataset, exactly like count areas."""
+        c = con()
+        ds = resolve_ds(c, dataset)
+        c.close()
+        return regions.load_count_areas(regions.dataset_area_path(config, ds, "panel"))
 
     @app.post("/api/panel-areas", dependencies=[Depends(require_poweruser)])
-    def set_panel_areas(req: AreasReq):
-        regions.save_count_areas(config.paths.panel_areas, req.areas)
-        run_localize(config)
+    def set_panel_areas(req: AreasReq, dataset: str | None = None):
+        c = con()
+        ds = resolve_ds(c, dataset)
+        has_dataset = db.latest_dataset(c) is not None
+        c.close()
+        if ds is None and has_dataset:
+            raise HTTPException(400, "dataset required to edit areas")
+        regions.save_count_areas(regions.dataset_area_path(config, ds, "panel"), req.areas)
+        run_localize(config, dataset_id=ds)
         return {"ok": True}
 
     @app.get("/api/area-counts")
@@ -537,8 +563,11 @@ def create_app(config: Config) -> FastAPI:
         return _records(df)
 
     @app.post("/api/localize", dependencies=[Depends(require_poweruser)])
-    def localize():
-        return {"updated": run_localize(config)}
+    def localize(dataset: str | None = None):
+        c = con()
+        ds = resolve_ds(c, dataset)
+        c.close()
+        return {"updated": run_localize(config, dataset_id=ds)}
 
     # ------------------------------------------------------------------ uploads
     @app.post("/api/uploads", dependencies=[Depends(require_poweruser)])
