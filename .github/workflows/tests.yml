@@ -1,0 +1,32 @@
+name: tests
+
+# Run the suite on every push and PR so regressions can't reach production the
+# way the frame-sampling and DuckDB-concurrency bugs did (the container runs
+# `serve --skip-tests`, and the tests aren't in the image — CI is the gate).
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # CPU-only torch from the PyTorch CPU wheel index (mirrors the Dockerfile,
+      # avoids pulling the multi-GB CUDA build ultralytics would otherwise drag in).
+      - name: Install CPU torch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+
+      - name: Install dependencies + test extras
+        run: |
+          pip install -r requirements.txt
+          pip install "httpx>=0.27"          # fastapi TestClient needs httpx (test_api/test_auth)
+
+      - name: Run tests
+        run: python -m tests

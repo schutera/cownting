@@ -24,6 +24,9 @@ dependencies = { file = ["requirements.txt"] }
 label = ["fiftyone>=1.0", "transformers>=4.41"]
 # Fine-tuning uses the core ultralytics dep; this pulls plotting/eval extras.
 finetune = ["matplotlib>=3.7"]
+# Test-only: fastapi's TestClient (test_api / test_auth) requires httpx. CI
+# installs this so the HTTP tests run; not needed in the runtime image.
+test = ["httpx>=0.27"]
 
 [project.scripts]
 cownting = "cownting.cli:app"
