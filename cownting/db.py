@@ -6,6 +6,7 @@ written NULL now and filled later, so downstream stages are additive.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import duckdb
@@ -30,8 +31,33 @@ DET_COLS = [
 
 
 def connect(db_path: str, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection, retrying past the transient file-handle conflict.
+
+    The app opens a short-lived connection per request/operation and closes it
+    right after. Under concurrent dashboard queries (or a request overlapping an
+    in-process upload) two opens momentarily coincide, and DuckDB rejects the
+    second with "Unique file handle conflict: ... already attached". The other
+    connection is released within milliseconds, so a bounded retry turns what used
+    to be a hard 500 into a sub-second wait. Kept deliberately per-request (not a
+    process-wide singleton) so the file stays free between operations for the
+    read-only CLI/eval tools that open it from their own process.
+    """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(db_path, read_only=read_only)
+    delay = 0.02
+    last: Exception | None = None
+    for _ in range(50):
+        try:
+            return duckdb.connect(db_path, read_only=read_only)
+        except Exception as e:  # noqa: BLE001 — retry only the file-handle clash
+            msg = str(e).lower()
+            if "already attached" in msg or "unique file handle" in msg or "conflict" in msg:
+                last = e
+                time.sleep(delay)
+                delay = min(delay * 1.5, 0.2)
+                continue
+            raise
+    assert last is not None
+    raise last  # exhausted retries — surface the real DuckDB error
 
 
 def init_db(con: duckdb.DuckDBPyConnection) -> None:
