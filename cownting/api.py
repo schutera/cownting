@@ -196,6 +196,7 @@ def create_app(config: Config) -> FastAPI:
         if not user:
             raise HTTPException(401, "invalid username or password")
         request.session["user"] = user
+        print(f"[cownting.alert] LOGIN user={body.username.strip()}", flush=True)
         return {**user, "auth_disabled": False}
 
     @app.post("/api/logout")
