@@ -48,7 +48,14 @@ def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str,
         raise RuntimeError(f"could not open video: {cam.video}")
 
     vfps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    step = max(1, round(vfps / max(ingest_cfg.target_fps, 1e-6)))
+    if ingest_cfg.frame_interval_seconds is not None:
+        # Time-lapse: every stored frame is already a deliberate capture, one
+        # real interval apart, so there is nothing to subsample — keep them all.
+        # (target_fps only makes sense for real-time footage; applying it here
+        # would silently drop most of the captured moments.)
+        step = 1
+    else:
+        step = max(1, round(vfps / max(ingest_cfg.target_fps, 1e-6)))
     start = _start_time(cam)
     base = Path(artifacts_dir) / dataset_id if dataset_id else Path(artifacts_dir)
     out_dir = base / "frames" / cam.id
