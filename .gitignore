@@ -44,3 +44,8 @@ frontend/.vite/
 
 # --- Local, machine-specific config (cownting.example.yaml stays tracked) ---
 config/cownting.yaml
+
+# --- Deployment-local: kept on the host, never committed ---
+# alerts/webhook.url is the Discord webhook (secret)
+alerts/webhook.url
+docker-compose.override.yml
