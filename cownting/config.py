@@ -191,7 +191,15 @@ def resolve_dataset(config: "Config") -> Tuple[str, Optional[date], str]:
     elif day is not None:
         dataset_id = day.isoformat()
     else:
-        dataset_id = "dataset"
+        # No dataset.id and no derivable day (no dataset.day, no cameras[].start).
+        # The old fallback to a constant "dataset" id silently made every such
+        # ingest purge + overwrite the previous one, because resolve_dataset can't
+        # see the in-file capture time that index_video actually reads. Fail loud.
+        raise ValueError(
+            "cannot resolve a dataset id: set dataset.id or dataset.day in the "
+            "config, or a cameras[].start — otherwise a re-ingest would overwrite "
+            "the previous run under the shared id 'dataset'."
+        )
     label = ds.label or (day.strftime("%b %d, %Y") if day else dataset_id)
     return dataset_id, day, label
 

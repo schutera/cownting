@@ -68,30 +68,33 @@ def index_video(cam: CameraCfg, ingest_cfg: IngestCfg, artifacts_dir: str,
             break
         if idx % step == 0:
             ok, frame = cap.retrieve()
-            if not ok:
-                break
-            if ingest_cfg.frame_interval_seconds is not None:
-                # Time-lapse: idx is the raw capture number, so real time advances
-                # one interval per frame (independent of the file's playback fps).
-                ts = start + timedelta(seconds=idx * ingest_cfg.frame_interval_seconds)
-            else:
-                ts = start + timedelta(seconds=idx / vfps)
-            frame_path = ""
-            if ingest_cfg.save_frames:
-                frame_path = str(out_dir / f"{idx:08d}.jpg")
-                cv2.imwrite(frame_path, frame)
-            rows.append(
-                dict(
-                    dataset_id=dataset_id,
-                    camera_id=cam.id,
-                    frame_idx=idx,
-                    ts=ts,
-                    time_bin=int(ts.timestamp() // ingest_cfg.time_bin_seconds),
-                    frame_path=frame_path,
-                    overlay_path=None,
-                    processed=False,
+            # A failed retrieve on a single grabbed frame (a transient one-frame
+            # decode hiccup) used to `break` and silently abandon the rest of the
+            # video. Skip just that frame instead; idx still advances below so
+            # timestamps stay aligned and the remaining footage is still ingested.
+            if ok:
+                if ingest_cfg.frame_interval_seconds is not None:
+                    # Time-lapse: idx is the raw capture number, so real time advances
+                    # one interval per frame (independent of the file's playback fps).
+                    ts = start + timedelta(seconds=idx * ingest_cfg.frame_interval_seconds)
+                else:
+                    ts = start + timedelta(seconds=idx / vfps)
+                frame_path = ""
+                if ingest_cfg.save_frames:
+                    frame_path = str(out_dir / f"{idx:08d}.jpg")
+                    cv2.imwrite(frame_path, frame)
+                rows.append(
+                    dict(
+                        dataset_id=dataset_id,
+                        camera_id=cam.id,
+                        frame_idx=idx,
+                        ts=ts,
+                        time_bin=int(ts.timestamp() // ingest_cfg.time_bin_seconds),
+                        frame_path=frame_path,
+                        overlay_path=None,
+                        processed=False,
+                    )
                 )
-            )
         idx += 1
     cap.release()
     return pd.DataFrame(rows)

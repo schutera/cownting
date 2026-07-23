@@ -228,9 +228,15 @@ def pose(config: Config, dataset_id: str | None = None, limit: int | None = None
             "detection_id": grp["detection_id"].to_numpy(),
             "posture": [i.posture for i in insts],
         }))
-        # Mirror the frame's path into a sibling pose_overlays/ subtree.
-        pose_ov = fpath.replace("/frames/", "/pose_overlays/") if "/frames/" in fpath \
-            else str(artifacts / "pose_overlays" / f"{Path(fpath).stem}.jpg")
+        # Mirror the frame's path into a sibling pose_overlays/ subtree. Rebuild via
+        # path parts rather than a literal "/frames/" so it also works on Windows
+        # (backslash) paths — the hardcoded slash silently collided every overlay.
+        parts = list(Path(fpath).parts)
+        if "frames" in parts:
+            parts[parts.index("frames")] = "pose_overlays"
+            pose_ov = str(Path(*parts))
+        else:
+            pose_ov = str(artifacts / "pose_overlays" / f"{Path(fpath).stem}.jpg")
         render_pose_overlay(image, insts, pose_ov, min_kpt_conf=config.pose.min_kpt_conf)
         db.set_pose_overlay(con, fpath, pose_ov)
         updated += len(insts)
