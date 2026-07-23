@@ -43,4 +43,4 @@ paths:
   archive_db_path: data/cownting_archive.duckdb
   count_areas: data/count_areas.json
   panel_areas: data/panel_areas.json
-  orthophoto: null                 # set to a top-down site image (under data/) for the AreaMap
+  orthophoto: data/orthophoto.png                 # set to a top-down site image (under data/) for the AreaMap

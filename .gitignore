@@ -13,8 +13,9 @@ venv/
 .idea/
 .vscode/
 
-# --- Cownting data & artifacts (videos, frames, overlays, orthophoto, duckdb, ---
+# --- Cownting data & artifacts (videos, frames, overlays, duckdb, ---
 # --- calibration): moved out-of-band, never via git ---
+# Exception: data/orthophoto.png is force-tracked (site backdrop ships with the repo).
 data/
 *.duckdb
 *.duckdb.wal
