@@ -295,17 +295,23 @@ def create_app(config: Config) -> FastAPI:
     @app.get("/api/site")
     def site(dataset: str | None = None):
         c = con()
-        ds = resolve_ds(c, dataset)
-        cams = db.cameras(c, ds)
-        kpis = db.kpi_summary(c, ds)
-        refs = {}
-        for cam in cams:
-            rf = db.reference_frame(c, cam, ds)
-            if rf:
-                w, h = _img_size(rf)
-                q = f"?dataset={ds}" if ds else ""
-                refs[cam] = {"url": f"/api/img/reference/{cam}{q}", "width": w, "height": h}
-        c.close()
+        try:
+            ds = resolve_ds(c, dataset)
+            cams = db.cameras(c, ds)
+            kpis = db.kpi_summary(c, ds)
+            refs = {}
+            for cam in cams:
+                rf = db.reference_frame(c, cam, ds)
+                # A DB row can outlive its JPEG (deleted / half-ingested); without
+                # this exists-guard _img_size would 500 the dashboard's primary
+                # endpoint (and, pre-try/finally, leak the connection). Mirrors the
+                # orthophoto and /api/img/reference guards.
+                if rf and Path(rf).exists():
+                    w, h = _img_size(rf)
+                    q = f"?dataset={ds}" if ds else ""
+                    refs[cam] = {"url": f"/api/img/reference/{cam}{q}", "width": w, "height": h}
+        finally:
+            c.close()
         ortho = None
         if config.paths.orthophoto and Path(config.paths.orthophoto).exists():
             w, h = _img_size(config.paths.orthophoto)
@@ -343,7 +349,7 @@ def create_app(config: Config) -> FastAPI:
     def get_areas():
         return regions.load_count_areas(config.paths.count_areas)
 
-    @app.post("/api/areas")
+    @app.post("/api/areas", dependencies=[Depends(require_poweruser)])
     def set_areas(req: AreasReq):
         regions.save_count_areas(config.paths.count_areas, req.areas)
         run_localize(config)
@@ -355,7 +361,7 @@ def create_app(config: Config) -> FastAPI:
         is 'under a panel'."""
         return regions.load_count_areas(config.paths.panel_areas)
 
-    @app.post("/api/panel-areas")
+    @app.post("/api/panel-areas", dependencies=[Depends(require_poweruser)])
     def set_panel_areas(req: AreasReq):
         regions.save_count_areas(config.paths.panel_areas, req.areas)
         run_localize(config)
@@ -530,7 +536,7 @@ def create_app(config: Config) -> FastAPI:
         c.close()
         return _records(df)
 
-    @app.post("/api/localize")
+    @app.post("/api/localize", dependencies=[Depends(require_poweruser)])
     def localize():
         return {"updated": run_localize(config)}
 
@@ -736,8 +742,11 @@ def create_app(config: Config) -> FastAPI:
         def spa(full_path: str):
             if full_path.startswith("api/"):
                 raise HTTPException(404, "not found")
-            candidate = dist / full_path
-            if full_path and candidate.is_file():
+            # Resolve and confirm the target stays within dist/ before serving, so a
+            # "../" in the path can't escape the static root and read arbitrary files.
+            root = dist.resolve()
+            candidate = (dist / full_path).resolve()
+            if full_path and (candidate == root or root in candidate.parents) and candidate.is_file():
                 return FileResponse(str(candidate))
             return FileResponse(str(dist / "index.html"))  # client-side routing fallback
 

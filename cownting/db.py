@@ -562,10 +562,12 @@ def area_counts_whole_day(con, dataset_id: str | None = None, bin_seconds: float
 def counts_over_time(con, camera_id: str, trunc: str = "hour", dataset_id: str | None = None) -> pd.DataFrame:
     # Frame-based (LEFT JOIN) so zero-cow frames count; all processed frames.
     where = " AND f.dataset_id = ?" if dataset_id is not None else ""
-    params = [camera_id] + ([dataset_id] if dataset_id is not None else [])
+    # trunc is bound as a parameter (never string-interpolated) — it flows from an
+    # unauthenticated-ish query string, so f-string interpolation here was a SQLi.
+    params = [trunc, camera_id] + ([dataset_id] if dataset_id is not None else [])
     return con.execute(
         f"""
-        SELECT date_trunc('{trunc}', f.ts)       AS t,
+        SELECT date_trunc(?, f.ts)               AS t,
                count(DISTINCT f.frame_idx)       AS frames,
                count(d.detection_id)             AS detections,
                count(d.detection_id) * 1.0 / nullif(count(DISTINCT f.frame_idx), 0) AS cows_per_frame
@@ -580,13 +582,13 @@ def counts_over_time(con, camera_id: str, trunc: str = "hour", dataset_id: str |
 
 def shelter_over_time(con, camera_id: str | None, trunc: str = "hour", dataset_id: str | None = None) -> pd.DataFrame:
     # Detection-based: sheltering = count of under_panel per bucket. camera_id None -> all cameras.
-    sql = f"""
-        SELECT date_trunc('{trunc}', ts)               AS t,
+    sql = """
+        SELECT date_trunc(?, ts)                       AS t,
                count(*) FILTER (WHERE under_panel)      AS sheltering,
                count(*)                                 AS detections
         FROM detections
     """
-    clauses, params = [], []
+    clauses, params = [], [trunc]  # trunc bound first (SELECT ? precedes WHERE ?s)
     if camera_id is not None:
         clauses.append("camera_id = ?")
         params.append(camera_id)
@@ -619,10 +621,10 @@ def area_counts_over_time(con, camera: str | None = None, trunc: str = "hour", d
 
 def posture_over_time(con, camera_id: str, trunc: str = "hour", dataset_id: str | None = None) -> pd.DataFrame:
     where = " AND dataset_id = ?" if dataset_id is not None else ""
-    params = [camera_id] + ([dataset_id] if dataset_id is not None else [])
+    params = [trunc, camera_id] + ([dataset_id] if dataset_id is not None else [])
     return con.execute(
         f"""
-        SELECT date_trunc('{trunc}', ts) AS t,
+        SELECT date_trunc(?, ts) AS t,
                coalesce(posture, 'unknown') AS posture,
                count(*) AS n
         FROM detections WHERE camera_id = ?{where}
