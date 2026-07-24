@@ -12,6 +12,7 @@ import type {
   UploadJob,
   Crosstab,
   FeatureInfo,
+  LocalizeStatus,
   User,
   Role,
 } from "./types";
@@ -241,6 +242,13 @@ export function refImg(camera: string): string {
 
 export function runLocalize(): Promise<{ updated: number }> {
   return j<{ updated: number }>("/api/localize", { method: "POST" });
+}
+
+// Background-localize progress for the "the box is working" spinner. This is
+// GLOBAL worker status — not scoped to a dataset. The endpoint ignores the
+// ?dataset param j() appends (same as listUploadJobs), so a plain j() GET is fine.
+export function getLocalizeStatus(): Promise<LocalizeStatus> {
+  return j<LocalizeStatus>("/api/localize/status");
 }
 
 // CSV export (one row per detection). Returns a URL for an <a href download> —

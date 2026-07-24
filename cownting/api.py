@@ -25,7 +25,7 @@ from . import features as features_mod
 from . import uploads as uploads_mod
 from .config import Config
 from .ingest import capture_time
-from .pipeline import localize as run_localize
+from . import localize_worker
 from .scene import regions
 
 
@@ -157,10 +157,10 @@ def create_app(config: Config) -> FastAPI:
     def con():
         # Read-write, NOT read_only: DuckDB rejects opening a second connection to
         # the same file with a different mode in one process ("Can't open a
-        # connection ... with a different configuration"). The save path
-        # (run_localize) needs a writer, so a read_only reader open at the same
-        # moment (e.g. the dashboard polling during a save) would make that write
-        # connection fail and 500 the POST. Everyone shares one mode.
+        # connection ... with a different configuration"). The background localize
+        # worker holds a writer while it reassigns detections, so a read_only reader
+        # open at the same moment (e.g. the dashboard polling during a save) would
+        # make that write connection fail and 500 the request. Everyone shares one mode.
         return db.connect(config.paths.db_path)
 
     def resolve_ds(c, requested: str | None) -> str | None:
@@ -369,8 +369,9 @@ def create_app(config: Config) -> FastAPI:
         if ds is None and has_dataset:
             raise HTTPException(400, "dataset required to edit areas")
         regions.save_count_areas(regions.dataset_area_path(config, ds, "count"), req.areas)
-        run_localize(config, dataset_id=ds)
-        return {"ok": True}
+        # Localize off the request thread so the save returns instantly; the
+        # frontend polls /api/localize/status for the "assigning cows…" spinner.
+        return {"ok": True, "localize": localize_worker.request_localize(config, ds)}
 
     @app.get("/api/panel-areas")
     def get_panel_areas(dataset: str | None = None):
@@ -390,8 +391,7 @@ def create_app(config: Config) -> FastAPI:
         if ds is None and has_dataset:
             raise HTTPException(400, "dataset required to edit areas")
         regions.save_count_areas(regions.dataset_area_path(config, ds, "panel"), req.areas)
-        run_localize(config, dataset_id=ds)
-        return {"ok": True}
+        return {"ok": True, "localize": localize_worker.request_localize(config, ds)}
 
     @app.get("/api/area-counts")
     def area_counts(frame: int | None = None, dataset: str | None = None):
@@ -567,7 +567,12 @@ def create_app(config: Config) -> FastAPI:
         c = con()
         ds = resolve_ds(c, dataset)
         c.close()
-        return {"updated": run_localize(config, dataset_id=ds)}
+        return localize_worker.request_localize(config, ds)
+
+    @app.get("/api/localize/status")
+    def localize_status():
+        """Background-localize progress for the 'the box is working' spinner."""
+        return localize_worker.status()
 
     # ------------------------------------------------------------------ uploads
     @app.post("/api/uploads", dependencies=[Depends(require_poweruser)])

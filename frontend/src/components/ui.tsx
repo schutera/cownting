@@ -198,6 +198,56 @@ export function Button({
   );
 }
 
+/* Reusable "the box is working" indicator: a spinning ring + a label, shown
+   anywhere the app waits on the backend (starting with localize-after-save).
+   Pass `done` to swap the spinner for a check so it reads as a settled
+   confirmation. Font size is inherited so callers can size it in context;
+   pure CSS/SVG (Tailwind's animate-spin), no dependencies. */
+export function Working({
+  label,
+  done = false,
+  className,
+}: {
+  label: ReactNode;
+  done?: boolean;
+  className?: string;
+}) {
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      className={
+        "inline-flex items-center gap-2 text-accent" + (className ? " " + className : "")
+      }
+    >
+      {done ? (
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M5 12.5l4.5 4.5L19 7"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      ) : (
+        <svg
+          className="animate-spin"
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+          <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+        </svg>
+      )}
+      <span>{label}</span>
+    </span>
+  );
+}
+
 export function Divider({ label }: { label?: string }) {
   return (
     <div className="flex items-center gap-4 my-6">

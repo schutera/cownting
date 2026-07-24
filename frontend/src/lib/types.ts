@@ -11,6 +11,22 @@ export type CountArea = { id: string; name: string; camera_polygon: number[][]; 
 // Areas keyed by camera id — used for both count areas and panel (shelter) areas.
 export type Areas = Record<string, CountArea[]>;
 
+// Background localize ("the box is working") progress. This is GLOBAL worker
+// state — NOT scoped to the selected dataset — returned by GET
+// /api/localize/status and embedded as `.localize` in the save-areas responses.
+// `pending` lists dataset_ids still queued; `busy` is true while any pass is
+// queued or running; `updated` is the detections reassigned in the last
+// completed pass and `dataset` is which day that pass was for.
+export interface LocalizeStatus {
+  status: "idle" | "pending" | "running" | "done" | "failed";
+  dataset: string | null;
+  updated: number;
+  error: string | null;
+  at: number | null;
+  pending: string[];
+  busy: boolean;
+}
+
 // A dashboard login account. `auth_disabled` is true only when the server was
 // booted with auth turned off (tests / trusted-LAN demo) — the SPA then skips
 // the login gate and treats the session as an admin.

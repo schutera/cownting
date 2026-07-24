@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
-import type { Areas, CountArea as Area, Site } from "../lib/types";
+import type { Areas, CountArea as Area, LocalizeStatus, Site } from "../lib/types";
 import {
   getAreas,
+  getLocalizeStatus,
   getPanelAreas,
   getSite,
   orthoImg,
@@ -12,11 +13,18 @@ import {
   savePanelAreas,
 } from "../lib/api";
 import { ImageClicker } from "../components/ImageClicker";
-import { Button, Card, SectionLabel } from "../components/ui";
+import { Button, Card, SectionLabel, Working } from "../components/ui";
 import { SHELTER_COLOR } from "../lib/palette";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 type Mode = "count" | "panel";
+
+// Localize-after-save watch tuning: how often we poll the box, how long the
+// "Updated" confirmation lingers, and a hard cap so the poll always terminates.
+const LOCALIZE_POLL_MS = 700;
+const LOCALIZE_DONE_LINGER_MS = 4000;
+const LOCALIZE_MAX_WATCH_MS = 120_000;
+type LocalizePhase = "idle" | "working" | "done" | "failed";
 
 /**
  * Per-camera count-area editor. A count area is a named region drawn twice: its
@@ -45,6 +53,20 @@ export default function CountArea() {
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveErr, setSaveErr] = useState<string | null>(null);
+
+  // "The box is working" — background localize kicked off by a save. We poll the
+  // (global) worker and treat it as working *for this editor* only while
+  // routeDataset is queued or is the dataset currently running.
+  const [localize, setLocalize] = useState<{
+    phase: LocalizePhase;
+    updated: number | null;
+    error: string | null;
+  }>({ phase: "idle", updated: null, error: null });
+  // Timers + a generation counter so a new save (or unmount) cancels any poll
+  // still in flight and no async tick ever setState()s a dead/stale watch.
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const doneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollGen = useRef(0);
 
   const isPanel = mode === "panel";
 
@@ -143,7 +165,84 @@ export default function CountArea() {
     setSaveState("idle");
   }
 
+  function clearLocalizeTimers() {
+    if (pollTimer.current) clearTimeout(pollTimer.current);
+    if (doneTimer.current) clearTimeout(doneTimer.current);
+    pollTimer.current = null;
+    doneTimer.current = null;
+  }
+
+  // Cancel any in-flight localize watch when this editor unmounts (a camera or
+  // dataset change remounts it) so the poll always terminates and no async tick
+  // ever touches a component that's gone.
+  useEffect(() => {
+    return () => {
+      pollGen.current++;
+      clearLocalizeTimers();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Poll GET /api/localize/status (~700 ms) after a save until this dataset's
+  // pass leaves the queue, then briefly confirm. A hard deadline guarantees the
+  // loop stops even if the box never reports done. Never blocks the UI.
+  function watchLocalize(ds: string) {
+    clearLocalizeTimers();
+    const gen = ++pollGen.current; // supersede any earlier watch
+    const deadline = Date.now() + LOCALIZE_MAX_WATCH_MS;
+    setLocalize({ phase: "working", updated: null, error: null });
+
+    const tick = async () => {
+      if (gen !== pollGen.current) return; // superseded / unmounted
+      let s: LocalizeStatus | null = null;
+      try {
+        s = await getLocalizeStatus();
+      } catch {
+        /* transient — let the deadline / next tick decide */
+      }
+      if (gen !== pollGen.current) return; // changed during the await
+
+      if (s) {
+        if (s.status === "failed" && s.dataset === ds) {
+          setLocalize({ phase: "failed", updated: null, error: s.error ?? "localize failed" });
+          return; // terminal
+        }
+        const mine = s.pending.includes(ds) || (s.status === "running" && s.dataset === ds);
+        if (!mine) {
+          // Our pass is done. Report its count only if the last pass was ours.
+          setLocalize({
+            phase: "done",
+            updated: s.dataset === ds ? s.updated : null,
+            error: null,
+          });
+          doneTimer.current = setTimeout(() => {
+            if (gen === pollGen.current) {
+              setLocalize((p) =>
+                p.phase === "done" ? { phase: "idle", updated: null, error: null } : p,
+              );
+            }
+          }, LOCALIZE_DONE_LINGER_MS);
+          return; // terminal
+        }
+      }
+
+      if (Date.now() >= deadline) {
+        // Timeout guard: stop watching; the box may still finish in the background.
+        setLocalize({ phase: "idle", updated: null, error: null });
+        return;
+      }
+      pollTimer.current = setTimeout(tick, LOCALIZE_POLL_MS);
+    };
+
+    // First poll after one interval — the save already enqueued the pass.
+    pollTimer.current = setTimeout(tick, LOCALIZE_POLL_MS);
+  }
+
   async function save() {
+    // A fresh save supersedes any localize watch still running from a prior one.
+    pollGen.current++;
+    clearLocalizeTimers();
+    setLocalize({ phase: "idle", updated: null, error: null });
     setSaveState("saving");
     setSaveErr(null);
     // Fill in / normalize any id that drifted (empty name etc.) and keep them
@@ -155,6 +254,9 @@ export default function CountArea() {
       setActiveMap(fullMap);
       setAreas(normalized);
       setSaveState("saved");
+      // The save POST returned instantly; the box now re-localizes off-thread.
+      // Watch it in the background without ever blocking the UI.
+      if (routeDataset) watchLocalize(routeDataset);
     } catch (e) {
       setSaveErr(String(e));
       setSaveState("error");
@@ -337,8 +439,27 @@ export default function CountArea() {
           {areas.length} area{areas.length === 1 ? "" : "s"} · {totalVerts} point
           {totalVerts === 1 ? "" : "s"} total
         </span>
-        {saveState === "saved" ? (
-          <span className="font-mono text-[11px] text-accent">✓ Saved · localizing…</span>
+        {saveState === "saved" && localize.phase === "idle" ? (
+          <span className="font-mono text-[11px] text-accent">✓ Saved</span>
+        ) : null}
+        {localize.phase === "working" ? (
+          <Working label="Assigning cows to areas…" className="font-mono text-[11px]" />
+        ) : null}
+        {localize.phase === "done" ? (
+          <Working
+            done
+            className="font-mono text-[11px]"
+            label={
+              localize.updated != null
+                ? `Updated · ${localize.updated} reassigned`
+                : "Updated"
+            }
+          />
+        ) : null}
+        {localize.phase === "failed" ? (
+          <span className="font-mono text-[11px] text-[#e76f51]">
+            Localize failed — {localize.error}
+          </span>
         ) : null}
         {saveState === "error" ? (
           <span className="font-mono text-[11px] text-[#e76f51]">Save failed — {saveErr}</span>
