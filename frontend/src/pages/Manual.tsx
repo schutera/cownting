@@ -82,8 +82,8 @@ export default function Manual() {
           <a href="#manage-cameras" className="text-accent hover:text-accent-deep">
             Manage cameras
           </a>{" "}
-          next. The <B>Coverage</B> panel at the bottom of the dashboard shows which
-          camera has frames in which time ranges, and warns when they cover very
+          next. The bar under each tile in the dashboard’s <B>Cameras</B> card shows
+          when that camera has frames, and the card warns when the cameras cover very
           different windows (counts only line up where the cameras overlap).
         </Callout>
       </Section>
@@ -117,7 +117,8 @@ export default function Manual() {
           </li>
           <li>
             <B>Clip a stream to sync:</B> if a camera recorded a longer window than the
-            others (the dashboard <B>Coverage</B> panel shows this), click{" "}
+            others (the coverage bars in the dashboard’s <B>Cameras</B> card show this),
+            click{" "}
             <ClipChip /> on it, set the <B>keep</B> window — it defaults to the times
             the other cameras share — and <B>Confirm clip</B>. Frames outside the window
             are set aside so the camera lines up with the rest. Changed your mind?{" "}
