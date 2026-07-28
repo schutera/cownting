@@ -87,3 +87,25 @@ export interface Crosstab {
 }
 // A feature the backend can cross-filter on, plus whether it has data available.
 export interface FeatureInfo { key: string; kind: string; available: boolean; }
+
+// One camera's frame coverage over the day: contiguous [startInstant, endInstant]
+// runs on the shared instant axis (gaps split them), plus its count + first/last ts.
+export interface CoverageCamera {
+  camera_id: string;
+  n_frames: number;
+  first_ts: string;
+  last_ts: string;
+  segments: [number, number][];
+}
+// Per-camera coverage for a day. `uneven` is true when the shortest-covered camera
+// spans under half the longest — the dashboard warns on it. Instants share the
+// timeline/scrubber axis; min/max_ts give the wall-clock extent for labels.
+export interface CameraCoverage {
+  cameras: CoverageCamera[];
+  min_instant: number;
+  max_instant: number;
+  min_ts: string | null;
+  max_ts: string | null;
+  bin_seconds: number;
+  uneven: boolean;
+}

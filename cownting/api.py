@@ -677,6 +677,17 @@ def create_app(config: Config) -> FastAPI:
         c.close()
         return {r.camera_id: int(r.frame_idx) for r in df.itertuples()}
 
+    @app.get("/api/camera-coverage")
+    def camera_coverage(dataset: str | None = None):
+        """Which cameras contribute frames in which time ranges, plus an `uneven`
+        flag — feeds the dashboard coverage strip so lopsided per-camera recording
+        (e.g. one camera stopping hours early) is visible, not silent. Read-only,
+        login-gated like the rest of the dashboard data."""
+        c = con()
+        out = db.camera_coverage(c, resolve_ds(c, dataset), bin_seconds)
+        c.close()
+        return out
+
     # ------------------------------------------------------------------ images
     @app.get("/api/img/orthophoto")
     def img_ortho():

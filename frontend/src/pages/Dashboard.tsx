@@ -10,6 +10,7 @@ import { CrossFilterProvider } from "../lib/crossfilter";
 import KpiPanel from "../components/KpiPanel";
 import CameraSegStack from "../components/CameraSegStack";
 import CameraDetail from "../components/CameraDetail";
+import CoveragePanel from "../components/CoveragePanel";
 
 // Homepage layout: heatmap hero in the centre, aggregated KPIs on the right,
 // per-camera segmentation on the left. Side panels stack under the hero on
@@ -150,6 +151,9 @@ export default function Dashboard() {
           />
         </div>
         </div>
+
+        {/* Full-width: which cameras contribute frames in which time ranges. */}
+        <CoveragePanel cameras={site.cameras} />
       </div>
     </CrossFilterProvider>
   );

@@ -77,12 +77,14 @@ export default function Manual() {
           </li>
         </Steps>
         <Callout>
-          <B>A camera looks broken?</B> If a camera came back unusable (a black or
-          empty image), you can drop that one stream and upload a replacement — see{" "}
+          <B>A camera looks broken, or the cameras don’t line up?</B> If one came back
+          unusable (a black or empty image), drop it and re-upload — see{" "}
           <a href="#manage-cameras" className="text-accent hover:text-accent-deep">
             Manage cameras
           </a>{" "}
-          next.
+          next. The <B>Coverage</B> panel at the bottom of the dashboard shows which
+          camera has frames in which time ranges, and warns when they cover very
+          different windows (counts only line up where the cameras overlap).
         </Callout>
       </Section>
 

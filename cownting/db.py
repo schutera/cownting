@@ -494,6 +494,70 @@ def frames_at_instant(con, instant: int, bin_seconds: float = 60.0,
     ).df()
 
 
+def camera_coverage(con, dataset_id: str | None = None, bin_seconds: float = 60.0) -> dict:
+    """Which cameras contribute frames in which time ranges, for one dataset.
+
+    Cameras rarely record the same window — one may run 24 h, another only a few
+    daytime hours (or stop early after a fault). That unevenness silently skews any
+    cross-camera sum, so this surfaces it. Returns, per camera, the contiguous
+    covered `segments` on the shared *instant* axis (each `[start, end]` a run of
+    consecutive frame buckets — so gaps show as separate segments), plus each
+    camera's frame count and first/last ts. `uneven` is True when the shortest
+    camera covers under half the span of the longest — the dashboard warns on it.
+    Instants are the same timestamp buckets as the scrubber/timeline (see
+    _instant_expr), so the strips line up with the rest of the day view."""
+    where = "WHERE dataset_id = ?" if dataset_id is not None else ""
+    params = [dataset_id] if dataset_id is not None else []
+    inst = _instant_expr(bin_seconds, "ts")
+    df = con.execute(
+        f"""
+        SELECT camera_id, {inst} AS instant, min(ts) AS ts, count(*) AS n
+        FROM frames {where}
+        GROUP BY camera_id, instant
+        ORDER BY camera_id, instant
+        """,
+        params,
+    ).df()
+    empty = {"cameras": [], "min_instant": 0, "max_instant": 0, "min_ts": None,
+             "max_ts": None, "bin_seconds": float(bin_seconds), "uneven": False}
+    if df.empty:
+        return empty
+
+    cameras = []
+    for cam, grp in df.groupby("camera_id"):
+        insts = [int(i) for i in grp["instant"].tolist()]
+        # Collapse consecutive instants into [start, end] runs; a jump > 1 is a gap.
+        segments: list[list[int]] = []
+        run_start = prev = insts[0]
+        for it in insts[1:]:
+            if it == prev + 1:
+                prev = it
+                continue
+            segments.append([run_start, prev])
+            run_start = prev = it
+        segments.append([run_start, prev])
+        cameras.append({
+            "camera_id": cam,
+            "n_frames": int(grp["n"].sum()),
+            "first_ts": grp["ts"].min().isoformat(),
+            "last_ts": grp["ts"].max().isoformat(),
+            "segments": segments,
+        })
+    cameras.sort(key=lambda c: c["camera_id"])
+
+    spans = [c["segments"][-1][1] - c["segments"][0][0] for c in cameras]
+    uneven = len(cameras) >= 2 and max(spans) > 0 and min(spans) < 0.5 * max(spans)
+    return {
+        "cameras": cameras,
+        "min_instant": int(df["instant"].min()),
+        "max_instant": int(df["instant"].max()),
+        "min_ts": df["ts"].min().isoformat(),
+        "max_ts": df["ts"].max().isoformat(),
+        "bin_seconds": float(bin_seconds),
+        "uneven": bool(uneven),
+    }
+
+
 def area_summary(con, dataset_id: str | None = None) -> pd.DataFrame:
     """Whole-day totals per count area, split by posture. Feeds the static
     per-area KPI list (cows spotted + standing/lying) on the right rail."""

@@ -14,6 +14,7 @@ import type {
   FeatureInfo,
   LocalizeStatus,
   CameraHealth,
+  CameraCoverage,
   User,
   Role,
 } from "./types";
@@ -287,6 +288,12 @@ export function getFrames(camera: string): Promise<FrameRow[]> {
 
 export function getTimeline(): Promise<TimelineData> {
   return j<TimelineData>("/api/timeline");
+}
+
+// Per-camera frame coverage over the day (which camera records in which ranges) +
+// an `uneven` flag, for the dashboard coverage strip. Scoped to the selected day.
+export function getCameraCoverage(): Promise<CameraCoverage> {
+  return j<CameraCoverage>("/api/camera-coverage");
 }
 
 export function getDaySeries(): Promise<DaySeries> {
