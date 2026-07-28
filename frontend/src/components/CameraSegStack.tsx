@@ -88,7 +88,19 @@ export default function CameraSegStack({
 
   return (
     <Panel className="lg:sticky lg:top-24">
-      <SectionLabel>CAMERAS</SectionLabel>
+      <div className="flex items-center gap-2">
+        <SectionLabel>CAMERAS</SectionLabel>
+        {dataset && canManage ? (
+          <button
+            onClick={() => navigate(`/data/${dataset}/cameras`)}
+            title="Manage cameras — add, replace, or delete a stream for this day"
+            aria-label="manage cameras"
+            className="grid place-items-center w-6 h-6 rounded-full text-gray-tertiary hover:text-accent hover:bg-accent-soft transition-colors"
+          >
+            <CogIcon className="w-3.5 h-3.5" />
+          </button>
+        ) : null}
+      </div>
       <div className="font-display text-xl text-near-black leading-none mt-1">
         Segmentation
       </div>
@@ -180,18 +192,6 @@ export default function CameraSegStack({
           );
         })}
       </div>
-
-      {/* Card-level camera management (add / replace / delete a whole stream) — the
-          per-tile gear edits count areas; this goes to the day's camera manager. */}
-      {dataset && canManage ? (
-        <button
-          onClick={() => navigate(`/data/${dataset}/cameras`)}
-          className="mt-4 pt-3 border-t border-border w-full text-left font-mono text-[11px] uppercase tracking-[0.14em] text-gray-tertiary hover:text-accent transition-colors"
-          title="Add, replace, or delete camera streams for this day"
-        >
-          Manage cameras →
-        </button>
-      ) : null}
     </Panel>
   );
 }

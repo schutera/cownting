@@ -97,8 +97,9 @@ export default function Manual() {
         </p>
         <Steps>
           <li>
-            Open the camera manager: on the <NavPill>Dashboard</NavPill>, in the{" "}
-            <B>Cameras</B> panel, click <B>Manage cameras →</B> — or on the{" "}
+            Open the camera manager: on the <NavPill>Dashboard</NavPill>, click the{" "}
+            <Inline><CogIcon className="w-4 h-4 text-gray-tertiary" /></Inline> gear next
+            to <B>CAMERAS</B> in the segmentation panel — or on the{" "}
             <NavPill>Data</NavPill> page, click the <CardGear /> gear on a day card.
           </li>
           <li>
