@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 from .config import CameraCfg, Config, DatasetCfg
 from .pipeline import ingest as run_ingest
+from .pipeline import ingest_one_camera as run_ingest_one
 from .pipeline import localize as run_localize
 from .pipeline import segment as run_segment
 
@@ -56,6 +57,9 @@ class Job:
     error: Optional[str] = None
     frames: int = 0
     detections: int = 0
+    # Advisory per-camera data-quality warnings from the post-process health check,
+    # e.g. ["camera_02 (obscured (dark), no cows detected)"]. Never blocks the job.
+    warnings: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)  # epoch secs; newest-first ordering
 
 
@@ -162,6 +166,83 @@ def start_upload_job(
     return job
 
 
+def _camera_health(config: Config, dataset_id: str) -> list[dict]:
+    """Per-camera health for `dataset_id`, or [] if the check itself fails — a
+    quality warning must never turn a successful upload into a failed job."""
+    try:
+        from .quality import camera_health
+        return camera_health(config, dataset_id)
+    except Exception:  # noqa: BLE001 — advisory only; swallow and report no warnings
+        return []
+
+
+def _warnings_from(health: list[dict]) -> list[str]:
+    from .quality import describe
+    return [describe(h) for h in health if not h["ok"]]
+
+
+def start_add_camera_job(
+    base: Config, dataset_id: str, camera_id: str, video_path: str,
+    start_iso: str, label: str,
+) -> Job:
+    """Register a queued job that ADDS/REPLACES one camera stream in an existing
+    dataset (ingest that one camera -> segment it -> re-localize the day), then
+    kicks it off on a daemon thread. Returns the Job immediately."""
+    job = Job(job_id=uuid.uuid4().hex, dataset_id=dataset_id, label=label)
+    with _LOCK:
+        _JOBS[job.job_id] = job
+        _persist(force=True)
+    threading.Thread(
+        target=_run_add_camera,
+        args=(job, base, dataset_id, camera_id, video_path, start_iso),
+        daemon=True,
+    ).start()
+    return job
+
+
+def _run_add_camera(
+    job: Job, base: Config, dataset_id: str, camera_id: str,
+    video_path: str, start_iso: str,
+) -> None:
+    try:
+        cfg = base.model_copy(deep=True)
+        cfg.cameras = [CameraCfg(id=camera_id, video=video_path, start=start_iso)]
+        cfg.dataset = DatasetCfg(id=dataset_id)  # existing day/label kept by ingest_one
+
+        _update(job, status="running", stage="ingesting", progress=0.05,
+                message=f"Reading {camera_id} and sampling frames…")
+        n_frames = run_ingest_one(cfg, dataset_id, cfg.cameras[0])
+
+        _update(job, stage="segmenting", progress=0.15, frames=n_frames,
+                message=f"Detecting cows across {n_frames} frames…")
+
+        def on_seg(done: int, total: int) -> None:
+            frac = done / total if total else 1.0
+            _update(job, progress=0.15 + 0.75 * frac,
+                    message=f"Detecting cows… frame {done}/{total}")
+
+        # Scope segmentation to just this camera's new frames so it can't sweep up
+        # unprocessed frames left elsewhere.
+        n_det = run_segment(cfg, on_progress=on_seg, dataset_id=dataset_id, camera_id=camera_id)
+
+        _update(job, stage="localizing", progress=0.92, detections=n_det,
+                message="Assigning cows to count areas…")
+        run_localize(cfg, dataset_id=dataset_id)
+
+        health = _camera_health(cfg, dataset_id)
+        warnings = _warnings_from(health)
+        mine = next((h for h in health if h["camera_id"] == camera_id), None)
+        if mine is not None and not mine["ok"]:
+            from .quality import describe
+            msg = (f"Added {camera_id}, but it still looks off — {describe(mine)}. "
+                   "Check the footage before trusting it.")
+        else:
+            msg = f"Added {camera_id} — {n_frames} frames, {n_det} cows detected."
+        _update(job, status="done", stage="done", progress=1.0, warnings=warnings, message=msg)
+    except Exception as e:  # noqa: BLE001 — surface any failure to the UI, don't crash the thread
+        _update(job, status="failed", error=str(e), message=f"Failed: {e}")
+
+
 def _run(
     job: Job,
     base: Config,
@@ -194,7 +275,16 @@ def _run(
                 message="Assigning cows to count areas…")
         run_localize(cfg, dataset_id=dataset_id)
 
-        _update(job, status="done", stage="done", progress=1.0,
-                message="Upload complete — the day is ready on the dashboard.")
+        # Advisory post-process quality check: warn (never block) if a camera looks
+        # obscured / stopped early / found no cows, so the user can delete + re-upload
+        # just that stream from the day's camera manager.
+        warnings = _warnings_from(_camera_health(cfg, dataset_id))
+        if warnings:
+            n = len(warnings)
+            msg = (f"Upload complete, but {n} camera{'s' if n > 1 else ''} need a look: "
+                   + "; ".join(warnings) + ".")
+        else:
+            msg = "Upload complete — the day is ready on the dashboard."
+        _update(job, status="done", stage="done", progress=1.0, warnings=warnings, message=msg)
     except Exception as e:  # noqa: BLE001 — surface any failure to the UI, don't crash the thread
         _update(job, status="failed", error=str(e), message=f"Failed: {e}")

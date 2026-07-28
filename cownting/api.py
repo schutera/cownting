@@ -75,6 +75,15 @@ def _records(df) -> list[dict]:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
+def _safe_path_id(value: str) -> bool:
+    """True if `value` is safe to use as a single filesystem path segment — no
+    separators, no parent refs, not empty/dot. Dataset ids are normally clean ISO
+    day slugs, but they can be set via CLI/config (DatasetCfg does no slug check),
+    so any id that becomes an rmtree/mkdir path segment is checked before use."""
+    return bool(value) and value not in (".", "..") \
+        and "/" not in value and "\\" not in value and ".." not in value
+
+
 def _img_size(path: str) -> tuple[int, int]:
     from PIL import Image
 
@@ -293,6 +302,159 @@ def create_app(config: Config) -> FastAPI:
         # artifacts/); drop them too so a re-upload of this id starts area-clean.
         shutil.rmtree(Path(config.paths.artifacts_dir).parent / "areas" / dataset_id, ignore_errors=True)
         return {"ok": True, "dataset_id": dataset_id, "detections_archived": moved}
+
+    # ------------------------------------------------------ per-camera management
+    @app.get("/api/dataset/{dataset_id}/camera-health")
+    def camera_health(dataset_id: str):
+        """Per-camera data-quality verdict for one day: brightness, time span,
+        detections, and any of 'dark' / 'truncated' / 'no_detections'. ADVISORY —
+        the frontend warns and offers delete/replace; nothing here mutates data."""
+        from .quality import camera_health as _camera_health
+        return _camera_health(config, dataset_id)
+
+    @app.delete("/api/dataset/{dataset_id}/camera/{camera}",
+                dependencies=[Depends(require_poweruser)])
+    def delete_camera(dataset_id: str, camera: str):
+        """Permanently remove ONE camera's stream from a day — its frames,
+        detections, on-disk images, and its per-dataset count/panel areas — leaving
+        every other camera untouched, then re-localize the day. For dropping a
+        malformed stream (e.g. an obscured camera) so a healthy one can replace it.
+
+        Unlike deleting a whole day (which archives), a single bad stream is dropped
+        outright — there is nothing worth preserving. 400 on a bad camera name,
+        404 if the dataset or that camera isn't present."""
+        if not uploads_mod.valid_camera_id(camera):
+            raise HTTPException(400, f"invalid camera name {camera!r}")
+        # dataset_id becomes a filesystem path segment below (rmtree / area dir);
+        # a real dataset row is required, but reject path-escape chars defensively
+        # in case an id was ever set (via CLI/config) to something non-slug.
+        if not _safe_path_id(dataset_id):
+            raise HTTPException(400, f"invalid dataset id {dataset_id!r}")
+        c = con()
+        try:
+            exists = c.execute(
+                "SELECT count(*) FROM datasets WHERE dataset_id = ?", [dataset_id]
+            ).fetchone()[0]
+            if not exists:
+                raise HTTPException(404, f"unknown dataset {dataset_id!r}")
+            nf = c.execute(
+                "SELECT count(*) FROM frames WHERE dataset_id = ? AND camera_id = ?",
+                [dataset_id, camera],
+            ).fetchone()[0]
+            nd = c.execute(
+                "SELECT count(*) FROM detections WHERE dataset_id = ? AND camera_id = ?",
+                [dataset_id, camera],
+            ).fetchone()[0]
+            if nf == 0 and nd == 0:
+                raise HTTPException(404, f"camera {camera!r} not in dataset {dataset_id!r}")
+            db.purge_dataset(c, dataset_id, camera_id=camera)
+            remaining = c.execute(
+                "SELECT count(DISTINCT camera_id) FROM frames WHERE dataset_id = ?",
+                [dataset_id],
+            ).fetchone()[0]
+        finally:
+            c.close()
+        # On-disk frames/overlays/pose overlays for this camera.
+        ds_art = Path(config.paths.artifacts_dir) / dataset_id
+        for sub in ("frames", "overlays", "pose_overlays"):
+            shutil.rmtree(ds_art / sub / camera, ignore_errors=True)
+        # Drop this camera's polygons from the day's per-dataset area files so a
+        # replacement re-upload of the same camera name starts area-clean.
+        for kind in ("count", "panel"):
+            p = regions.dataset_area_path(config, dataset_id, kind)
+            areas = regions.load_count_areas(p)
+            if camera in areas:
+                areas.pop(camera, None)
+                regions.save_count_areas(p, areas)
+        # Reassign the day's remaining detections (off-thread) so counts refresh.
+        status = localize_worker.request_localize(config, dataset_id)
+        return {"ok": True, "dataset_id": dataset_id, "camera": camera,
+                "frames_removed": int(nf), "detections_removed": int(nd),
+                "remaining_cameras": int(remaining), "localize": status}
+
+    @app.post("/api/dataset/{dataset_id}/camera", dependencies=[Depends(require_poweruser)])
+    def add_camera(dataset_id: str,
+                   video: UploadFile = File(...),
+                   camera: str = Form(...),
+                   start: str | None = Form(None)):
+        """Add (or replace) ONE camera stream in an existing day, then auto-process
+        just that stream (ingest -> segment -> re-localize) in the background.
+        Returns 202 + a job id the frontend polls at GET /api/uploads/{job_id}.
+
+        The start time is read from the video itself (container creation_time, else
+        the burned-in Brinno bar); when neither yields a time it anchors to the
+        day's date at midnight so the new stream lands on the right day. Pass an
+        explicit `start` (ISO 8601) to override."""
+        cam = camera.strip()
+        if not uploads_mod.valid_camera_id(cam):
+            raise HTTPException(400, f"invalid camera name {cam!r} (use letters, digits, _ or -)")
+        if not _safe_path_id(dataset_id):  # becomes a filesystem path segment below
+            raise HTTPException(400, f"invalid dataset id {dataset_id!r}")
+        if not uploads_mod.allowed_ext(video.filename or ""):
+            raise HTTPException(400, f"unsupported file type: {video.filename!r}")
+        c = con()
+        try:
+            exists = c.execute(
+                "SELECT count(*) FROM datasets WHERE dataset_id = ?", [dataset_id]
+            ).fetchone()[0]
+            day = db.dataset_day(c, dataset_id)
+        finally:
+            c.close()
+        if not exists:
+            raise HTTPException(404, f"unknown dataset {dataset_id!r}")
+
+        # Land the clip in the day's inbox under the camera name (a re-add of the
+        # same camera overwrites its prior clip, matching the replace semantics).
+        inbox = Path(config.paths.artifacts_dir) / "_uploads" / dataset_id
+        inbox.mkdir(parents=True, exist_ok=True)
+        ext = Path(video.filename or "").suffix.lower()
+        dest = inbox / f"{cam}{ext}"
+        try:
+            with open(dest, "wb") as f:
+                shutil.copyfileobj(video.file, f)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
+
+        # Resolve the start time; unlink the just-landed clip on any reject path so a
+        # 400/422 doesn't leave an orphan video in the inbox.
+        try:
+            start_dt = None
+            if start and start.strip():
+                # Explicit override — trusted as-is (the caller may deliberately
+                # place the stream at a specific instant).
+                try:
+                    start_dt = datetime.fromisoformat(start.strip())
+                except ValueError:
+                    raise HTTPException(400, "start must be an ISO 8601 timestamp")
+            else:
+                read = (capture_time.read_container_time(dest)
+                        or capture_time.read_burned_timestamp(dest))
+                if read is not None and day is not None:
+                    # The day is fixed (this dataset already exists). Keep the clip's
+                    # time-of-day but PIN its date to the dataset's day, so a camera
+                    # whose clock drifted to a different calendar date still lines up
+                    # with the other cameras (cross-camera linking is by timestamp)
+                    # instead of landing on a day nothing else recorded.
+                    start_dt = datetime(day.year, day.month, day.day,
+                                        read.hour, read.minute, read.second)
+                elif read is not None:
+                    start_dt = read
+                elif day is not None:
+                    start_dt = datetime(day.year, day.month, day.day)  # midnight on the day
+            if start_dt is None:
+                raise HTTPException(422, detail={
+                    "code": "capture_day_required",
+                    "message": ("Couldn't read a recording time from the video and the "
+                                "day has no date on record — set a start time."),
+                })
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
+
+        job = uploads_mod.start_add_camera_job(
+            config, dataset_id, cam, str(dest), start_dt.isoformat(), f"add {cam}")
+        return JSONResponse(status_code=202, content=uploads_mod.job_dict(job))
 
     # ------------------------------------------------------------------ data
     @app.get("/api/site")

@@ -46,18 +46,72 @@ def ingest(config: Config) -> int:
     return total
 
 
+def _assert_decodable(video: str) -> None:
+    """Confirm a video exists, opens, and yields at least one decodable frame —
+    raised BEFORE any destructive purge so a corrupt/non-video replacement can't
+    destroy the stream it was meant to replace (a single stream has no archive,
+    unlike a whole-day delete)."""
+    if not Path(video).exists():
+        raise FileNotFoundError(video)
+    cap = cv2.VideoCapture(video)
+    try:
+        readable = bool(cap.isOpened() and cap.grab() and cap.retrieve()[0])
+    finally:
+        cap.release()
+    if not readable:
+        raise RuntimeError(f"unreadable or empty video (refusing to replace): {video}")
+
+
+def ingest_one_camera(config: Config, dataset_id: str, cam) -> int:
+    """Ingest ONE camera's video into an EXISTING dataset without disturbing the
+    others — unlike `ingest`, which purges the whole dataset and rmtrees its whole
+    artifact subtree. Used to add or replace a single camera stream (e.g. swap a
+    failed camera for a healthy re-upload).
+
+    Idempotent for that one camera: its prior rows + on-disk frames/overlays are
+    dropped first, then re-indexed, so re-adding replaces rather than duplicates.
+    The dataset's day/label and every OTHER camera are left untouched. Returns
+    frames indexed.
+    """
+    # Validate the replacement decodes BEFORE touching the existing stream: a
+    # corrupt upload must fail loudly with the old data still intact, not wipe it.
+    _assert_decodable(cam.video)
+    con = db.connect(config.paths.db_path)
+    try:
+        db.init_db(con)
+        # Keep the dataset's existing day/label (coalesce None); just ensure the row
+        # exists and mark it back to 'ingested' until the new stream re-localizes.
+        db.upsert_dataset(con, dataset_id, status="ingested")
+        # Replace just this camera: drop its rows and its artifact subdirs.
+        db.purge_dataset(con, dataset_id, camera_id=cam.id)
+        ds_art = Path(config.paths.artifacts_dir) / dataset_id
+        for sub in ("frames", "overlays", "pose_overlays"):
+            shutil.rmtree(ds_art / sub / cam.id, ignore_errors=True)
+        frames = index_video(cam, config.ingest, config.paths.artifacts_dir, dataset_id)
+        db.insert_frames(con, frames)
+    finally:
+        con.close()
+    print(f"[ingest_one] {cam.id}: {len(frames)} frames into {dataset_id!r}")
+    return len(frames)
+
+
 def segment(config: Config, limit: int | None = None,
-            on_progress: Callable[[int, int], None] | None = None) -> int:
+            on_progress: Callable[[int, int], None] | None = None,
+            dataset_id: str | None = None, camera_id: str | None = None) -> int:
     """Run the segmenter on unprocessed frames; write detections + overlays.
 
     Region assignment happens later in `localize`. `on_progress(done, total)` is
     called after each frame (if given) so a caller — e.g. the upload worker — can
-    drive a progress bar through this, the batch's long pole.
+    drive a progress bar through this, the batch's long pole. `dataset_id` /
+    `camera_id` scope which unprocessed frames are picked up: unset (the batch
+    default) processes every pending frame; set (the add-one-camera flow) processes
+    only that camera's new frames, so a stray unprocessed frame elsewhere isn't
+    swept in.
     """
     con = db.connect(config.paths.db_path)
     db.init_db(con)
 
-    pending = db.unprocessed_frames(con)
+    pending = db.unprocessed_frames(con, camera_id=camera_id, dataset_id=dataset_id)
     if limit:
         pending = pending.head(limit)
     if pending.empty:

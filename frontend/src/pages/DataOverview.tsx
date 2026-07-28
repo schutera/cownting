@@ -95,6 +95,7 @@ export default function DataOverview() {
                 active={dataset === d.dataset_id}
                 canManage={canManage}
                 onClick={() => pick(d.dataset_id)}
+                onManage={() => navigate(`/data/${d.dataset_id}/cameras`)}
                 onDelete={() => setPendingDelete(d)}
               />
             ))}
@@ -231,12 +232,14 @@ function DayCard({
   active,
   canManage,
   onClick,
+  onManage,
   onDelete,
 }: {
   row: DatasetRow;
   active: boolean;
   canManage: boolean;
   onClick: () => void;
+  onManage: () => void;
   onDelete: () => void;
 }) {
   const title = row.label ?? row.day ?? row.dataset_id;
@@ -253,7 +256,7 @@ function DayCard({
           (active ? "border-accent" : "border-border hover:border-accent")
         }
       >
-        <div className={"min-w-0 " + (canManage ? "pr-16" : "")}>
+        <div className={"min-w-0 " + (canManage ? "pr-24" : "")}>
           <div className="font-display text-2xl text-near-black leading-none truncate">{title}</div>
           <div className="mt-2 flex items-center gap-2">
             {row.day && row.label ? (
@@ -280,12 +283,23 @@ function DayCard({
         </div>
       </button>
 
-      {/* Corner controls: per-day CSV download + archive. Siblings of the pick
-          button (not nested), so clicking either does not activate the day. Only
-          powerusers/admins can download or delete data, so view-only users get a
-          clean card with no corner affordances. */}
+      {/* Corner controls: manage cameras + per-day CSV download + archive.
+          Siblings of the pick button (not nested), so clicking any of them does
+          not activate the day. Only powerusers/admins can manage/download/delete
+          data, so view-only users get a clean card with no corner affordances. */}
       {canManage ? (
         <div className="absolute top-3.5 right-3.5 flex items-center gap-0.5">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onManage();
+            }}
+            aria-label={`manage cameras for ${title}`}
+            title="Manage cameras for this day"
+            className="w-7 h-7 grid place-items-center rounded-full text-[13px] text-gray-tertiary opacity-70 hover:opacity-100 hover:bg-accent-soft hover:text-accent-deep transition-all duration-150"
+          >
+            ⚙
+          </button>
           <a
             href={exportCsvUrl(row.dataset_id)}
             download

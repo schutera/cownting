@@ -13,6 +13,7 @@ import type {
   Crosstab,
   FeatureInfo,
   LocalizeStatus,
+  CameraHealth,
   User,
   Role,
 } from "./types";
@@ -196,6 +197,76 @@ export async function deleteDataset(id: string, confirm: string): Promise<void> 
     }
     throw new Error(detail);
   }
+}
+
+// ---------------------------------------------------- per-camera management
+// Per-camera data-quality verdict for one day (brightness, span, detections, and
+// any 'dark'/'truncated'/'no_detections' issues). The id rides in the path; the
+// ?dataset that j() appends is harmless — the endpoint reads the path id.
+export function getCameraHealth(dataset: string): Promise<CameraHealth[]> {
+  return j<CameraHealth[]>(`/api/dataset/${encodeURIComponent(dataset)}/camera-health`);
+}
+
+// Permanently drop ONE camera's stream from a day (frames, detections, images,
+// areas) — every other camera is untouched — and re-localize what remains. Not
+// routed through j() because it's path-scoped; both segments are encoded.
+export async function deleteCameraStream(
+  dataset: string,
+  camera: string,
+): Promise<{
+  ok: boolean;
+  dataset_id: string;
+  camera: string;
+  frames_removed: number;
+  detections_removed: number;
+  localize: LocalizeStatus;
+}> {
+  const res = await fetch(
+    `/api/dataset/${encodeURIComponent(dataset)}/camera/${encodeURIComponent(camera)}`,
+    { method: "DELETE", credentials: "include" },
+  );
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+// Add (or replace) ONE camera stream in an existing day, then auto-process just
+// that stream (ingest -> segment -> re-localize) server-side. `form` carries a
+// `video` file + `camera` name (no `start` — the backend reads the recording time
+// from the video). Returns the queued job (202) to poll with getUploadJob. Like
+// uploadVideos, a plain fetch (no j()) so it isn't scoped by the ?dataset param.
+export async function addCameraStream(dataset: string, form: FormData): Promise<UploadJob> {
+  const res = await fetch(`/api/dataset/${encodeURIComponent(dataset)}/camera`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    let code: string | undefined;
+    try {
+      const body = await res.json();
+      if (body?.detail && typeof body.detail === "object") {
+        detail = body.detail.message || detail;
+        code = body.detail.code;
+      } else if (body?.detail) {
+        detail = body.detail;
+      }
+    } catch {
+      /* non-JSON error body */
+    }
+    if (code === "capture_day_required") throw new CaptureDayRequiredError(detail);
+    throw new Error(detail);
+  }
+  return res.json() as Promise<UploadJob>;
 }
 
 export function getSite(): Promise<Site> {

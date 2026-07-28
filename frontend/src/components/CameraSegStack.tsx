@@ -11,6 +11,22 @@ interface CamState {
   error: string | null;
 }
 
+// Honest placeholder for a tile with no image to show. Without this, a camera
+// that simply has no footage at the selected slider instant (shownIdx null while
+// a `frame` instant is picked — e.g. camera_02 after it stopped early) would read
+// "loading…" forever. Order matters: a real fetch error wins; then "no frame at
+// this instant"; then a not-yet-loaded state; else the camera has no frames at all.
+function placeholderText(
+  cs: CamState | undefined,
+  frame: number | null | undefined,
+  shownIdx: number | undefined,
+): string {
+  if (cs?.error) return "no frames";
+  if (frame != null && shownIdx == null) return "no frame now";
+  if (cs === undefined) return "loading…";
+  return "no frames";
+}
+
 /**
  * Left panel: one segmentation overlay per camera. Each tile has a colour bar
  * (matching its heatmap dots) that toggles the camera in/out of the heatmap;
@@ -122,7 +138,7 @@ export default function CameraSegStack({
                   />
                 ) : (
                   <div className="aspect-video grid place-items-center bg-surface-sunk text-[11px] font-mono text-gray-tertiary">
-                    {cs?.error ? "no frames" : "loading…"}
+                    {placeholderText(cs, frame, shownIdx)}
                   </div>
                 )}
                 {/* gear — opens the count-area editor for this camera */}

@@ -10,6 +10,7 @@ import type { ReactNode } from "react";
 import Dashboard from "./pages/Dashboard";
 import CountArea from "./pages/CountArea";
 import DataOverview from "./pages/DataOverview";
+import CameraManage from "./pages/CameraManage";
 import Admin from "./pages/Admin";
 import { TimelineProvider, useTimeline } from "./lib/timeline";
 import { DatasetProvider, useDataset } from "./lib/dataset";
@@ -145,6 +146,7 @@ function AppInner() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/data" element={<DataOverview />} />
+          <Route path="/data/:dataset/cameras" element={<CameraManage />} />
           <Route path="/count-area/:dataset/:camera" element={<CountArea />} />
           <Route
             path="/admin"

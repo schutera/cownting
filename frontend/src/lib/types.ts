@@ -43,6 +43,25 @@ export interface UploadJob {
   stage:"queued"|"ingesting"|"segmenting"|"localizing"|"done";
   progress:number; message:string; error:string|null;
   frames:number; detections:number; created_at:number;
+  // Advisory per-camera quality warnings, present on completed jobs (e.g.
+  // ["camera_02 (obscured (dark), no cows detected)"]). Never blocks the job.
+  warnings?:string[];
+}
+// The three per-camera issue codes quality.camera_health can flag on a camera.
+export type CameraIssue = "dark" | "truncated" | "no_detections";
+// Per-camera data-quality verdict for one day (quality.camera_health). ADVISORY:
+// `ok` is true when `issues` is empty; a flagged camera is obscured ('dark'),
+// stopped early ('truncated'), or produced nothing ('no_detections').
+export interface CameraHealth {
+  camera_id:string;
+  n_frames:number;
+  first_ts:string|null;
+  last_ts:string|null;
+  span_seconds:number;
+  n_detections:number;
+  brightness_p90:number|null;
+  issues:CameraIssue[];
+  ok:boolean;
 }
 export interface CountRow { t:string; frames:number; detections:number; cows_per_frame:number|null; }
 export type PostureRow = { t:string } & Record<string, number|string>;
