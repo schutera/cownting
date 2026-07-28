@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
+import { useAuth, canManageData } from "../lib/auth";
 import type { FrameRow } from "../lib/types";
 import { getFrames, frameImg } from "../lib/api";
 import { CogIcon, Panel, SectionLabel } from "./ui";
@@ -59,6 +60,8 @@ export default function CameraSegStack({
   const [state, setState] = useState<Record<string, CamState>>({});
   const navigate = useNavigate();
   const { dataset } = useDataset();
+  const { user } = useAuth();
+  const canManage = canManageData(user);
 
   const shownIdxFor = (cam: string): number | undefined =>
     frame != null ? frameMap?.[cam] : state[cam]?.frame?.frame_idx;
@@ -177,6 +180,18 @@ export default function CameraSegStack({
           );
         })}
       </div>
+
+      {/* Card-level camera management (add / replace / delete a whole stream) — the
+          per-tile gear edits count areas; this goes to the day's camera manager. */}
+      {dataset && canManage ? (
+        <button
+          onClick={() => navigate(`/data/${dataset}/cameras`)}
+          className="mt-4 pt-3 border-t border-border w-full text-left font-mono text-[11px] uppercase tracking-[0.14em] text-gray-tertiary hover:text-accent transition-colors"
+          title="Add, replace, or delete camera streams for this day"
+        >
+          Manage cameras →
+        </button>
+      ) : null}
     </Panel>
   );
 }

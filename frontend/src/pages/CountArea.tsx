@@ -371,20 +371,9 @@ export default function CountArea() {
     <div className="animate-fade-slide-in">
       <div className="mb-6 flex items-start justify-between gap-4">
         <div>
-          <div className="flex items-center gap-4">
-            <Link to="/" className="font-mono text-[11px] text-gray-tertiary hover:text-accent">
-              ← Dashboard
-            </Link>
-            {routeDataset ? (
-              <Link
-                to={`/data/${routeDataset}/cameras`}
-                className="font-mono text-[11px] text-gray-tertiary hover:text-accent"
-                title="Add, replace, or delete a camera stream for this day"
-              >
-                Manage cameras →
-              </Link>
-            ) : null}
-          </div>
+          <Link to="/" className="font-mono text-[11px] text-gray-tertiary hover:text-accent">
+            ← Dashboard
+          </Link>
           <h1 className="font-sans text-2xl text-near-black mt-2">
             {isPanel ? "Panel areas" : "Count areas"} ·{" "}
             <span className="text-accent">{camera}</span>
@@ -468,34 +457,34 @@ export default function CountArea() {
         <ImportAreas currentDataset={routeDataset} mode={mode} onImport={importAreas} />
       </div>
 
-      {/* Frame picker: slide to choose which camera frame is the drawing backdrop. */}
-      {ref && frames.length ? (
-        <div className="mb-5 flex items-center gap-3 flex-wrap text-[12px]">
-          <SectionLabel>Drawing on</SectionLabel>
-          <input
-            type="range"
-            min={0}
-            max={frames.length - 1}
-            value={sliderPos}
-            onChange={(e) => {
-              const f = frames[Number(e.target.value)];
-              if (f) setFrameIdx(f.frame_idx);
-            }}
-            className="w-64 max-w-[50vw] accent-accent cursor-pointer"
-            aria-label="drawing frame"
-          />
-          <span className="font-mono text-near-black tabular-nums whitespace-nowrap">
-            {frameLabel}
-          </span>
-          <span className="text-gray-tertiary">just a backdrop — it doesn’t change your areas</span>
-        </div>
-      ) : null}
-
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* LEFT — camera reference frame: edits camera_polygon (does the counting). */}
         <Card className="p-4">
           {ref ? (
             <>
+              {/* Frame picker sits here (not spanning both cards) because it only
+                  changes THIS camera backdrop — never the orthophoto. */}
+              {frames.length ? (
+                <div className="mb-3 flex items-center gap-2.5 flex-wrap text-[12px]">
+                  <span className="text-gray-tertiary shrink-0">Frame</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={frames.length - 1}
+                    value={sliderPos}
+                    onChange={(e) => {
+                      const f = frames[Number(e.target.value)];
+                      if (f) setFrameIdx(f.frame_idx);
+                    }}
+                    className="flex-1 min-w-[8rem] accent-accent cursor-pointer"
+                    aria-label="drawing frame"
+                    title="Pick which frame to draw on — a backdrop only; it doesn’t move your areas"
+                  />
+                  <span className="font-mono text-near-black tabular-nums whitespace-nowrap shrink-0">
+                    {frameLabel}
+                  </span>
+                </div>
+              ) : null}
               <ImageClicker
                 title={
                   activeArea
