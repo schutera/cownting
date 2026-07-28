@@ -1,11 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
-import type { Areas, CountArea as Area, LocalizeStatus, Site } from "../lib/types";
+import { useTimeline } from "../lib/timeline";
+import type { Areas, CountArea as Area, DatasetRow, FrameRow, LocalizeStatus, Site } from "../lib/types";
 import {
+  frameImg,
   getAreas,
+  getAreasFor,
+  getDatasets,
+  getFrameMap,
+  getFrames,
   getLocalizeStatus,
   getPanelAreas,
+  getPanelAreasFor,
   getSite,
   orthoImg,
   refImg,
@@ -15,6 +22,12 @@ import {
 import { ImageClicker } from "../components/ImageClicker";
 import { Button, Card, SectionLabel, Working } from "../components/ui";
 import { SHELTER_COLOR } from "../lib/palette";
+
+// HH:MM straight off a frame's ISO ts (no timezone shift), for the frame picker.
+function hhmm(iso: string | null | undefined): string {
+  const m = iso?.match(/T(\d{2}:\d{2})/);
+  return m ? m[1] : "";
+}
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 type Mode = "count" | "panel";
@@ -41,8 +54,17 @@ type LocalizePhase = "idle" | "working" | "done" | "failed";
 export default function CountArea() {
   const { dataset: routeDataset = "", camera = "" } = useParams();
   const { dataset: currentDataset, setDataset } = useDataset();
+  // The dashboard's currently-selected instant (a timestamp bucket), carried in
+  // via the app-wide TimelineProvider — so the editor can open on the exact frame
+  // the user was looking at on the dashboard.
+  const { frame: dashInstant } = useTimeline();
 
   const [site, setSite] = useState<Site | null>(null);
+  // Which camera frame is used as the drawing backdrop. `frameIdx` null = the
+  // mid-day reference frame; a number = that specific frame (raw image). Polygons
+  // are in fixed camera-pixel space, so the backdrop never moves existing points.
+  const [frames, setFrames] = useState<FrameRow[]>([]);
+  const [frameIdx, setFrameIdx] = useState<number | null>(null);
   // Two independent per-camera polygon sets: count areas (tally cows) and panel
   // areas (a cow inside one is 'under a panel'). `mode` picks which is edited.
   const [countMap, setCountMap] = useState<Areas>({});
@@ -100,6 +122,39 @@ export default function CountArea() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera, routeDataset, currentDataset]);
 
+  // Frame picker: load this camera's frame list, and default the drawing backdrop
+  // to the frame at the dashboard's selected instant (so the editor opens on what
+  // the user was just looking at). Falls back to the reference frame when the
+  // camera has no footage at that instant, or nothing was selected. Runs once per
+  // camera/day; the dashboard scrubber isn't shown here so `dashInstant` is stable.
+  useEffect(() => {
+    if (!routeDataset || currentDataset !== routeDataset || !camera) return;
+    let alive = true;
+    getFrames(camera)
+      .then((fr) => {
+        if (!alive) return;
+        setFrames(fr);
+      })
+      .catch(() => {
+        if (alive) setFrames([]);
+      });
+    if (dashInstant != null) {
+      getFrameMap(dashInstant)
+        .then((fm) => {
+          if (alive) setFrameIdx(fm[camera] ?? null);
+        })
+        .catch(() => {
+          if (alive) setFrameIdx(null);
+        });
+    } else {
+      setFrameIdx(null);
+    }
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [camera, routeDataset, currentDataset]);
+
   const activeMap = isPanel ? panelMap : countMap;
   const setActiveMap = isPanel ? setPanelMap : setCountMap;
 
@@ -144,6 +199,55 @@ export default function CountArea() {
   }
   function setOrthoPoly(poly: number[][]) {
     mutateActive({ ortho_polygon: poly });
+  }
+
+  // Fine-adjust: move / delete a single vertex of the active area's polygons.
+  const moveCamPoint = (i: number, pt: [number, number]) =>
+    setCamPoly(camPoly.map((p, idx) => (idx === i ? pt : p)));
+  const deleteCamPoint = (i: number) => setCamPoly(camPoly.filter((_, idx) => idx !== i));
+  const moveOrthoPoint = (i: number, pt: [number, number]) =>
+    setOrthoPoly(orthoPoly.map((p, idx) => (idx === i ? pt : p)));
+  const deleteOrthoPoint = (i: number) => setOrthoPoly(orthoPoly.filter((_, idx) => idx !== i));
+
+  // Frame picker: the backdrop image for the LEFT (camera) canvas.
+  const frameSrc = frameIdx != null ? frameImg(camera, frameIdx, "raw") : refImg(camera);
+  const framePos = frameIdx != null ? frames.findIndex((f) => f.frame_idx === frameIdx) : -1;
+  const frameLabel =
+    frameIdx != null && framePos >= 0
+      ? `${hhmm(frames[framePos]?.ts)} · ${framePos + 1}/${frames.length}`
+      : "reference (midday)";
+
+  function stepFrame(dir: 1 | -1) {
+    if (!frames.length) return;
+    const from = framePos >= 0 ? framePos : Math.floor(frames.length / 2);
+    const next = Math.min(frames.length - 1, Math.max(0, from + dir));
+    const f = frames[next];
+    if (f) setFrameIdx(f.frame_idx);
+  }
+
+  // Import: append another day/camera's areas into this camera's list (deep-copied,
+  // re-named/-ided to stay unique) so they can be tweaked with the point handles
+  // rather than redrawn. Coordinates carry over as-is — a moved camera just needs
+  // the corners nudged.
+  function importAreas(src: Area[]) {
+    if (!src.length) return;
+    const base = areas.length;
+    setAreas((prev) => {
+      const out = [...prev];
+      for (const a of src) {
+        const name = defaultName(out, a.name || camera);
+        const id = uniqueSlug(name, out);
+        out.push({
+          id,
+          name,
+          camera_polygon: a.camera_polygon.map((p) => [...p]),
+          ortho_polygon: a.ortho_polygon.map((p) => [...p]),
+        });
+      }
+      return out;
+    });
+    setActive(base); // focus the first imported area
+    setSaveState("idle");
   }
 
   function addArea() {
@@ -355,7 +459,45 @@ export default function CountArea() {
         <Button variant="ghost" onClick={addArea}>
           + Add {isPanel ? "panel" : "area"}
         </Button>
+        <ImportAreas currentDataset={routeDataset} mode={mode} onImport={importAreas} />
       </div>
+
+      {/* Frame picker: which camera frame is the drawing backdrop (left canvas). */}
+      {ref && frames.length ? (
+        <div className="mb-5 flex items-center gap-3 flex-wrap text-[12px]">
+          <SectionLabel>Drawing on</SectionLabel>
+          <div className="inline-flex items-center gap-1">
+            <button
+              onClick={() => stepFrame(-1)}
+              className="w-7 h-7 grid place-items-center border border-border rounded hover:border-accent text-gray-mid hover:text-accent"
+              title="Previous frame"
+            >
+              ‹
+            </button>
+            <span className="font-mono text-near-black tabular-nums text-center px-2 min-w-[8.5rem]">
+              {frameLabel}
+            </span>
+            <button
+              onClick={() => stepFrame(1)}
+              className="w-7 h-7 grid place-items-center border border-border rounded hover:border-accent text-gray-mid hover:text-accent"
+              title="Next frame"
+            >
+              ›
+            </button>
+          </div>
+          {frameIdx != null ? (
+            <button
+              onClick={() => setFrameIdx(null)}
+              className="font-mono text-[11px] text-gray-tertiary hover:text-accent underline decoration-dotted"
+            >
+              use reference
+            </button>
+          ) : null}
+          <span className="text-gray-tertiary">
+            just a backdrop — it doesn’t change your areas
+          </span>
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* LEFT — camera reference frame: edits camera_polygon (does the counting). */}
@@ -368,7 +510,7 @@ export default function CountArea() {
                     ? `Camera frame — ${activeArea.name} (${isPanel ? "under panel" : "counts here"})`
                     : `Camera frame — add ${isPanel ? "a panel area" : "an area"} to begin`
                 }
-                src={refImg(camera)}
+                src={frameSrc}
                 naturalWidth={ref.width}
                 naturalHeight={ref.height}
                 mode="polyline"
@@ -377,6 +519,8 @@ export default function CountArea() {
                 lines={camGuides}
                 interactive={activeIdx >= 0}
                 onPlace={(pt) => setCamPoly([...camPoly, pt])}
+                onMovePoint={moveCamPoint}
+                onDeletePoint={deleteCamPoint}
               />
               <PolyControls
                 label={activeArea ? `${activeArea.name} · camera` : "camera"}
@@ -411,6 +555,8 @@ export default function CountArea() {
                 lines={orthoGuides}
                 interactive={activeIdx >= 0}
                 onPlace={(pt) => setOrthoPoly([...orthoPoly, pt])}
+                onMovePoint={moveOrthoPoint}
+                onDeletePoint={deleteOrthoPoint}
               />
               <PolyControls
                 label={activeArea ? `${activeArea.name} · map` : "map"}
@@ -523,6 +669,128 @@ function PolyControls({
           {poly.length > 0 && !ready ? " — need ≥3" : ready ? " ✓" : ""}
         </span>
       </SectionLabel>
+    </div>
+  );
+}
+
+/**
+ * Import another day/camera's areas into the current camera — so a repeat site
+ * doesn't have to be redrawn every upload. Pick a day, then a camera on that day;
+ * its shapes are appended to the current list (coordinates carry over as-is, to be
+ * nudged into place with the point handles). Reads the source day's areas directly
+ * (getAreasFor / getPanelAreasFor), independent of the currently-selected day.
+ */
+function ImportAreas({
+  currentDataset,
+  mode,
+  onImport,
+}: {
+  currentDataset: string;
+  mode: Mode;
+  onImport: (src: Area[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [days, setDays] = useState<DatasetRow[]>([]);
+  const [ds, setDs] = useState("");
+  const [srcAreas, setSrcAreas] = useState<Areas | null>(null);
+  const [cam, setCam] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  function toggle() {
+    const next = !open;
+    setOpen(next);
+    if (next && days.length === 0) {
+      getDatasets()
+        .then((rows) => setDays(rows.filter((r) => r.dataset_id !== currentDataset)))
+        .catch((e) => setErr(String(e)));
+    }
+  }
+
+  async function pickDay(id: string) {
+    setDs(id);
+    setSrcAreas(null);
+    setCam("");
+    setErr(null);
+    if (!id) return;
+    setBusy(true);
+    try {
+      setSrcAreas(await (mode === "count" ? getAreasFor : getPanelAreasFor)(id));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const cams = srcAreas ? Object.keys(srcAreas).filter((c) => (srcAreas[c]?.length ?? 0) > 0) : [];
+  const picked = srcAreas && cam ? srcAreas[cam] ?? [] : [];
+
+  function doImport() {
+    onImport(picked);
+    setOpen(false);
+    setDs("");
+    setSrcAreas(null);
+    setCam("");
+  }
+
+  if (!open) {
+    return (
+      <Button variant="ghost" onClick={toggle}>
+        Import areas…
+      </Button>
+    );
+  }
+
+  return (
+    <div className="w-full mt-2 border border-border rounded-xl p-3.5 flex flex-col gap-3 bg-surface">
+      <div className="flex items-center justify-between">
+        <SectionLabel>Import {mode} areas from another day</SectionLabel>
+        <button onClick={toggle} className="text-gray-tertiary hover:text-near-black text-sm" aria-label="close import">
+          ✕
+        </button>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 text-[13px]">
+        <select
+          value={ds}
+          onChange={(e) => pickDay(e.target.value)}
+          className="bg-surface-sunk border border-border rounded-lg px-2.5 py-1.5 text-[13px] outline-none focus:border-accent"
+        >
+          <option value="">Choose a day…</option>
+          {days.map((d) => (
+            <option key={d.dataset_id} value={d.dataset_id}>
+              {d.label ?? d.day?.slice(0, 10) ?? d.dataset_id}
+            </option>
+          ))}
+        </select>
+        {busy ? <span className="text-gray-tertiary">Loading…</span> : null}
+        {srcAreas && cams.length ? (
+          <select
+            value={cam}
+            onChange={(e) => setCam(e.target.value)}
+            className="bg-surface-sunk border border-border rounded-lg px-2.5 py-1.5 text-[13px] outline-none focus:border-accent"
+          >
+            <option value="">Choose a camera…</option>
+            {cams.map((c) => (
+              <option key={c} value={c}>
+                {c} ({srcAreas[c]?.length ?? 0})
+              </option>
+            ))}
+          </select>
+        ) : null}
+        {cam && picked.length ? (
+          <Button onClick={doImport}>
+            Import {picked.length} area{picked.length === 1 ? "" : "s"}
+          </Button>
+        ) : null}
+      </div>
+      {srcAreas && cams.length === 0 ? (
+        <span className="text-[12px] text-gray-tertiary">That day has no {mode} areas to import.</span>
+      ) : null}
+      {err ? <span className="text-[12px] text-[#e76f51]">{err}</span> : null}
+      <span className="text-[11px] text-gray-tertiary">
+        Imported shapes are added to this camera — drag the corners to fit, then Save.
+      </span>
     </div>
   );
 }

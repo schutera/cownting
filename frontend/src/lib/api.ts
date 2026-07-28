@@ -348,6 +348,25 @@ export function getPanelAreas(): Promise<Areas> {
   return j<Areas>("/api/panel-areas");
 }
 
+// Areas for an EXPLICIT dataset (a different day than the selected one) — used to
+// import a camera's shapes from another day so they don't have to be redrawn. A
+// plain fetch, NOT j(), so the current-day ?dataset param isn't also appended.
+export async function getAreasFor(dataset: string): Promise<Areas> {
+  const res = await fetch(`/api/areas?dataset=${encodeURIComponent(dataset)}`, {
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json() as Promise<Areas>;
+}
+
+export async function getPanelAreasFor(dataset: string): Promise<Areas> {
+  const res = await fetch(`/api/panel-areas?dataset=${encodeURIComponent(dataset)}`, {
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json() as Promise<Areas>;
+}
+
 export function savePanelAreas(areas: Areas): Promise<{ ok: boolean }> {
   return j<{ ok: boolean }>("/api/panel-areas", {
     method: "POST",

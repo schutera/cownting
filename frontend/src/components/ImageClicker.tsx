@@ -6,6 +6,7 @@ import { CHART_PRIMARY } from "../lib/palette";
 const MIN_SCALE = 1;
 const MAX_SCALE = 16;
 const DRAG_THRESHOLD = 4; // px of pointer travel before a press counts as a pan
+const VERTEX_HIT_PX = 12; // screen-px radius for grabbing an existing vertex
 
 function clamp(v: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, v));
@@ -27,6 +28,11 @@ function clamp(v: number, lo: number, hi: number) {
  *   line. Pass the finished lines via `lines` (each a list of natural-px pts)
  *   and the in-progress vertices via `points`; both are drawn as connected
  *   overlays with dots at each vertex.
+ *
+ * Fine adjustment (polyline mode): pass `onMovePoint` to drag an existing vertex
+ * of the current line, and `onDeletePoint` to double-click one away. Grabbing a
+ * vertex takes priority over placing/panning, so points can be nudged after the
+ * shape is roughed in (or after importing one from another day).
  */
 export function ImageClicker({
   src,
@@ -40,6 +46,8 @@ export function ImageClicker({
   mode = "point",
   lines,
   closed = false,
+  onMovePoint,
+  onDeletePoint,
 }: {
   src: string;
   naturalWidth: number;
@@ -52,6 +60,8 @@ export function ImageClicker({
   mode?: "point" | "polyline";
   lines?: number[][][]; // finished polylines (natural px), drawn behind `points`
   closed?: boolean; // polyline mode: draw the current `points` and every guide `line` as closed rings
+  onMovePoint?: (index: number, pt: [number, number]) => void; // polyline: drag a current-line vertex
+  onDeletePoint?: (index: number) => void; // polyline: double-click a current-line vertex to remove it
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -69,6 +79,9 @@ export function ImageClicker({
     moved: boolean;
   } | null>(null);
   const [dragging, setDragging] = useState(false);
+  // While set, a pointer press grabbed an existing current-line vertex, so moves
+  // reposition it (via onMovePoint) instead of panning, and the release doesn't place.
+  const vertexDrag = useRef<number | null>(null);
 
   // Reset the view whenever the image changes.
   useEffect(() => {
@@ -109,19 +122,54 @@ export function ImageClicker({
     return () => vp.removeEventListener("wheel", onWheel);
   }, []);
 
-  function place(clientX: number, clientY: number) {
-    if (!interactive || !onPlace) return;
+  // Map a screen point to natural (full-resolution) pixels, clamped to the image.
+  function toNatural(clientX: number, clientY: number): [number, number] | null {
     const img = imgRef.current;
-    if (!img) return;
+    if (!img) return null;
     const rect = img.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
+    if (rect.width === 0 || rect.height === 0) return null;
     const ratioX = clamp((clientX - rect.left) / rect.width, 0, 1);
     const ratioY = clamp((clientY - rect.top) / rect.height, 0, 1);
-    onPlace([ratioX * naturalWidth, ratioY * naturalHeight]);
+    return [ratioX * naturalWidth, ratioY * naturalHeight];
+  }
+
+  // Index of the current-line vertex under a screen point (within VERTEX_HIT_PX),
+  // or null. Only meaningful when vertex editing is wired (polyline + onMovePoint).
+  function hitVertex(clientX: number, clientY: number): number | null {
+    if (mode !== "polyline" || !interactive || !onMovePoint) return null;
+    const img = imgRef.current;
+    if (!img) return null;
+    const rect = img.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    let best: number | null = null;
+    let bestD = VERTEX_HIT_PX;
+    for (let i = 0; i < points.length; i++) {
+      const sx = rect.left + (points[i][0] / naturalWidth) * rect.width;
+      const sy = rect.top + (points[i][1] / naturalHeight) * rect.height;
+      const d = Math.hypot(clientX - sx, clientY - sy);
+      if (d <= bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  function place(clientX: number, clientY: number) {
+    if (!interactive || !onPlace) return;
+    const pt = toNatural(clientX, clientY);
+    if (pt) onPlace(pt);
   }
 
   function onPointerDown(e: RPointerEvent<HTMLDivElement>) {
     e.currentTarget.setPointerCapture(e.pointerId);
+    // Grabbing an existing vertex wins over placing/panning.
+    const vi = hitVertex(e.clientX, e.clientY);
+    if (vi !== null) {
+      vertexDrag.current = vi;
+      setDragging(true);
+      return;
+    }
     drag.current = {
       startX: e.clientX,
       startY: e.clientY,
@@ -132,6 +180,11 @@ export function ImageClicker({
   }
 
   function onPointerMove(e: RPointerEvent<HTMLDivElement>) {
+    if (vertexDrag.current !== null) {
+      const pt = toNatural(e.clientX, e.clientY);
+      if (pt && onMovePoint) onMovePoint(vertexDrag.current, pt);
+      return;
+    }
     const d = drag.current;
     if (!d) return;
     const dx = e.clientX - d.startX;
@@ -143,10 +196,24 @@ export function ImageClicker({
   }
 
   function onPointerUp(e: RPointerEvent<HTMLDivElement>) {
+    if (vertexDrag.current !== null) {
+      vertexDrag.current = null;
+      setDragging(false);
+      return; // a vertex drag never places a new point
+    }
     const d = drag.current;
     drag.current = null;
     setDragging(false);
     if (d && !d.moved) place(e.clientX, e.clientY);
+  }
+
+  function onDoubleClick(e: RPointerEvent<HTMLDivElement>) {
+    if (!onDeletePoint) return;
+    const vi = hitVertex(e.clientX, e.clientY);
+    if (vi !== null) {
+      e.preventDefault();
+      onDeletePoint(vi);
+    }
   }
 
   const { scale, tx, ty } = view;
@@ -162,7 +229,9 @@ export function ImageClicker({
             scroll to zoom · drag to pan
             {interactive
               ? mode === "polyline"
-                ? " · click to add vertices"
+                ? onMovePoint
+                  ? " · click to add · drag a point · double-click to remove"
+                  : " · click to add vertices"
                 : " · click to place"
               : ""}
           </span>
@@ -184,8 +253,10 @@ export function ImageClicker({
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onDoubleClick={onDoubleClick}
         onPointerCancel={() => {
           drag.current = null;
+          vertexDrag.current = null;
           setDragging(false);
         }}
       >

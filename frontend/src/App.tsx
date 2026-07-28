@@ -11,6 +11,7 @@ import Dashboard from "./pages/Dashboard";
 import CountArea from "./pages/CountArea";
 import DataOverview from "./pages/DataOverview";
 import CameraManage from "./pages/CameraManage";
+import Manual from "./pages/Manual";
 import Admin from "./pages/Admin";
 import { TimelineProvider, useTimeline } from "./lib/timeline";
 import { DatasetProvider, useDataset } from "./lib/dataset";
@@ -131,6 +132,9 @@ function AppInner() {
             <NavLink to="/data" className={navClass}>
               Data
             </NavLink>
+            <NavLink to="/manual" className={navClass}>
+              Manual
+            </NavLink>
             {isAdmin ? (
               <NavLink to="/admin" className={navClass}>
                 Users
@@ -147,6 +151,7 @@ function AppInner() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/data" element={<DataOverview />} />
           <Route path="/data/:dataset/cameras" element={<CameraManage />} />
+          <Route path="/manual" element={<Manual />} />
           <Route path="/count-area/:dataset/:camera" element={<CountArea />} />
           <Route
             path="/admin"
