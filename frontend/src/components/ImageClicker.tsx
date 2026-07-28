@@ -7,6 +7,7 @@ const MIN_SCALE = 1;
 const MAX_SCALE = 16;
 const DRAG_THRESHOLD = 4; // px of pointer travel before a press counts as a pan
 const VERTEX_HIT_PX = 12; // screen-px radius for grabbing an existing vertex
+const PREVIEW_COLOR = "#3b82f6"; // dashed overlay for a to-be-imported (not yet added) area
 
 function clamp(v: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, v));
@@ -46,6 +47,7 @@ export function ImageClicker({
   mode = "point",
   lines,
   closed = false,
+  preview,
   onMovePoint,
   onDeletePoint,
 }: {
@@ -60,6 +62,7 @@ export function ImageClicker({
   mode?: "point" | "polyline";
   lines?: number[][][]; // finished polylines (natural px), drawn behind `points`
   closed?: boolean; // polyline mode: draw the current `points` and every guide `line` as closed rings
+  preview?: number[][][]; // provisional polygons (e.g. an import preview), drawn dashed in a distinct colour
   onMovePoint?: (index: number, pt: [number, number]) => void; // polyline: drag a current-line vertex
   onDeletePoint?: (index: number) => void; // polyline: double-click a current-line vertex to remove it
 }) {
@@ -291,6 +294,24 @@ export function ImageClicker({
                       fill="none"
                       stroke={CHART_PRIMARY}
                       strokeWidth={2 * invScale}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ) : null,
+                )}
+                {/* Provisional (import) preview — dashed, distinct blue, drawn under
+                    the area currently being edited. */}
+                {(preview ?? []).map((pv, i) =>
+                  pv.length >= 2 ? (
+                    <polyline
+                      key={`pv-${i}`}
+                      points={(closed && pv.length >= 3 ? [...pv, pv[0]] : pv)
+                        .map((p) => `${p[0]},${p[1]}`)
+                        .join(" ")}
+                      fill={closed && pv.length >= 3 ? PREVIEW_COLOR : "none"}
+                      fillOpacity={0.1}
+                      stroke={PREVIEW_COLOR}
+                      strokeWidth={2 * invScale}
+                      strokeDasharray={`${5 * invScale} ${4 * invScale}`}
                       vectorEffect="non-scaling-stroke"
                     />
                   ) : null,

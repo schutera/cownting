@@ -123,9 +123,8 @@ export default function Manual() {
         </Steps>
         <Callout>
           Managing cameras — the health view, delete, and replace — is available to{" "}
-          <B>powerusers and admins</B> only. If you don’t see the <B>Manage cameras</B>{" "}
-          link or the gear, your account can view the dashboard but not change data —
-          ask an admin.
+          <B>powerusers and admins</B> only. If you don’t see the camera-manager gear,
+          your account can view the dashboard but not change data — ask an admin.
         </Callout>
       </Section>
 
@@ -147,10 +146,10 @@ export default function Manual() {
             corner. This opens the <B>count-area editor</B> for that camera.
           </li>
           <li>
-            <B>Pick a clear frame to draw on</B> using the frame stepper{" "}
-            <Stepper /> at the top. It opens on the moment you had selected on the
-            dashboard timeline; step to a frame where the ground is easy to see. The
-            frame is only a backdrop — it doesn’t change your areas.
+            <B>Pick a clear frame to draw on</B> with the <B>Frame</B> slider{" "}
+            <SliderPreview /> above the camera frame (left). It opens on the moment you
+            had selected on the dashboard timeline; slide to a frame where the ground is
+            easy to see. The frame is only a backdrop — it doesn’t change your areas.
           </li>
           <li>
             Click{" "}
@@ -184,9 +183,11 @@ export default function Manual() {
           <B>Reuse areas from another day or camera.</B> Instead of drawing from
           scratch, click{" "}
           <InlineBtn><Button variant="ghost" onClick={noop}>Import areas…</Button></InlineBtn>,
-          pick a source <B>day</B> and <B>camera</B>, and import its shapes. Then
-          fine-tune by dragging the corners — handy when a camera moved only a little
-          between days.
+          then pick a source <B>day</B> and <B>camera</B>. The chosen camera’s areas
+          appear on the canvases as a <B>dashed blue preview</B> before you commit — so
+          you can flip between cameras and see which one fits without importing and
+          undoing. Click <B>Import</B> to add them, then drag the corners to fine-tune.
+          Handy when a camera moved only a little between days.
         </Callout>
       </Section>
 
@@ -317,13 +318,21 @@ function CardGear() {
   );
 }
 
-/* The frame stepper (‹ … ›). Light inline representation, not a shared component. */
-function Stepper() {
+/* The frame picker slider (a real, non-interactive range so it matches the app). */
+function SliderPreview() {
   return (
-    <span className="inline-flex items-center gap-1 align-middle mx-0.5">
-      <span className="w-6 h-6 grid place-items-center border border-border rounded text-gray-mid text-[13px]">‹</span>
-      <span className="font-mono text-[11px] text-gray-mid px-1">12:00</span>
-      <span className="w-6 h-6 grid place-items-center border border-border rounded text-gray-mid text-[13px]">›</span>
+    <span className="inline-flex items-center gap-1.5 align-middle mx-0.5">
+      <input
+        type="range"
+        readOnly
+        value={45}
+        min={0}
+        max={100}
+        aria-hidden="true"
+        tabIndex={-1}
+        className="w-20 accent-accent pointer-events-none align-middle"
+      />
+      <span className="font-mono text-[11px] text-gray-mid">12:00</span>
     </span>
   );
 }

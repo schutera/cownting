@@ -65,6 +65,10 @@ export default function CountArea() {
   // are in fixed camera-pixel space, so the backdrop never moves existing points.
   const [frames, setFrames] = useState<FrameRow[]>([]);
   const [frameIdx, setFrameIdx] = useState<number | null>(null);
+  // A source camera's areas, overlaid (dashed) as a preview before import, so you
+  // can see which one fits the current view without committing. Driven by the
+  // import panel; cleared when it closes or the camera changes.
+  const [previewAreas, setPreviewAreas] = useState<Area[]>([]);
   // Two independent per-camera polygon sets: count areas (tally cows) and panel
   // areas (a cow inside one is 'under a panel'). `mode` picks which is edited.
   const [countMap, setCountMap] = useState<Areas>({});
@@ -190,6 +194,10 @@ export default function CountArea() {
     .filter((_, i) => i !== activeIdx)
     .map((a) => a.ortho_polygon)
     .filter((p) => p.length >= 3);
+
+  // Import preview overlays (dashed), one polygon per source area, per canvas.
+  const camPreview = previewAreas.map((a) => a.camera_polygon).filter((p) => p.length >= 3);
+  const orthoPreview = previewAreas.map((a) => a.ortho_polygon).filter((p) => p.length >= 3);
 
   function mutateActive(patch: Partial<Area>) {
     if (activeIdx < 0) return;
@@ -454,7 +462,13 @@ export default function CountArea() {
         <Button variant="ghost" onClick={addArea}>
           + Add {isPanel ? "panel" : "area"}
         </Button>
-        <ImportAreas currentDataset={routeDataset} mode={mode} onImport={importAreas} />
+        <ImportAreas
+          key={camera}
+          currentDataset={routeDataset}
+          mode={mode}
+          onImport={importAreas}
+          onPreview={setPreviewAreas}
+        />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -502,6 +516,7 @@ export default function CountArea() {
                 onPlace={(pt) => setCamPoly([...camPoly, pt])}
                 onMovePoint={moveCamPoint}
                 onDeletePoint={deleteCamPoint}
+                preview={camPreview}
               />
               <PolyControls
                 label={activeArea ? `${activeArea.name} · camera` : "camera"}
@@ -538,6 +553,7 @@ export default function CountArea() {
                 onPlace={(pt) => setOrthoPoly([...orthoPoly, pt])}
                 onMovePoint={moveOrthoPoint}
                 onDeletePoint={deleteOrthoPoint}
+                preview={orthoPreview}
               />
               <PolyControls
                 label={activeArea ? `${activeArea.name} · map` : "map"}
@@ -756,10 +772,12 @@ function ImportAreas({
   currentDataset,
   mode,
   onImport,
+  onPreview,
 }: {
   currentDataset: string;
   mode: Mode;
   onImport: (src: Area[]) => void;
+  onPreview: (areas: Area[]) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [days, setDays] = useState<DatasetRow[]>([]);
@@ -768,6 +786,14 @@ function ImportAreas({
   const [cam, setCam] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  // Overlay the chosen source camera's areas (dashed) on the canvases while the
+  // panel is open, and clear it when closed — so you can flip through cameras and
+  // see which one fits, without importing and undoing. Cleanup on unmount clears it.
+  useEffect(() => {
+    onPreview(open && srcAreas && cam ? srcAreas[cam] ?? [] : []);
+    return () => onPreview([]);
+  }, [open, cam, srcAreas, onPreview]);
 
   function toggle() {
     const next = !open;
@@ -854,7 +880,9 @@ function ImportAreas({
       ) : null}
       {err ? <span className="text-[12px] text-[#e76f51]">{err}</span> : null}
       <span className="text-[11px] text-gray-tertiary">
-        Imported shapes are added to this camera — drag the corners to fit, then Save.
+        The chosen camera’s areas preview on the canvases in{" "}
+        <span className="text-[#3b82f6] font-medium">dashed blue</span> — Import adds them
+        to this camera, then drag the corners to fit and Save.
       </span>
     </div>
   );
