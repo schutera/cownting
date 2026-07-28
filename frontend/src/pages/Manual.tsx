@@ -183,11 +183,11 @@ export default function Manual() {
           <B>Reuse areas from another day or camera.</B> Instead of drawing from
           scratch, click{" "}
           <InlineBtn><Button variant="ghost" onClick={noop}>Import areas…</Button></InlineBtn>,
-          then pick a source <B>day</B> and <B>camera</B>. The chosen camera’s areas
-          appear on the canvases as a <B>dashed blue preview</B> before you commit — so
-          you can flip between cameras and see which one fits without importing and
-          undoing. Click <B>Import</B> to add them, then drag the corners to fine-tune.
-          Handy when a camera moved only a little between days.
+          pick a source <B>day</B>, then step through its <B>cameras</B> with the{" "}
+          <B>‹ ›</B> arrows. Each camera’s areas appear on the canvases as a{" "}
+          <B>dashed blue preview</B> as you step — so you can see which one fits without
+          importing and undoing. Click <B>Import</B> to add them, then drag the corners
+          to fine-tune. Handy when a camera moved only a little between days.
         </Callout>
       </Section>
 

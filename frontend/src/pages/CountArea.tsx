@@ -813,7 +813,12 @@ function ImportAreas({
     if (!id) return;
     setBusy(true);
     try {
-      setSrcAreas(await (mode === "count" ? getAreasFor : getPanelAreasFor)(id));
+      const a = await (mode === "count" ? getAreasFor : getPanelAreasFor)(id);
+      setSrcAreas(a);
+      // Land on the first camera that has areas, so the preview shows at once and
+      // the user just steps from there.
+      const first = Object.keys(a).find((c) => (a[c]?.length ?? 0) > 0);
+      if (first) setCam(first);
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -823,6 +828,16 @@ function ImportAreas({
 
   const cams = srcAreas ? Object.keys(srcAreas).filter((c) => (srcAreas[c]?.length ?? 0) > 0) : [];
   const picked = srcAreas && cam ? srcAreas[cam] ?? [] : [];
+
+  // Step through the source cameras (wrap around), so each one's preview can be
+  // eyeballed in turn without a dropdown.
+  function stepCam(dir: 1 | -1) {
+    if (!cams.length) return;
+    const i = cams.indexOf(cam);
+    const from = i >= 0 ? i : 0;
+    const next = cams[(from + dir + cams.length) % cams.length];
+    if (next) setCam(next);
+  }
 
   function doImport() {
     onImport(picked);
@@ -861,13 +876,31 @@ function ImportAreas({
         />
         {busy ? <span className="text-gray-tertiary">Loading…</span> : null}
         {srcAreas && cams.length ? (
-          <Dropdown
-            value={cam}
-            onChange={setCam}
-            ariaLabel="source camera"
-            placeholder="Choose a camera…"
-            options={cams.map((c) => ({ value: c, label: `${c} (${srcAreas?.[c]?.length ?? 0})` }))}
-          />
+          <div className="inline-flex items-center gap-1.5" role="group" aria-label="source camera">
+            <button
+              type="button"
+              onClick={() => stepCam(-1)}
+              disabled={cams.length <= 1}
+              title="Previous camera"
+              aria-label="previous camera"
+              className="w-8 h-8 grid place-items-center border border-border rounded-full text-gray-mid hover:border-accent hover:text-accent transition-colors disabled:opacity-40 disabled:pointer-events-none"
+            >
+              ‹
+            </button>
+            <span className="font-mono text-[13px] text-near-black text-center min-w-[9rem]">
+              {cam ? `${cam} · ${srcAreas[cam]?.length ?? 0} area${(srcAreas[cam]?.length ?? 0) === 1 ? "" : "s"}` : "—"}
+            </span>
+            <button
+              type="button"
+              onClick={() => stepCam(1)}
+              disabled={cams.length <= 1}
+              title="Next camera"
+              aria-label="next camera"
+              className="w-8 h-8 grid place-items-center border border-border rounded-full text-gray-mid hover:border-accent hover:text-accent transition-colors disabled:opacity-40 disabled:pointer-events-none"
+            >
+              ›
+            </button>
+          </div>
         ) : null}
         {cam && picked.length ? (
           <Button onClick={doImport}>
