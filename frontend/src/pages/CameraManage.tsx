@@ -6,6 +6,7 @@ import {
   getCameraHealth,
   getDatasets,
   deleteCameraStream,
+  clipCameraStream,
   addCameraStream,
   getUploadJob,
   CaptureDayRequiredError,
@@ -170,8 +171,9 @@ export default function CameraManage() {
               key={cam.camera_id}
               dataset={dataset}
               cam={cam}
+              others={health.filter((h) => h.camera_id !== cam.camera_id)}
               canManage={canManage}
-              onDeleted={refreshHealth}
+              onChanged={refreshHealth}
             />
           ))}
         </section>
@@ -189,25 +191,48 @@ export default function CameraManage() {
 
 /**
  * One camera's row: id, frame count, recording window, detections, and a status —
- * a calm "Healthy" badge, or one warm chip per issue. The Delete control is a
- * two-step (Delete → Confirm) so a stream is never dropped on a single stray click.
+ * a calm "Healthy" badge, or one warm chip per issue. Two-step controls (a reveal
+ * then a Confirm) so a stream is never dropped or trimmed on a stray click:
+ *   • Clip — trim to a time window (default = the window the OTHER cameras share),
+ *     to line an over-long camera up with the rest.
+ *   • Delete — drop the whole stream.
  */
 function CameraCard({
   dataset,
   cam,
+  others,
   canManage,
-  onDeleted,
+  onChanged,
 }: {
   dataset: string;
   cam: CameraHealth;
+  others: CameraHealth[];
   canManage: boolean;
-  onDeleted: () => Promise<void>;
+  onChanged: () => Promise<void>;
 }) {
-  const [confirming, setConfirming] = useState(false);
+  const [mode, setMode] = useState<"idle" | "delete" | "clip">("idle");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const flagged = !cam.ok;
+  const dayStr = cam.first_ts?.slice(0, 10) ?? "";
+
+  // Default clip window = the span the OTHER cameras share (latest start → earliest
+  // end), so "clip to sync" trims this one to line up; fall back to this camera's
+  // own range when the others don't overlap.
+  const startList = others.map((o) => o.first_ts).filter((t): t is string => !!t).sort();
+  const endList = others.map((o) => o.last_ts).filter((t): t is string => !!t).sort();
+  const syncStart: string | null = startList.length ? startList[startList.length - 1] ?? null : null;
+  const syncEnd: string | null = endList.length ? endList[0] ?? null : null;
+  const useSync = !!(syncStart && syncEnd && syncStart < syncEnd);
+  const [clipStart, setClipStart] = useState(hhmm(useSync ? syncStart : cam.first_ts) ?? "");
+  const [clipEnd, setClipEnd] = useState(hhmm(useSync ? syncEnd : cam.last_ts) ?? "");
+  const clipValid = !!(clipStart && clipEnd && clipStart < clipEnd && dayStr);
+
+  function close() {
+    setMode("idle");
+    setErr(null);
+  }
 
   async function confirmDelete() {
     if (busy) return;
@@ -215,7 +240,24 @@ function CameraCard({
     setErr(null);
     try {
       await deleteCameraStream(dataset, cam.camera_id);
-      await onDeleted(); // re-reads the health list — this row drops out
+      await onChanged(); // re-reads the health list — this row drops out
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  async function confirmClip() {
+    if (busy || !clipValid) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await clipCameraStream(
+        dataset, cam.camera_id, `${dayStr}T${clipStart}:00`, `${dayStr}T${clipEnd}:59`,
+      );
+      await onChanged(); // reloads health — this card refreshes with the trimmed range
+      setMode("idle");
+      setBusy(false);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -261,7 +303,7 @@ function CameraCard({
 
       {canManage ? (
         <div className="mt-4 pt-3 border-t border-border">
-          {confirming ? (
+          {mode === "delete" ? (
             <div className="flex flex-col gap-2.5">
               <p className="text-[13px] text-gray-mid">
                 This <span className="text-near-black">permanently removes this camera stream</span> —
@@ -279,25 +321,66 @@ function CameraCard({
                 >
                   {busy ? "Removing…" : "Confirm delete"}
                 </button>
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    setConfirming(false);
-                    setErr(null);
-                  }}
+                <Button variant="ghost" onClick={close} disabled={busy}>Cancel</Button>
+              </div>
+            </div>
+          ) : mode === "clip" ? (
+            <div className="flex flex-col gap-2.5">
+              <p className="text-[13px] text-gray-mid">
+                Keep only frames recorded between these times — everything outside is{" "}
+                <span className="text-near-black">permanently removed</span>. Lines this camera up with
+                the others; the default is the window they share.
+              </p>
+              <div className="flex items-center gap-2 flex-wrap text-[13px]">
+                <span className="text-gray-tertiary">Keep</span>
+                <input
+                  type="time"
+                  value={clipStart}
                   disabled={busy}
+                  onChange={(e) => setClipStart(e.target.value)}
+                  aria-label="clip start time"
+                  className="bg-surface-sunk border border-border rounded-lg px-2.5 py-1.5 font-mono text-[13px] text-near-black outline-none focus:border-accent"
+                />
+                <span className="text-gray-tertiary">to</span>
+                <input
+                  type="time"
+                  value={clipEnd}
+                  disabled={busy}
+                  onChange={(e) => setClipEnd(e.target.value)}
+                  aria-label="clip end time"
+                  className="bg-surface-sunk border border-border rounded-lg px-2.5 py-1.5 font-mono text-[13px] text-near-black outline-none focus:border-accent"
+                />
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={confirmClip}
+                  disabled={busy || !clipValid}
+                  className={
+                    "bg-warn text-white text-sm font-medium px-4 py-2 rounded-full hover:opacity-90 active:scale-95 transition-all duration-150" +
+                    (busy || !clipValid ? " opacity-50 pointer-events-none" : "")
+                  }
                 >
-                  Cancel
-                </Button>
+                  {busy ? "Clipping…" : "Confirm clip"}
+                </button>
+                <Button variant="ghost" onClick={close} disabled={busy}>Cancel</Button>
               </div>
             </div>
           ) : (
-            <button
-              onClick={() => setConfirming(true)}
-              className="inline-flex items-center gap-1.5 text-[13px] text-warn border border-warn/40 rounded-full px-3.5 py-1.5 hover:bg-warn/10 transition-colors"
-            >
-              🗑 Delete this camera
-            </button>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={() => setMode("clip")}
+                title="Trim this camera to a time window so it lines up with the others — removes frames outside it"
+                className="inline-flex items-center gap-1.5 text-[13px] text-text border border-border rounded-full px-3.5 py-1.5 hover:border-accent hover:text-accent-deep transition-colors"
+              >
+                ✂ Clip this stream
+              </button>
+              <button
+                onClick={() => setMode("delete")}
+                className="inline-flex items-center gap-1.5 text-[13px] text-warn border border-warn/40 rounded-full px-3.5 py-1.5 hover:bg-warn/10 transition-colors"
+              >
+                🗑 Delete this camera
+              </button>
+            </div>
           )}
           {err ? (
             <p className="mt-3 text-sm text-accent-deep bg-accent-soft border border-accent/30 rounded-xl px-3.5 py-2.5">

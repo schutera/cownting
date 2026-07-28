@@ -116,6 +116,13 @@ export default function Manual() {
             every other camera is left untouched. This can’t be undone.
           </li>
           <li>
+            <B>Clip a stream to sync:</B> if a camera recorded a longer window than the
+            others (the dashboard <B>Coverage</B> panel shows this), click{" "}
+            <ClipChip /> on it, set the <B>keep</B> window — it defaults to the times
+            the other cameras share — and <B>Confirm clip</B>. Frames outside the window
+            are removed so the camera lines up with the rest. Permanent.
+          </li>
+          <li>
             <B>Add or replace:</B> under <B>Add or replace a camera</B>, drop a clip
             and give it a camera name — an <B>existing name replaces</B> that stream,
             a <B>new name adds</B> one. Click{" "}
@@ -362,6 +369,15 @@ function DeleteChip() {
   return (
     <span className="inline-flex items-center gap-1.5 text-[12px] text-warn border border-warn/40 rounded-full px-3 py-1 align-middle mx-0.5">
       🗑 Delete this camera
+    </span>
+  );
+}
+
+/* The clip-stream control as it appears in the camera manager. */
+function ClipChip() {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[12px] text-text border border-border rounded-full px-3 py-1 align-middle mx-0.5">
+      ✂ Clip this stream
     </span>
   );
 }

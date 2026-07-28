@@ -270,6 +270,37 @@ export async function addCameraStream(dataset: string, form: FormData): Promise<
   return res.json() as Promise<UploadJob>;
 }
 
+// Trim ONE camera's stream to a time window [start, end] (ISO timestamps),
+// permanently dropping frames + detections outside it, so an over-long camera
+// lines up with the others. Poweruser-gated; re-localizes the day server-side.
+export async function clipCameraStream(
+  dataset: string,
+  camera: string,
+  start: string,
+  end: string,
+): Promise<{ ok: boolean; dataset_id: string; camera: string; frames_removed: number; frames_kept: number }> {
+  const res = await fetch(
+    `/api/dataset/${encodeURIComponent(dataset)}/camera/${encodeURIComponent(camera)}/clip`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start, end }),
+    },
+  );
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
 export function getSite(): Promise<Site> {
   return j<Site>("/api/site");
 }

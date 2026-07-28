@@ -193,6 +193,30 @@ def purge_dataset(con, dataset_id: str, camera_id: str | None = None) -> None:
     con.execute(f"DELETE FROM frames WHERE {where}", params)
 
 
+def clip_camera(con, dataset_id: str, camera_id: str, start, end) -> dict:
+    """Trim one camera's stream to the time window [start, end] (inclusive) within a
+    dataset: delete its frames + detections OUTSIDE the window, keep the rest — so an
+    over-long camera can be lined up with the others. `start`/`end` are ISO timestamps
+    (anything DuckDB casts to TIMESTAMP). Returns removed / kept frame counts and the
+    on-disk image paths that were dropped; the caller unlinks them (db.py stays
+    filesystem-free). Detections first, then frames — same order as purge_dataset."""
+    outside = "dataset_id = ? AND camera_id = ? AND (ts < ? OR ts > ?)"
+    op = [dataset_id, camera_id, start, end]
+    paths = con.execute(
+        f"SELECT frame_path, overlay_path, pose_overlay_path FROM frames WHERE {outside}", op
+    ).df()
+    kept = con.execute(
+        "SELECT count(*) FROM frames WHERE dataset_id = ? AND camera_id = ? AND ts >= ? AND ts <= ?",
+        [dataset_id, camera_id, start, end],
+    ).fetchone()[0]
+    con.execute(f"DELETE FROM detections WHERE {outside}", op)
+    con.execute(f"DELETE FROM frames WHERE {outside}", op)
+    files: list[str] = []
+    for col in ("frame_path", "overlay_path", "pose_overlay_path"):
+        files += [p for p in paths[col].tolist() if p]
+    return {"removed": int(len(paths)), "kept": int(kept), "paths": files}
+
+
 def dataset_day(con, dataset_id: str):
     """The capture `day` (date) of a dataset, or None if the id is unknown or the
     day was never set. Used to derive the delete-confirmation date."""

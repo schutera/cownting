@@ -252,12 +252,53 @@ def test_segment_scoping_unprocessed_frames():
               set(both["camera_id"].tolist()) == {x, y}, str(set(both["camera_id"].tolist())))
 
 
+# --------------------------------------------------------------------------- 4: clip a stream to a time window
+def test_clip_camera_window():
+    ds = "2025-10-15"
+    x, keep = "camera_x", "camera_keep"
+    lo, hi = "2025-10-15T06:05:00", "2025-10-15T06:14:00"  # keep [06:05, 06:14] inclusive
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d)
+        con = db.connect(config.paths.db_path)
+        try:
+            db.init_db(con)
+            db.upsert_dataset(con, ds, date(2025, 10, 15), "Oct 15, 2025")
+            _seed_frames(con, ds, x, 20)     # 06:00..06:19 (one per minute)
+            _seed_dets(con, ds, x, 20)
+            _seed_frames(con, ds, keep, 8)   # control camera, must stay untouched
+            _seed_dets(con, ds, keep, 5)
+
+            res = db.clip_camera(con, ds, x, lo, hi)
+
+            x_frames = _count(con, "frames", ds, x)
+            x_dets = _count(con, "detections", ds, x)
+            keep_frames = _count(con, "frames", ds, keep)
+            keep_dets = _count(con, "detections", ds, keep)
+            outside = con.execute(
+                "SELECT count(*) FROM frames WHERE dataset_id=? AND camera_id=? AND (ts < ? OR ts > ?)",
+                [ds, x, lo, hi],
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+    check("clip kept the 10 frames inside the window", x_frames == 10, str(x_frames))
+    check("clip removed the 10 frames outside", res["removed"] == 10, str(res["removed"]))
+    check("clip reports kept == frames remaining", res["kept"] == 10 == x_frames, str(res["kept"]))
+    check("clip removed out-of-window detections too", x_dets == 10, str(x_dets))
+    check("clip returned an image path per removed frame", len(res["paths"]) == res["removed"],
+          f"paths={len(res['paths'])} removed={res['removed']}")
+    check("no frames remain outside the window", outside == 0, str(outside))
+    check("other camera frames untouched by clip", keep_frames == 8, str(keep_frames))
+    check("other camera detections untouched by clip", keep_dets == 5, str(keep_dets))
+
+
 # --------------------------------------------------------------------------- driver
 def main():
     print("=== test_camera_lifecycle ===")
     test_ingest_one_camera_add_and_replace()
     test_delete_one_camera_building_blocks()
     test_segment_scoping_unprocessed_frames()
+    test_clip_camera_window()
     print("=============================")
     if _FAILED:
         print(f"{_FAILED} check(s) FAILED")

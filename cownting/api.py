@@ -34,6 +34,12 @@ class AreasReq(BaseModel):
     areas: dict[str, list[dict]] = {}
 
 
+class ClipReq(BaseModel):
+    # Keep frames whose ts is in [start, end]; ISO 8601 timestamps.
+    start: str
+    end: str
+
+
 class LoginReq(BaseModel):
     username: str
     password: str
@@ -458,6 +464,56 @@ def create_app(config: Config) -> FastAPI:
         job = uploads_mod.start_add_camera_job(
             config, dataset_id, cam, str(dest), start_dt.isoformat(), f"add {cam}")
         return JSONResponse(status_code=202, content=uploads_mod.job_dict(job))
+
+    @app.post("/api/dataset/{dataset_id}/camera/{camera}/clip",
+              dependencies=[Depends(require_poweruser)])
+    def clip_camera(dataset_id: str, camera: str, req: ClipReq):
+        """Trim ONE camera's stream to the time window [start, end]: delete its frames,
+        detections, and images OUTSIDE the window, then re-localize. For lining an
+        over-long camera up with the others (see the dashboard coverage strip).
+        Permanent — the trimmed frames aren't archived. 400 on a bad name/dates,
+        404 if the dataset or camera isn't present."""
+        if not uploads_mod.valid_camera_id(camera):
+            raise HTTPException(400, f"invalid camera name {camera!r}")
+        if not _safe_path_id(dataset_id):
+            raise HTTPException(400, f"invalid dataset id {dataset_id!r}")
+        try:
+            start = datetime.fromisoformat(req.start)
+            end = datetime.fromisoformat(req.end)
+        except ValueError:
+            raise HTTPException(400, "start and end must be ISO 8601 timestamps")
+        if end <= start:
+            raise HTTPException(400, "end must be after start")
+        c = con()
+        try:
+            exists = c.execute(
+                "SELECT count(*) FROM datasets WHERE dataset_id = ?", [dataset_id]
+            ).fetchone()[0]
+            if not exists:
+                raise HTTPException(404, f"unknown dataset {dataset_id!r}")
+            has = c.execute(
+                "SELECT count(*) FROM frames WHERE dataset_id = ? AND camera_id = ?",
+                [dataset_id, camera],
+            ).fetchone()[0]
+            if not has:
+                raise HTTPException(404, f"camera {camera!r} not in dataset {dataset_id!r}")
+            result = db.clip_camera(c, dataset_id, camera, start.isoformat(), end.isoformat())
+        finally:
+            c.close()
+        # Unlink the trimmed images, confined under the artifacts dir (paths come from
+        # our own ingest, but confirm containment before any unlink).
+        art = Path(config.paths.artifacts_dir).resolve()
+        for p in result["paths"]:
+            try:
+                rp = Path(p).resolve()
+                if art == rp or art in rp.parents:
+                    rp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        status = localize_worker.request_localize(config, dataset_id)
+        return {"ok": True, "dataset_id": dataset_id, "camera": camera,
+                "frames_removed": result["removed"], "frames_kept": result["kept"],
+                "localize": status}
 
     # ------------------------------------------------------------------ data
     @app.get("/api/site")

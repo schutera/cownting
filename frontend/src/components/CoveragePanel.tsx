@@ -90,6 +90,7 @@ export default function CoveragePanel({ cameras }: { cameras: string[] }) {
 
       <p className="mt-3 text-[11px] text-gray-tertiary">
         Each bar marks the minutes a camera has frames; gaps mean no footage then.
+        Powerusers can trim an over-long stream to match from the camera manager (the ⚙ gear).
       </p>
     </Panel>
   );
