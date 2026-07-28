@@ -15,7 +15,7 @@ import Manual from "./pages/Manual";
 import Admin from "./pages/Admin";
 import { TimelineProvider, useTimeline } from "./lib/timeline";
 import { DatasetProvider, useDataset } from "./lib/dataset";
-import { AuthProvider, useAuth } from "./lib/auth";
+import { AuthProvider, useAuth, canManageData } from "./lib/auth";
 import { TimeScrubber } from "./components/TimeScrubber";
 import { Chip } from "./components/ui";
 
@@ -106,6 +106,14 @@ function AdminOnly({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+/** Route wrapper for data-management pages (e.g. the camera manager): powerusers
+ *  and admins only; plain viewers bounce home. */
+function PowerUserOnly({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  if (!user || !canManageData(user)) return <Navigate to="/" replace />;
+  return <>{children}</>;
+}
+
 function AppInner() {
   // Remount the timeline + routed content whenever the day changes, so the
   // scrubber and every dashboard fetch pick up the newly-selected dataset.
@@ -150,7 +158,14 @@ function AppInner() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/data" element={<DataOverview />} />
-          <Route path="/data/:dataset/cameras" element={<CameraManage />} />
+          <Route
+            path="/data/:dataset/cameras"
+            element={
+              <PowerUserOnly>
+                <CameraManage />
+              </PowerUserOnly>
+            }
+          />
           <Route path="/manual" element={<Manual />} />
           <Route path="/count-area/:dataset/:camera" element={<CountArea />} />
           <Route

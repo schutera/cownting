@@ -304,11 +304,14 @@ def create_app(config: Config) -> FastAPI:
         return {"ok": True, "dataset_id": dataset_id, "detections_archived": moved}
 
     # ------------------------------------------------------ per-camera management
-    @app.get("/api/dataset/{dataset_id}/camera-health")
+    @app.get("/api/dataset/{dataset_id}/camera-health",
+             dependencies=[Depends(require_poweruser)])
     def camera_health(dataset_id: str):
         """Per-camera data-quality verdict for one day: brightness, time span,
         detections, and any of 'dark' / 'truncated' / 'no_detections'. ADVISORY —
-        the frontend warns and offers delete/replace; nothing here mutates data."""
+        the frontend warns and offers delete/replace; nothing here mutates data.
+        Poweruser-gated: the whole camera manager (view + delete + replace) is a
+        data-management surface, so plain viewers can't reach it."""
         from .quality import camera_health as _camera_health
         return _camera_health(config, dataset_id)
 

@@ -30,8 +30,9 @@ export default function Manual() {
         </p>
         <nav className="mt-5 flex flex-wrap gap-x-5 gap-y-1.5 text-[13px]">
           <a href="#upload" className="text-accent hover:text-accent-deep">1 · Upload footage</a>
-          <a href="#count-areas" className="text-accent hover:text-accent-deep">2 · Count areas</a>
-          <a href="#panel-areas" className="text-accent hover:text-accent-deep">3 · Panel areas</a>
+          <a href="#manage-cameras" className="text-accent hover:text-accent-deep">2 · Manage cameras</a>
+          <a href="#count-areas" className="text-accent hover:text-accent-deep">3 · Count areas</a>
+          <a href="#panel-areas" className="text-accent hover:text-accent-deep">4 · Panel areas</a>
         </nav>
       </header>
 
@@ -76,17 +77,59 @@ export default function Manual() {
           </li>
         </Steps>
         <Callout>
-          <B>A camera looks broken?</B> On the <NavPill>Data</NavPill> page, click the{" "}
-          <CardGear /> on a day card to open its camera manager. Each camera shows a
-          health badge — e.g. <IssueChip>Obscured</IssueChip>,{" "}
-          <IssueChip>Stopped early</IssueChip>, or <IssueChip>No cows</IssueChip>. You
-          can <B>delete</B> one bad stream and <B>upload a replacement</B> into the
-          same day — the other cameras are left untouched.
+          <B>A camera looks broken?</B> If a camera came back unusable (a black or
+          empty image), you can drop that one stream and upload a replacement — see{" "}
+          <a href="#manage-cameras" className="text-accent hover:text-accent-deep">
+            Manage cameras
+          </a>{" "}
+          next.
         </Callout>
       </Section>
 
-      {/* 2 — COUNT AREAS ------------------------------------------------------- */}
-      <Section id="count-areas" n="2" title="Draw count areas">
+      {/* 2 — MANAGE CAMERAS ---------------------------------------------------- */}
+      <Section id="manage-cameras" n="2" title="Manage cameras">
+        <PowerNote />
+        <p>
+          Each day’s cameras can be checked and fixed one at a time. If a camera came
+          back unusable — an obscured lens (black frames), a clip that stopped early,
+          or a view with no cows — drop that one stream and upload a healthy
+          replacement, without touching the other cameras or re-doing the whole day.
+        </p>
+        <Steps>
+          <li>
+            Open the camera manager: on the <NavPill>Dashboard</NavPill>, in the{" "}
+            <B>Cameras</B> panel, click <B>Manage cameras →</B> — or on the{" "}
+            <NavPill>Data</NavPill> page, click the <CardGear /> gear on a day card.
+          </li>
+          <li>
+            Each camera is listed with a health badge:{" "}
+            <IssueChip>Obscured</IssueChip> (too dark),{" "}
+            <IssueChip>Stopped early</IssueChip>, or <IssueChip>No cows</IssueChip> —
+            or a calm <B>Healthy</B> when it’s fine.
+          </li>
+          <li>
+            <B>Delete a bad stream:</B> click <DeleteChip /> on that camera, then{" "}
+            <B>Confirm delete</B>. Its frames, detections, and areas are removed and
+            every other camera is left untouched. This can’t be undone.
+          </li>
+          <li>
+            <B>Add or replace:</B> under <B>Add or replace a camera</B>, drop a clip
+            and give it a camera name — an <B>existing name replaces</B> that stream,
+            a <B>new name adds</B> one. Click{" "}
+            <InlineBtn><Button onClick={noop}>Upload camera</Button></InlineBtn> and
+            watch the progress; the day updates when it finishes.
+          </li>
+        </Steps>
+        <Callout>
+          Managing cameras — the health view, delete, and replace — is available to{" "}
+          <B>powerusers and admins</B> only. If you don’t see the <B>Manage cameras</B>{" "}
+          link or the gear, your account can view the dashboard but not change data —
+          ask an admin.
+        </Callout>
+      </Section>
+
+      {/* 3 — COUNT AREAS ------------------------------------------------------- */}
+      <Section id="count-areas" n="3" title="Draw count areas">
         <p>
           A <B>count area</B> is a named region you draw on a camera’s view. Any cow
           standing inside it is tallied to that area. You draw it twice: once on the{" "}
@@ -146,8 +189,8 @@ export default function Manual() {
         </Callout>
       </Section>
 
-      {/* 3 — PANEL AREAS ------------------------------------------------------- */}
-      <Section id="panel-areas" n="3" title="Draw panel (shelter) areas">
+      {/* 4 — PANEL AREAS ------------------------------------------------------- */}
+      <Section id="panel-areas" n="4" title="Draw panel (shelter) areas">
         <p>
           A <B>panel area</B> marks the shade under a solar panel. A cow whose feet
           fall inside one counts as <B>sheltering</B> (under a panel). It’s drawn
@@ -289,6 +332,24 @@ function IssueChip({ children }: { children: ReactNode }) {
   return (
     <span className="text-[12px] px-2.5 py-1 rounded-full bg-warn/10 border border-warn/40 text-warn align-middle mx-0.5">
       {children}
+    </span>
+  );
+}
+
+/* "Powerusers & admins" note — a section is gated to data-managers. */
+function PowerNote() {
+  return (
+    <span className="inline-flex items-center gap-1.5 w-fit text-[11px] px-2.5 py-1 rounded-full bg-accent-soft text-accent-deep border border-accent/20">
+      🔒 Powerusers &amp; admins
+    </span>
+  );
+}
+
+/* The delete-camera control as it appears in the camera manager. */
+function DeleteChip() {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[12px] text-warn border border-warn/40 rounded-full px-3 py-1 align-middle mx-0.5">
+      🗑 Delete this camera
     </span>
   );
 }
