@@ -294,9 +294,9 @@ function CameraCard({
           ) : (
             <button
               onClick={() => setConfirming(true)}
-              className="text-[13px] text-warn hover:text-near-black transition-colors"
+              className="inline-flex items-center gap-1.5 text-[13px] text-warn border border-warn/40 rounded-full px-3.5 py-1.5 hover:bg-warn/10 transition-colors"
             >
-              Delete this camera…
+              🗑 Delete this camera
             </button>
           )}
           {err ? (

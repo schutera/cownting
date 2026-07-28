@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
 import { useTimeline } from "../lib/timeline";
@@ -372,9 +371,20 @@ export default function CountArea() {
     <div className="animate-fade-slide-in">
       <div className="mb-6 flex items-start justify-between gap-4">
         <div>
-          <Link to="/" className="font-mono text-[11px] text-gray-tertiary hover:text-accent">
-            ← Dashboard
-          </Link>
+          <div className="flex items-center gap-4">
+            <Link to="/" className="font-mono text-[11px] text-gray-tertiary hover:text-accent">
+              ← Dashboard
+            </Link>
+            {routeDataset ? (
+              <Link
+                to={`/data/${routeDataset}/cameras`}
+                className="font-mono text-[11px] text-gray-tertiary hover:text-accent"
+                title="Add, replace, or delete a camera stream for this day"
+              >
+                Manage cameras →
+              </Link>
+            ) : null}
+          </div>
           <h1 className="font-sans text-2xl text-near-black mt-2">
             {isPanel ? "Panel areas" : "Count areas"} ·{" "}
             <span className="text-accent">{camera}</span>
@@ -657,42 +667,91 @@ function PolyControls({
 }
 
 /**
- * A native <select> that looks like the rest of the app's controls: the browser's
- * default chrome (and its ugly built-in arrow) is stripped with appearance-none and
- * replaced by our own chevron, over the same rounded-full / bordered / accent-hover
- * pill the ghost <Button> uses — so the day/camera pickers sit flush with it.
+ * A fully styled dropdown (custom listbox): a pill button that opens OUR OWN option
+ * list. A native <select> can't style its opened option list (that menu is drawn by
+ * the OS), so the day/camera pickers use this instead — matching the app's look both
+ * closed and open. Closes on outside-click or after a choice.
  */
-function PillSelect({
+function Dropdown({
   value,
   onChange,
+  options,
+  placeholder,
   ariaLabel,
-  children,
 }: {
   value: string;
-  onChange: (e: ChangeEvent<HTMLSelectElement>) => void;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  placeholder: string;
   ariaLabel: string;
-  children: ReactNode;
 }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  const selected = options.find((o) => o.value === value);
   return (
-    <div className="relative inline-flex">
-      <select
-        value={value}
-        onChange={onChange}
+    <div ref={ref} className="relative inline-block">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
         aria-label={ariaLabel}
-        className="appearance-none text-sm text-text bg-surface border border-border rounded-full pl-4 pr-9 py-2.5 leading-tight hover:border-accent transition-colors duration-150 outline-none focus:border-accent cursor-pointer"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        className={
+          "inline-flex items-center gap-2 text-sm border rounded-full pl-4 pr-3 py-2.5 bg-surface " +
+          "transition-colors duration-150 outline-none cursor-pointer hover:border-accent " +
+          (open ? "border-accent " : "border-border ") +
+          (selected ? "text-text" : "text-gray-tertiary")
+        }
       >
-        {children}
-      </select>
-      <svg
-        className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-tertiary"
-        viewBox="0 0 20 20"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2.25"
-        aria-hidden="true"
-      >
-        <path d="M5 7.5L10 12.5L15 7.5" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
+        <span className="truncate max-w-[12rem]">{selected ? selected.label : placeholder}</span>
+        <svg
+          className="w-3 h-3 text-gray-tertiary shrink-0"
+          viewBox="0 0 20 20"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.25"
+          aria-hidden="true"
+        >
+          <path d="M5 7.5L10 12.5L15 7.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open ? (
+        <div
+          role="listbox"
+          className="absolute left-0 z-30 mt-1.5 min-w-full max-h-64 overflow-auto rounded-2xl border border-border bg-surface shadow-[0_10px_28px_-10px_rgba(43,42,38,0.25)] py-1"
+        >
+          {options.length === 0 ? (
+            <div className="px-4 py-2 text-[13px] text-gray-tertiary whitespace-nowrap">No options</div>
+          ) : (
+            options.map((o) => (
+              <button
+                key={o.value}
+                type="button"
+                role="option"
+                aria-selected={o.value === value}
+                onClick={() => {
+                  onChange(o.value);
+                  setOpen(false);
+                }}
+                className={
+                  "w-full text-left px-4 py-2 text-sm whitespace-nowrap transition-colors hover:bg-accent-soft/60 " +
+                  (o.value === value ? "text-accent-deep bg-accent-soft/40" : "text-text")
+                }
+              >
+                {o.label}
+              </button>
+            ))
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -775,24 +834,25 @@ function ImportAreas({
         </button>
       </div>
       <div className="flex flex-wrap items-center gap-2.5 text-[13px]">
-        <PillSelect value={ds} onChange={(e) => pickDay(e.target.value)} ariaLabel="source day">
-          <option value="">Choose a day…</option>
-          {days.map((d) => (
-            <option key={d.dataset_id} value={d.dataset_id}>
-              {d.label ?? d.day?.slice(0, 10) ?? d.dataset_id}
-            </option>
-          ))}
-        </PillSelect>
+        <Dropdown
+          value={ds}
+          onChange={pickDay}
+          ariaLabel="source day"
+          placeholder="Choose a day…"
+          options={days.map((d) => ({
+            value: d.dataset_id,
+            label: d.label ?? d.day?.slice(0, 10) ?? d.dataset_id,
+          }))}
+        />
         {busy ? <span className="text-gray-tertiary">Loading…</span> : null}
         {srcAreas && cams.length ? (
-          <PillSelect value={cam} onChange={(e) => setCam(e.target.value)} ariaLabel="source camera">
-            <option value="">Choose a camera…</option>
-            {cams.map((c) => (
-              <option key={c} value={c}>
-                {c} ({srcAreas[c]?.length ?? 0})
-              </option>
-            ))}
-          </PillSelect>
+          <Dropdown
+            value={cam}
+            onChange={setCam}
+            ariaLabel="source camera"
+            placeholder="Choose a camera…"
+            options={cams.map((c) => ({ value: c, label: `${c} (${srcAreas?.[c]?.length ?? 0})` }))}
+          />
         ) : null}
         {cam && picked.length ? (
           <Button onClick={doImport}>
