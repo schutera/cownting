@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
 import type { FrameRow } from "../lib/types";
 import { getFrames, frameImg } from "../lib/api";
-import { Panel, SectionLabel } from "./ui";
+import { CogIcon, Panel, SectionLabel } from "./ui";
 import { cameraColor } from "../lib/palette";
 
 interface CamState {
@@ -160,19 +160,7 @@ export default function CameraSegStack({
                   title={`Edit count areas for ${cam}`}
                   className="absolute top-2 right-2 grid place-items-center w-7 h-7 rounded-lg bg-black/45 text-white opacity-0 group-hover:opacity-100 hover:bg-black/70 transition-opacity duration-150 cursor-pointer"
                 >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    className="w-4 h-4"
-                    aria-hidden="true"
-                  >
-                    <circle cx="12" cy="12" r="3" />
-                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                  </svg>
+                  <CogIcon className="w-4 h-4" />
                 </span>
                 <div className="absolute inset-x-0 bottom-0 flex items-center gap-1.5 px-2.5 py-1.5 bg-gradient-to-t from-black/55 to-transparent">
                   <span className="w-2 h-2 rounded-full" style={{ background: color }} />

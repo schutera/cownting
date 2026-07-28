@@ -615,8 +615,9 @@ export default function CountArea() {
   );
 }
 
-/** Segmented toggle: edit count areas (tally cows) vs panel areas (shelter). */
-function ModeToggle({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
+/** Segmented toggle: edit count areas (tally cows) vs panel areas (shelter).
+ *  Exported so the manual can render the real control (code-as-documentation). */
+export function ModeToggle({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
   return (
     <div className="inline-flex border border-border rounded overflow-hidden shrink-0">
       <button
@@ -734,6 +735,13 @@ function ImportAreas({
     setCam("");
   }
 
+  // Match the ghost <Button> pill (rounded-full, bordered, accent hover) so the
+  // day/camera pickers read as the same control family as every other button.
+  const selectClass =
+    "text-sm text-text bg-surface border border-border rounded-full px-4 py-2.5 " +
+    "hover:border-accent hover:text-accent-deep transition-colors duration-150 " +
+    "outline-none focus:border-accent cursor-pointer";
+
   if (!open) {
     return (
       <Button variant="ghost" onClick={toggle}>
@@ -754,7 +762,7 @@ function ImportAreas({
         <select
           value={ds}
           onChange={(e) => pickDay(e.target.value)}
-          className="bg-surface-sunk border border-border rounded-lg px-2.5 py-1.5 text-[13px] outline-none focus:border-accent"
+          className={selectClass}
         >
           <option value="">Choose a day…</option>
           {days.map((d) => (
@@ -768,7 +776,7 @@ function ImportAreas({
           <select
             value={cam}
             onChange={(e) => setCam(e.target.value)}
-            className="bg-surface-sunk border border-border rounded-lg px-2.5 py-1.5 text-[13px] outline-none focus:border-accent"
+            className={selectClass}
           >
             <option value="">Choose a camera…</option>
             {cams.map((c) => (
