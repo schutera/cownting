@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { ChangeEvent, ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
 import { useTimeline } from "../lib/timeline";
@@ -134,21 +135,24 @@ export default function CountArea() {
       .then((fr) => {
         if (!alive) return;
         setFrames(fr);
+        const mid = fr[Math.floor(fr.length / 2)]?.frame_idx ?? null;
+        // Default the backdrop to the dashboard's selected instant, else the middle
+        // frame — always a real frame so the slider has a position to sit at.
+        if (dashInstant != null) {
+          getFrameMap(dashInstant)
+            .then((fm) => {
+              if (alive) setFrameIdx(fm[camera] ?? mid);
+            })
+            .catch(() => {
+              if (alive) setFrameIdx(mid);
+            });
+        } else {
+          setFrameIdx(mid);
+        }
       })
       .catch(() => {
         if (alive) setFrames([]);
       });
-    if (dashInstant != null) {
-      getFrameMap(dashInstant)
-        .then((fm) => {
-          if (alive) setFrameIdx(fm[camera] ?? null);
-        })
-        .catch(() => {
-          if (alive) setFrameIdx(null);
-        });
-    } else {
-      setFrameIdx(null);
-    }
     return () => {
       alive = false;
     };
@@ -209,21 +213,13 @@ export default function CountArea() {
     setOrthoPoly(orthoPoly.map((p, idx) => (idx === i ? pt : p)));
   const deleteOrthoPoint = (i: number) => setOrthoPoly(orthoPoly.filter((_, idx) => idx !== i));
 
-  // Frame picker: the backdrop image for the LEFT (camera) canvas.
+  // Frame picker: the backdrop image for the LEFT (camera) canvas, chosen by a
+  // slider over this camera's frames.
   const frameSrc = frameIdx != null ? frameImg(camera, frameIdx, "raw") : refImg(camera);
   const framePos = frameIdx != null ? frames.findIndex((f) => f.frame_idx === frameIdx) : -1;
+  const sliderPos = framePos >= 0 ? framePos : Math.floor(frames.length / 2);
   const frameLabel =
-    frameIdx != null && framePos >= 0
-      ? `${hhmm(frames[framePos]?.ts)} · ${framePos + 1}/${frames.length}`
-      : "reference (midday)";
-
-  function stepFrame(dir: 1 | -1) {
-    if (!frames.length) return;
-    const from = framePos >= 0 ? framePos : Math.floor(frames.length / 2);
-    const next = Math.min(frames.length - 1, Math.max(0, from + dir));
-    const f = frames[next];
-    if (f) setFrameIdx(f.frame_idx);
-  }
+    framePos >= 0 ? `${hhmm(frames[framePos]?.ts)} · ${framePos + 1}/${frames.length}` : "";
 
   // Import: append another day/camera's areas into this camera's list (deep-copied,
   // re-named/-ided to stay unique) so they can be tweaked with the point handles
@@ -462,40 +458,26 @@ export default function CountArea() {
         <ImportAreas currentDataset={routeDataset} mode={mode} onImport={importAreas} />
       </div>
 
-      {/* Frame picker: which camera frame is the drawing backdrop (left canvas). */}
+      {/* Frame picker: slide to choose which camera frame is the drawing backdrop. */}
       {ref && frames.length ? (
         <div className="mb-5 flex items-center gap-3 flex-wrap text-[12px]">
           <SectionLabel>Drawing on</SectionLabel>
-          <div className="inline-flex items-center gap-1">
-            <button
-              onClick={() => stepFrame(-1)}
-              className="w-7 h-7 grid place-items-center border border-border rounded hover:border-accent text-gray-mid hover:text-accent"
-              title="Previous frame"
-            >
-              ‹
-            </button>
-            <span className="font-mono text-near-black tabular-nums text-center px-2 min-w-[8.5rem]">
-              {frameLabel}
-            </span>
-            <button
-              onClick={() => stepFrame(1)}
-              className="w-7 h-7 grid place-items-center border border-border rounded hover:border-accent text-gray-mid hover:text-accent"
-              title="Next frame"
-            >
-              ›
-            </button>
-          </div>
-          {frameIdx != null ? (
-            <button
-              onClick={() => setFrameIdx(null)}
-              className="font-mono text-[11px] text-gray-tertiary hover:text-accent underline decoration-dotted"
-            >
-              use reference
-            </button>
-          ) : null}
-          <span className="text-gray-tertiary">
-            just a backdrop — it doesn’t change your areas
+          <input
+            type="range"
+            min={0}
+            max={frames.length - 1}
+            value={sliderPos}
+            onChange={(e) => {
+              const f = frames[Number(e.target.value)];
+              if (f) setFrameIdx(f.frame_idx);
+            }}
+            className="w-64 max-w-[50vw] accent-accent cursor-pointer"
+            aria-label="drawing frame"
+          />
+          <span className="font-mono text-near-black tabular-nums whitespace-nowrap">
+            {frameLabel}
           </span>
+          <span className="text-gray-tertiary">just a backdrop — it doesn’t change your areas</span>
         </div>
       ) : null}
 
@@ -675,6 +657,47 @@ function PolyControls({
 }
 
 /**
+ * A native <select> that looks like the rest of the app's controls: the browser's
+ * default chrome (and its ugly built-in arrow) is stripped with appearance-none and
+ * replaced by our own chevron, over the same rounded-full / bordered / accent-hover
+ * pill the ghost <Button> uses — so the day/camera pickers sit flush with it.
+ */
+function PillSelect({
+  value,
+  onChange,
+  ariaLabel,
+  children,
+}: {
+  value: string;
+  onChange: (e: ChangeEvent<HTMLSelectElement>) => void;
+  ariaLabel: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="relative inline-flex">
+      <select
+        value={value}
+        onChange={onChange}
+        aria-label={ariaLabel}
+        className="appearance-none text-sm text-text bg-surface border border-border rounded-full pl-4 pr-9 py-2.5 leading-tight hover:border-accent transition-colors duration-150 outline-none focus:border-accent cursor-pointer"
+      >
+        {children}
+      </select>
+      <svg
+        className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-tertiary"
+        viewBox="0 0 20 20"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.25"
+        aria-hidden="true"
+      >
+        <path d="M5 7.5L10 12.5L15 7.5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </div>
+  );
+}
+
+/**
  * Import another day/camera's areas into the current camera — so a repeat site
  * doesn't have to be redrawn every upload. Pick a day, then a camera on that day;
  * its shapes are appended to the current list (coordinates carry over as-is, to be
@@ -735,13 +758,6 @@ function ImportAreas({
     setCam("");
   }
 
-  // Match the ghost <Button> pill (rounded-full, bordered, accent hover) so the
-  // day/camera pickers read as the same control family as every other button.
-  const selectClass =
-    "text-sm text-text bg-surface border border-border rounded-full px-4 py-2.5 " +
-    "hover:border-accent hover:text-accent-deep transition-colors duration-150 " +
-    "outline-none focus:border-accent cursor-pointer";
-
   if (!open) {
     return (
       <Button variant="ghost" onClick={toggle}>
@@ -758,33 +774,25 @@ function ImportAreas({
           ✕
         </button>
       </div>
-      <div className="flex flex-wrap items-center gap-2 text-[13px]">
-        <select
-          value={ds}
-          onChange={(e) => pickDay(e.target.value)}
-          className={selectClass}
-        >
+      <div className="flex flex-wrap items-center gap-2.5 text-[13px]">
+        <PillSelect value={ds} onChange={(e) => pickDay(e.target.value)} ariaLabel="source day">
           <option value="">Choose a day…</option>
           {days.map((d) => (
             <option key={d.dataset_id} value={d.dataset_id}>
               {d.label ?? d.day?.slice(0, 10) ?? d.dataset_id}
             </option>
           ))}
-        </select>
+        </PillSelect>
         {busy ? <span className="text-gray-tertiary">Loading…</span> : null}
         {srcAreas && cams.length ? (
-          <select
-            value={cam}
-            onChange={(e) => setCam(e.target.value)}
-            className={selectClass}
-          >
+          <PillSelect value={cam} onChange={(e) => setCam(e.target.value)} ariaLabel="source camera">
             <option value="">Choose a camera…</option>
             {cams.map((c) => (
               <option key={c} value={c}>
                 {c} ({srcAreas[c]?.length ?? 0})
               </option>
             ))}
-          </select>
+          </PillSelect>
         ) : null}
         {cam && picked.length ? (
           <Button onClick={doImport}>
