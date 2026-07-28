@@ -301,6 +301,29 @@ export async function clipCameraStream(
   return res.json();
 }
 
+// Undo a clip: restore ONE camera's staged (clipped-out) frames + detections back
+// to its full pre-clip extent. Poweruser-gated; re-localizes the day server-side.
+export async function restoreCameraStream(
+  dataset: string,
+  camera: string,
+): Promise<{ ok: boolean; dataset_id: string; camera: string; frames_restored: number }> {
+  const res = await fetch(
+    `/api/dataset/${encodeURIComponent(dataset)}/camera/${encodeURIComponent(camera)}/restore`,
+    { method: "POST", credentials: "include" },
+  );
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
 export function getSite(): Promise<Site> {
   return j<Site>("/api/site");
 }

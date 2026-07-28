@@ -303,6 +303,11 @@ def create_app(config: Config) -> FastAPI:
             c.close()
             raise HTTPException(400, "confirmation does not match the day's date (ddmmyy)")
         moved = db.archive_dataset(c, dataset_id, config.paths.archive_db_path)
+        # Drop any reversible-clip staging for the day too (it isn't part of the
+        # archive move), so a deleted day leaves nothing behind.
+        for t in ("clipped_detections", "clipped_frames"):
+            if db._table_exists(c, t):
+                c.execute(f"DELETE FROM {t} WHERE dataset_id = ?", [dataset_id])
         c.close()
         # The day's per-dataset area files live under data/areas/<id>/ (a sibling of
         # artifacts/); drop them too so a re-upload of this id starts area-clean.
@@ -317,9 +322,19 @@ def create_app(config: Config) -> FastAPI:
         detections, and any of 'dark' / 'truncated' / 'no_detections'. ADVISORY —
         the frontend warns and offers delete/replace; nothing here mutates data.
         Poweruser-gated: the whole camera manager (view + delete + replace) is a
-        data-management surface, so plain viewers can't reach it."""
+        data-management surface, so plain viewers can't reach it. Each camera also
+        carries `restorable` — staged frames from a prior clip that Undo can bring
+        back (0 when not clipped)."""
         from .quality import camera_health as _camera_health
-        return _camera_health(config, dataset_id)
+        health = _camera_health(config, dataset_id)
+        c = con()
+        try:
+            restorable = db.clipped_counts(c, dataset_id)
+        finally:
+            c.close()
+        for h in health:
+            h["restorable"] = restorable.get(h["camera_id"], 0)
+        return health
 
     @app.delete("/api/dataset/{dataset_id}/camera/{camera}",
                 dependencies=[Depends(require_poweruser)])
@@ -468,11 +483,12 @@ def create_app(config: Config) -> FastAPI:
     @app.post("/api/dataset/{dataset_id}/camera/{camera}/clip",
               dependencies=[Depends(require_poweruser)])
     def clip_camera(dataset_id: str, camera: str, req: ClipReq):
-        """Trim ONE camera's stream to the time window [start, end]: delete its frames,
-        detections, and images OUTSIDE the window, then re-localize. For lining an
-        over-long camera up with the others (see the dashboard coverage strip).
-        Permanent — the trimmed frames aren't archived. 400 on a bad name/dates,
-        404 if the dataset or camera isn't present."""
+        """Trim ONE camera's stream to the time window [start, end], then re-localize.
+        REVERSIBLE: the out-of-window frames + detections are moved to staging (the
+        images are kept), so it can be undone via .../camera/{camera}/restore. For
+        lining an over-long camera up with the others (see the dashboard coverage
+        strip). 400 on a bad name/dates or an empty window, 404 if the dataset or
+        camera isn't present."""
         if not uploads_mod.valid_camera_id(camera):
             raise HTTPException(400, f"invalid camera name {camera!r}")
         if not _safe_path_id(dataset_id):
@@ -491,29 +507,49 @@ def create_app(config: Config) -> FastAPI:
             ).fetchone()[0]
             if not exists:
                 raise HTTPException(404, f"unknown dataset {dataset_id!r}")
-            has = c.execute(
+            total = c.execute(
                 "SELECT count(*) FROM frames WHERE dataset_id = ? AND camera_id = ?",
                 [dataset_id, camera],
             ).fetchone()[0]
-            if not has:
+            if not total:
                 raise HTTPException(404, f"camera {camera!r} not in dataset {dataset_id!r}")
+            in_window = c.execute(
+                "SELECT count(*) FROM frames WHERE dataset_id = ? AND camera_id = ? "
+                "AND ts >= ? AND ts <= ?",
+                [dataset_id, camera, start.isoformat(), end.isoformat()],
+            ).fetchone()[0]
+            if in_window == 0:
+                raise HTTPException(400, "the window keeps no frames for this camera — widen it")
             result = db.clip_camera(c, dataset_id, camera, start.isoformat(), end.isoformat())
         finally:
             c.close()
-        # Unlink the trimmed images, confined under the artifacts dir (paths come from
-        # our own ingest, but confirm containment before any unlink).
-        art = Path(config.paths.artifacts_dir).resolve()
-        for p in result["paths"]:
-            try:
-                rp = Path(p).resolve()
-                if art == rp or art in rp.parents:
-                    rp.unlink(missing_ok=True)
-            except OSError:
-                pass
         status = localize_worker.request_localize(config, dataset_id)
         return {"ok": True, "dataset_id": dataset_id, "camera": camera,
                 "frames_removed": result["removed"], "frames_kept": result["kept"],
                 "localize": status}
+
+    @app.post("/api/dataset/{dataset_id}/camera/{camera}/restore",
+              dependencies=[Depends(require_poweruser)])
+    def restore_camera(dataset_id: str, camera: str):
+        """Undo clipping for ONE camera: move its staged (clipped-out) frames +
+        detections back into the live tables, restoring its full pre-clip extent, then
+        re-localize. A no-op (frames_restored 0) when nothing was clipped. 404 if the
+        dataset or camera isn't present."""
+        if not uploads_mod.valid_camera_id(camera):
+            raise HTTPException(400, f"invalid camera name {camera!r}")
+        c = con()
+        try:
+            exists = c.execute(
+                "SELECT count(*) FROM datasets WHERE dataset_id = ?", [dataset_id]
+            ).fetchone()[0]
+            if not exists:
+                raise HTTPException(404, f"unknown dataset {dataset_id!r}")
+            restored = db.restore_clip(c, dataset_id, camera)
+        finally:
+            c.close()
+        status = localize_worker.request_localize(config, dataset_id)
+        return {"ok": True, "dataset_id": dataset_id, "camera": camera,
+                "frames_restored": restored, "localize": status}
 
     # ------------------------------------------------------------------ data
     @app.get("/api/site")

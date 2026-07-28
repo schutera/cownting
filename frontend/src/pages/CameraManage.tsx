@@ -7,6 +7,7 @@ import {
   getDatasets,
   deleteCameraStream,
   clipCameraStream,
+  restoreCameraStream,
   addCameraStream,
   getUploadJob,
   CaptureDayRequiredError,
@@ -264,6 +265,22 @@ function CameraCard({
     }
   }
 
+  // Undo is the safe direction (it restores data), so it's a single click.
+  const restorable = cam.restorable ?? 0;
+  async function restore() {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await restoreCameraStream(dataset, cam.camera_id);
+      await onChanged(); // reloads health — the full range comes back
+      setBusy(false);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
   return (
     <div
       className={
@@ -367,6 +384,16 @@ function CameraCard({
             </div>
           ) : (
             <div className="flex items-center gap-2 flex-wrap">
+              {restorable > 0 ? (
+                <button
+                  onClick={restore}
+                  disabled={busy}
+                  title={`Undo clipping — restore ${restorable.toLocaleString()} frames removed by a previous clip`}
+                  className="inline-flex items-center gap-1.5 text-[13px] text-accent-deep border border-accent/40 rounded-full px-3.5 py-1.5 hover:bg-accent-soft transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                >
+                  ↩ Undo clip · {restorable.toLocaleString()}
+                </button>
+              ) : null}
               <button
                 onClick={() => setMode("clip")}
                 title="Trim this camera to a time window so it lines up with the others — removes frames outside it"

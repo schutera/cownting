@@ -123,6 +123,13 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS dataset_id VARCHAR")
     # Forward-compat: pose overlay for DBs created before the pose stage.
     con.execute("ALTER TABLE frames ADD COLUMN IF NOT EXISTS pose_overlay_path VARCHAR")
+    # Reversible-clip staging: when a camera is clipped to a time window, the
+    # out-of-window frames/detections are MOVED here (not deleted) so the clip can be
+    # undone. Same columns as the live tables — created AFTER the ALTERs above (CTAS
+    # copies the current schema), so they carry every column. The on-disk images stay
+    # in place while clipped, so a restore just re-inserts the rows.
+    con.execute("CREATE TABLE IF NOT EXISTS clipped_frames AS SELECT * FROM frames WHERE 1=0")
+    con.execute("CREATE TABLE IF NOT EXISTS clipped_detections AS SELECT * FROM detections WHERE 1=0")
 
 
 # --------------------------------------------------------------------------- writes
@@ -191,30 +198,70 @@ def purge_dataset(con, dataset_id: str, camera_id: str | None = None) -> None:
         params.append(camera_id)
     con.execute(f"DELETE FROM detections WHERE {where}", params)
     con.execute(f"DELETE FROM frames WHERE {where}", params)
+    # Drop any reversible-clip staging for the same scope, so deleting/re-ingesting a
+    # camera doesn't leave orphaned clipped rows behind.
+    for t in ("clipped_detections", "clipped_frames"):
+        if _table_exists(con, t):
+            con.execute(f"DELETE FROM {t} WHERE {where}", params)
 
 
 def clip_camera(con, dataset_id: str, camera_id: str, start, end) -> dict:
     """Trim one camera's stream to the time window [start, end] (inclusive) within a
-    dataset: delete its frames + detections OUTSIDE the window, keep the rest — so an
-    over-long camera can be lined up with the others. `start`/`end` are ISO timestamps
-    (anything DuckDB casts to TIMESTAMP). Returns removed / kept frame counts and the
-    on-disk image paths that were dropped; the caller unlinks them (db.py stays
-    filesystem-free). Detections first, then frames — same order as purge_dataset."""
+    dataset, REVERSIBLY: the frames + detections OUTSIDE the window are MOVED to the
+    clipped_* staging tables (not deleted), keeping the in-window rest — so an
+    over-long camera lines up with the others and the clip can be undone
+    (restore_clip). The on-disk images are left in place. `start`/`end` are ISO
+    timestamps (anything DuckDB casts to TIMESTAMP). Returns removed / kept frame
+    counts. Idempotent-friendly: re-clipping only ever moves the newly-out-of-window
+    rows, so repeated clips accumulate in staging without duplicating."""
+    fcols = ", ".join(FRAME_COLS)
+    dcols = ", ".join(DET_COLS)  # excludes the auto detection_id, so a restore re-mints it
     outside = "dataset_id = ? AND camera_id = ? AND (ts < ? OR ts > ?)"
     op = [dataset_id, camera_id, start, end]
-    paths = con.execute(
-        f"SELECT frame_path, overlay_path, pose_overlay_path FROM frames WHERE {outside}", op
-    ).df()
+    removed = con.execute(f"SELECT count(*) FROM frames WHERE {outside}", op).fetchone()[0]
     kept = con.execute(
         "SELECT count(*) FROM frames WHERE dataset_id = ? AND camera_id = ? AND ts >= ? AND ts <= ?",
         [dataset_id, camera_id, start, end],
     ).fetchone()[0]
+    # Stash the out-of-window rows, then drop them from the live tables.
+    con.execute(f"INSERT INTO clipped_detections ({dcols}) SELECT {dcols} FROM detections WHERE {outside}", op)
+    con.execute(f"INSERT INTO clipped_frames ({fcols}) SELECT {fcols} FROM frames WHERE {outside}", op)
     con.execute(f"DELETE FROM detections WHERE {outside}", op)
     con.execute(f"DELETE FROM frames WHERE {outside}", op)
-    files: list[str] = []
-    for col in ("frame_path", "overlay_path", "pose_overlay_path"):
-        files += [p for p in paths[col].tolist() if p]
-    return {"removed": int(len(paths)), "kept": int(kept), "paths": files}
+    return {"removed": int(removed), "kept": int(kept)}
+
+
+def restore_clip(con, dataset_id: str, camera_id: str) -> int:
+    """Undo clipping for one camera: move its staged (clipped) frames + detections
+    back into the live tables and clear them from staging. Restores the camera to its
+    full pre-clip extent (any/all clips on it). Returns frames restored (0 if none
+    were staged). The images were never removed, so the restored rows point at frames
+    that still exist on disk."""
+    if not _table_exists(con, "clipped_frames"):
+        return 0
+    fcols = ", ".join(FRAME_COLS)
+    dcols = ", ".join(DET_COLS)
+    where = "dataset_id = ? AND camera_id = ?"
+    p = [dataset_id, camera_id]
+    n = con.execute(f"SELECT count(*) FROM clipped_frames WHERE {where}", p).fetchone()[0]
+    con.execute(f"INSERT INTO frames ({fcols}) SELECT {fcols} FROM clipped_frames WHERE {where}", p)
+    con.execute(f"INSERT INTO detections ({dcols}) SELECT {dcols} FROM clipped_detections WHERE {where}", p)
+    con.execute(f"DELETE FROM clipped_frames WHERE {where}", p)
+    con.execute(f"DELETE FROM clipped_detections WHERE {where}", p)
+    return int(n)
+
+
+def clipped_counts(con, dataset_id: str) -> dict:
+    """{camera_id: staged (restorable) frame count} for a dataset — lets the camera
+    manager show an Undo control on a clipped camera. Empty on a DB without the
+    staging table (pre-clip-feature)."""
+    if not _table_exists(con, "clipped_frames"):
+        return {}
+    rows = con.execute(
+        "SELECT camera_id, count(*) FROM clipped_frames WHERE dataset_id = ? GROUP BY camera_id",
+        [dataset_id],
+    ).fetchall()
+    return {r[0]: int(r[1]) for r in rows}
 
 
 def dataset_day(con, dataset_id: str):

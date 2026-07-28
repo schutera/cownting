@@ -62,6 +62,8 @@ export interface CameraHealth {
   brightness_p90:number|null;
   issues:CameraIssue[];
   ok:boolean;
+  // Frames staged by a prior clip that Undo can restore (0 when not clipped).
+  restorable?:number;
 }
 export interface CountRow { t:string; frames:number; detections:number; cows_per_frame:number|null; }
 export type PostureRow = { t:string } & Record<string, number|string>;

@@ -120,7 +120,8 @@ export default function Manual() {
             others (the dashboard <B>Coverage</B> panel shows this), click{" "}
             <ClipChip /> on it, set the <B>keep</B> window — it defaults to the times
             the other cameras share — and <B>Confirm clip</B>. Frames outside the window
-            are removed so the camera lines up with the rest. Permanent.
+            are set aside so the camera lines up with the rest. Changed your mind?{" "}
+            <B>↩ Undo clip</B> on that camera brings its full range back.
           </li>
           <li>
             <B>Add or replace:</B> under <B>Add or replace a camera</B>, drop a clip
