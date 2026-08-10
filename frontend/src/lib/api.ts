@@ -93,6 +93,17 @@ export async function logout(): Promise<void> {
   await fetch("/api/logout", { method: "POST", credentials: "include" });
 }
 
+// Admin-only role preview: switch this session's effective role ("admin" switches
+// back). Server-enforced — while acting, gated routes genuinely 403. Returns the
+// updated /api/me payload.
+export function actAs(role: Role): Promise<User> {
+  return j<User>("/api/act-as", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role }),
+  });
+}
+
 // --------------------------------------------------------------- admin: users
 export function listUsers(): Promise<User[]> {
   return j<User[]>("/api/admin/users");

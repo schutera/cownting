@@ -178,6 +178,53 @@ def test_poweruser_data_gate():
               pow_.get("/api/admin/users").status_code == 403)
 
 
+def test_act_as_role_preview():
+    """An admin can switch the session's EFFECTIVE role to preview the app as a
+    lower role (gates genuinely 403), and can always switch back because act-as
+    itself is gated on the REAL role."""
+    with tempfile.TemporaryDirectory() as d:
+        app, _dbp = _app(d)
+        admin = TestClient(app)
+        admin.post("/api/login", json={"username": "admin", "password": "s3cret"})
+        admin.post("/api/admin/users", json={"username": "pow", "password": "pw", "role": "poweruser"})
+
+        # Only a real admin may act-as at all.
+        pow_ = TestClient(app)
+        pow_.post("/api/login", json={"username": "pow", "password": "pw"})
+        r = pow_.post("/api/act-as", json={"role": "user"})
+        check("poweruser cannot act-as -> 403", r.status_code == 403, str(r.status_code))
+
+        # Acting as a plain user: view works, data + admin routes genuinely 403,
+        # and /api/me reports both the effective and the real role.
+        r = admin.post("/api/act-as", json={"role": "user"})
+        check("act-as user -> 200", r.status_code == 200, str(r.status_code))
+        me = admin.get("/api/me").json()
+        check("me: effective user, real admin",
+              me.get("role") == "user" and me.get("real_role") == "admin", str(me))
+        check("acting user: dashboard still viewable", admin.get("/api/site").status_code == 200)
+        check("acting user: export blocked -> 403", admin.get("/api/export.csv").status_code == 403)
+        check("acting user: admin routes blocked -> 403", admin.get("/api/admin/users").status_code == 403)
+
+        # Acting as poweruser: data allowed, admin still blocked.
+        admin.post("/api/act-as", json={"role": "poweruser"})
+        check("acting poweruser: export allowed", admin.get("/api/export.csv").status_code == 200)
+        check("acting poweruser: admin routes blocked -> 403",
+              admin.get("/api/admin/users").status_code == 403)
+
+        # The way back: gated on the REAL role, so it works even while acting.
+        r = admin.post("/api/act-as", json={"role": "admin"})
+        check("switch back -> 200", r.status_code == 200, str(r.status_code))
+        check("admin routes reachable again", admin.get("/api/admin/users").status_code == 200)
+
+        # Bogus role rejected; a fresh login always starts at the real role.
+        r = admin.post("/api/act-as", json={"role": "root"})
+        check("bogus role -> 400", r.status_code == 400, str(r.status_code))
+        admin.post("/api/act-as", json={"role": "user"})
+        admin.post("/api/login", json={"username": "admin", "password": "s3cret"})
+        me = admin.get("/api/me").json()
+        check("fresh login clears the preview", me.get("role") == "admin", str(me))
+
+
 def test_auth_disabled_is_open():
     with tempfile.TemporaryDirectory() as d:
         dbp = os.path.join(d, "cownting.duckdb")
@@ -202,6 +249,7 @@ def main():
     test_password_hash_roundtrip()
     test_gate_and_admin_flow()
     test_poweruser_data_gate()
+    test_act_as_role_preview()
     test_auth_disabled_is_open()
     print("=================")
     if _FAILED:

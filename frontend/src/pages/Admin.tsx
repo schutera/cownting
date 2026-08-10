@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { Role, User } from "../lib/types";
 import { listUsers, createUser, updateUser, deleteUser } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { Button, Card, SectionLabel } from "../components/ui";
+import { Button, Card, Chip, SectionLabel } from "../components/ui";
 
 const inputCls =
   "bg-bg border border-border rounded-xl px-3 h-10 box-border text-sm text-text " +
@@ -136,6 +136,9 @@ export default function Admin() {
 
       {error ? <p className="text-[13px] text-red-500">{error}</p> : null}
 
+      {/* Role preview — switch your own session's effective role */}
+      {!user?.auth_disabled ? <RoleSwitcher /> : null}
+
       {/* Add a user */}
       <Card className="p-5">
         <div className="flex items-center justify-between gap-3">
@@ -215,6 +218,57 @@ export default function Admin() {
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * "Experience the app as…" — switches this session's EFFECTIVE role so an admin
+ * can see exactly what a user or poweruser sees. Server-enforced: while
+ * previewing, gated routes genuinely 403 and gated UI disappears — including
+ * this page, so the way back (an amber pill + "Back to admin" chip) lives in
+ * the header. The account's stored role never changes.
+ */
+function RoleSwitcher() {
+  const { user, actAs } = useAuth();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function pick(role: Role) {
+    if (busy || role === user?.role) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await actAs(role); // leaving "admin" re-renders the app as that role
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="p-5">
+      <SectionLabel>Experience the app as…</SectionLabel>
+      <p className="text-[13px] text-gray-mid mt-2">
+        See Cownting exactly as another role does — the server enforces the
+        preview, so anything a role can't do really is blocked, not just hidden.
+        Picking <span className="font-mono text-[12px]">user</span> or{" "}
+        <span className="font-mono text-[12px]">poweruser</span> takes you to the
+        dashboard as that role; return via <span className="text-text">Back to
+        admin</span> in the header. Your account keeps its admin role throughout.
+      </p>
+      <div className="flex items-center gap-1.5 mt-3">
+        {ROLE_OPTIONS.map((r) => (
+          <Chip key={r} active={user?.role === r} onClick={() => pick(r)}>
+            {r}
+          </Chip>
+        ))}
+      </div>
+      <p className="text-[11px] text-gray-tertiary mt-2">
+        {ROLE_BLURB[user?.role ?? "admin"]}
+      </p>
+      {err ? <p className="text-[13px] text-red-500 mt-2">{err}</p> : null}
+    </Card>
   );
 }
 

@@ -6,14 +6,16 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { User } from "./types";
-import { getMe, login as apiLogin, logout as apiLogout, setUnauthorizedHandler } from "./api";
+import type { Role, User } from "./types";
+import { actAs as apiActAs, getMe, login as apiLogin, logout as apiLogout, setUnauthorizedHandler } from "./api";
 import { Button } from "../components/ui";
 
 interface AuthCtx {
   user: User | null;
   login: (username: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  // Admin-only role preview (server-enforced); actAs("admin") switches back.
+  actAs: (role: Role) => Promise<void>;
 }
 
 const Ctx = createContext<AuthCtx | null>(null);
@@ -70,17 +72,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }, []);
 
+  const actAs = useCallback(async (role: Role) => {
+    setUser(await apiActAs(role));
+  }, []);
+
   if (!ready) return null; // brief: waiting on the /api/me probe
 
   if (!user) {
     return (
-      <Ctx.Provider value={{ user, login, logout }}>
+      <Ctx.Provider value={{ user, login, logout, actAs }}>
         <LoginScreen />
       </Ctx.Provider>
     );
   }
 
-  return <Ctx.Provider value={{ user, login, logout }}>{children}</Ctx.Provider>;
+  return <Ctx.Provider value={{ user, login, logout, actAs }}>{children}</Ctx.Provider>;
 }
 
 function LoginScreen() {

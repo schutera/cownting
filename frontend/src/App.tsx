@@ -85,15 +85,31 @@ function HeaderScrubber() {
  * Uses the same "label + pill" layout the day selector used to carry (the
  * username as a static pill, logout as a Chip), so the header reads as one
  * consistent styled block now that the Day picker has moved to the dashboard.
+ *
+ * While an admin is previewing a lower role (Users page → "Experience as"),
+ * the pill turns amber and a "Back to admin" chip appears HERE — the header is
+ * the one place still reachable when the preview locks you out of the Users
+ * page itself.
  */
 function UserMenu() {
-  const { user, logout } = useAuth();
+  const { user, logout, actAs } = useAuth();
   if (!user || user.auth_disabled) return null;
+  const acting = user.real_role === "admin" && user.role !== "admin";
   return (
     <div className="flex items-center gap-1.5 ml-6 sm:ml-8">
-      <span className="text-[13px] px-3 py-1.5 rounded-full border bg-green-50 text-green-700 border-green-600/40 font-medium">
+      <span
+        className={
+          "text-[13px] px-3 py-1.5 rounded-full border font-medium " +
+          (acting
+            ? "bg-amber-50 text-amber-700 border-amber-600/40"
+            : "bg-green-50 text-green-700 border-green-600/40")
+        }
+        title={acting ? `Signed in as ${user.username} (admin), previewing the ${user.role} role` : undefined}
+      >
         {user.username}
+        {acting ? ` · as ${user.role}` : ""}
       </span>
+      {acting ? <Chip onClick={() => actAs("admin")}>Back to admin</Chip> : null}
       <Chip onClick={() => logout()}>Logout</Chip>
     </div>
   );

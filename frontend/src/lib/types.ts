@@ -31,7 +31,10 @@ export interface LocalizeStatus {
 // booted with auth turned off (tests / trusted-LAN demo) — the SPA then skips
 // the login gate and treats the session as an admin.
 export type Role = "admin" | "poweruser" | "user";
-export interface User { username:string; role:Role; auth_disabled?:boolean; }
+// `role` is the EFFECTIVE role (an admin may act as a lower role via /api/act-as
+// to preview the app); `real_role` is the account's actual role — they differ
+// only while an admin is previewing.
+export interface User { username:string; role:Role; real_role?:Role; auth_disabled?:boolean; }
 
 export interface Site { cameras:string[]; kpis:Kpis; orthophoto:ImgMeta|null; references:Record<string,ImgMeta>; posture_enabled:boolean; pose_enabled:boolean; dataset:string|null; }
 // One data-package (a day's multi-camera shoot) for the day picker.

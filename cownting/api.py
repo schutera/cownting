@@ -45,6 +45,11 @@ class LoginReq(BaseModel):
     password: str
 
 
+class ActAsReq(BaseModel):
+    # The role an admin wants to temporarily act as; "admin" returns to normal.
+    role: str
+
+
 class CreateUserReq(BaseModel):
     username: str
     password: str
@@ -115,25 +120,37 @@ def create_app(config: Config) -> FastAPI:
         if not request.session.get("user"):
             raise HTTPException(401, "login required")
 
+    def effective_role(request: Request) -> str | None:
+        """The role the gates enforce. An admin may set session['acting_role']
+        (via /api/act-as) to temporarily act as a lower role and experience the
+        app exactly as that role — the gates then really 403. Only honoured when
+        the REAL session role is admin, so nothing else can plant an override."""
+        user = request.session.get("user")
+        if not user:
+            return None
+        acting = request.session.get("acting_role")
+        if acting in auth_mod.ROLES and user.get("role") == "admin":
+            return acting
+        return user.get("role")
+
     def require_admin(request: Request):
-        """Extra gate for /api/admin/*: the session user must be an admin. Listed
-        alongside require_login on the admin routes, so it runs after login is
-        already assured."""
+        """Extra gate for /api/admin/*: the session user must be an admin (by
+        effective role — an admin acting as a lower role is kept out, that's the
+        point of the preview). Listed alongside require_login on the admin
+        routes, so it runs after login is already assured."""
         if not auth_on:
             return
-        user = request.session.get("user")
-        if not user or user.get("role") != "admin":
+        if effective_role(request) != "admin":
             raise HTTPException(403, "admin only")
 
     def require_poweruser(request: Request):
         """Extra gate for data-management routes (upload / download / delete):
-        the session user must be a poweruser or admin. Plain `user` accounts can
-        view the dashboard but not mutate or export data. Runs after login is
-        already assured by the app-wide require_login."""
+        the session user must be a poweruser or admin (by effective role). Plain
+        `user` accounts can view the dashboard but not mutate or export data.
+        Runs after login is already assured by the app-wide require_login."""
         if not auth_on:
             return
-        user = request.session.get("user")
-        if not user or not auth_mod.can_manage_data(user.get("role")):
+        if not auth_mod.can_manage_data(effective_role(request)):
             raise HTTPException(403, "poweruser or admin only")
 
     app = FastAPI(title="Cownting API", dependencies=[Depends(require_login)])
@@ -192,27 +209,56 @@ def create_app(config: Config) -> FastAPI:
     # ------------------------------------------------------------------ auth
     @app.get("/api/me")
     def me(request: Request):
-        """The logged-in user, or 401. When auth is disabled, reports a synthetic
-        admin so the SPA renders without a login gate."""
+        """The logged-in user, or 401. `role` is the EFFECTIVE role (honouring an
+        admin's act-as preview); `real_role` is the account's actual role, so the
+        SPA knows an admin is previewing and can offer the way back. When auth is
+        disabled, reports a synthetic admin so the SPA renders without a login
+        gate."""
         if not auth_on:
-            return {"username": "local", "role": "admin", "auth_disabled": True}
+            return {"username": "local", "role": "admin", "real_role": "admin",
+                    "auth_disabled": True}
         user = request.session.get("user")
         if not user:
             raise HTTPException(401, "not logged in")
-        return {**user, "auth_disabled": False}
+        return {"username": user.get("username"), "role": effective_role(request),
+                "real_role": user.get("role"), "auth_disabled": False}
 
     @app.post("/api/login")
     def login(body: LoginReq, request: Request):
         if not auth_on:
-            return {"username": "local", "role": "admin", "auth_disabled": True}
+            return {"username": "local", "role": "admin", "real_role": "admin",
+                    "auth_disabled": True}
         c = con()
         user = auth_mod.authenticate(c, body.username.strip(), body.password)
         c.close()
         if not user:
             raise HTTPException(401, "invalid username or password")
         request.session["user"] = user
+        # A fresh sign-in always starts at the account's real role.
+        request.session.pop("acting_role", None)
         print(f"[cownting.alert] LOGIN user={body.username.strip()}", flush=True)
-        return {**user, "auth_disabled": False}
+        return {**user, "real_role": user["role"], "auth_disabled": False}
+
+    @app.post("/api/act-as")
+    def act_as(body: ActAsReq, request: Request):
+        """Admin-only role preview: switch this session's EFFECTIVE role to test
+        the app as a plain user or poweruser — the gates then genuinely enforce
+        it (hidden controls 403 for real). Gated on the REAL role, not the
+        effective one, so an acting admin can always switch back; "admin" clears
+        the override. Session-only: the account's stored role never changes."""
+        if not auth_on:
+            raise HTTPException(400, "auth is disabled — every request already runs as admin")
+        user = request.session.get("user")
+        if not user or user.get("role") != "admin":
+            raise HTTPException(403, "admin only")
+        if body.role not in auth_mod.ROLES:
+            raise HTTPException(400, f"role must be one of {list(auth_mod.ROLES)}")
+        if body.role == "admin":
+            request.session.pop("acting_role", None)
+        else:
+            request.session["acting_role"] = body.role
+        print(f"[cownting.alert] ACT-AS user={user.get('username')} role={body.role}", flush=True)
+        return me(request)
 
     @app.post("/api/logout")
     def logout(request: Request):
