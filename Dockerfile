@@ -54,11 +54,15 @@ COPY --from=frontend /web/dist ./frontend/dist
 ARG YOLO_WEIGHTS=yolo11x-seg.pt
 RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_WEIGHTS}')"
 
-# Run as an unprivileged user; the data volume + weights are owned by it.
+# The app runs as an unprivileged user, but the container STARTS as root: the
+# entrypoint re-owns anything in the /app/data bind mount that a root-run host
+# tool left behind (the build-time chown below can't reach a mount), then drops
+# to `cownting` via setpriv before exec'ing the CMD.
 RUN useradd --create-home --uid 10001 cownting \
     && mkdir -p /app/data \
     && chown -R cownting:cownting /app
-USER cownting
+COPY entrypoint.sh ./
+ENTRYPOINT ["/bin/sh", "/app/entrypoint.sh"]
 
 EXPOSE 8000
 

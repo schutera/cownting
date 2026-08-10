@@ -113,6 +113,20 @@ docker compose start cownting
 The session secret and admin credentials live in `.env` — back that up too, out
 of band. Neither `.env` nor `data/` is committed to git.
 
+### File ownership in `data/`
+
+The app runs as uid **10001** inside the container, and `data/` is a host bind
+mount — so a root-run host tool that writes into it (a manual copy, a
+migration script) leaves files the app cannot overwrite, which surfaces later
+as a 500 (`PermissionError`) on some unrelated save. Two layers of defence:
+
+- **Prefer `docker compose exec cownting …`** for maintenance that touches
+  `data/` — it runs as the app user, so ownership stays correct.
+- **The entrypoint self-heals on boot**: anything in `/app/data` not owned by
+  the app user is re-owned before the server starts (then privileges drop to
+  uid 10001). A root-owned stray at worst breaks things until the next
+  `docker compose restart cownting`.
+
 ## Notes & tuning
 
 - **CPU speed.** The default detector is `yolo11x-seg.pt` — accurate but slow on
