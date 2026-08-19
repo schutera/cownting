@@ -86,11 +86,13 @@ docker compose up -d --build      # rebuilds the image, recreates containers
 ### Managing login accounts from the host
 
 ```bash
-docker compose exec cownting python -m cownting.cli \
+# -u cownting: exec sessions default to root (the image boots as root so the
+# entrypoint can heal data/ ownership); run maintenance as the app user instead.
+docker compose exec -u cownting cownting python -m cownting.cli \
   --help                                   # see all commands
-docker compose exec cownting python -m cownting.cli user list \
+docker compose exec -u cownting cownting python -m cownting.cli user list \
   -c config/cownting.prod.yaml
-docker compose exec cownting python -m cownting.cli user passwd <name> \
+docker compose exec -u cownting cownting python -m cownting.cli user passwd <name> \
   -c config/cownting.prod.yaml             # reset a password / recover access
 ```
 
@@ -120,8 +122,9 @@ mount — so a root-run host tool that writes into it (a manual copy, a
 migration script) leaves files the app cannot overwrite, which surfaces later
 as a 500 (`PermissionError`) on some unrelated save. Two layers of defence:
 
-- **Prefer `docker compose exec cownting …`** for maintenance that touches
-  `data/` — it runs as the app user, so ownership stays correct.
+- **Prefer `docker compose exec -u cownting cownting …`** for maintenance that
+  touches `data/` — it runs as the app user, so ownership stays correct (a
+  plain `exec` enters as root, exactly the mistake this section is about).
 - **The entrypoint self-heals on boot**: anything in `/app/data` not owned by
   the app user is re-owned before the server starts (then privileges drop to
   uid 10001). A root-owned stray at worst breaks things until the next
