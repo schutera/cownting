@@ -157,7 +157,11 @@ export class CaptureDayRequiredError extends Error {
 // Returns the queued job (202) to poll with getUploadJob. Not routed through j()
 // because it's dataset-independent and must not append the ?dataset param.
 export async function uploadVideos(form: FormData): Promise<UploadJob> {
-  const res = await fetch("/api/uploads", { method: "POST", body: form });
+  const res = await fetch("/api/uploads", {
+    method: "POST",
+    credentials: "include", // session cookie must ride even cross-origin (see j())
+    body: form,
+  });
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
     let code: string | undefined;
@@ -197,7 +201,7 @@ export function listUploadJobs(): Promise<UploadJob[]> {
 export async function deleteDataset(id: string, confirm: string): Promise<void> {
   const res = await fetch(
     `/api/datasets/${encodeURIComponent(id)}?confirm=${encodeURIComponent(confirm)}`,
-    { method: "DELETE" },
+    { method: "DELETE", credentials: "include" }, // session cookie, as in j()
   );
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;

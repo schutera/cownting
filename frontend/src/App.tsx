@@ -183,7 +183,17 @@ function AppInner() {
             }
           />
           <Route path="/manual" element={<Manual />} />
-          <Route path="/count-area/:dataset/:camera" element={<CountArea />} />
+          {/* Editing areas is a poweruser action (saves are require_poweruser
+              server-side) — gate the whole editor so a viewer can't draw for ten
+              minutes and only hit the 403 at Save. */}
+          <Route
+            path="/count-area/:dataset/:camera"
+            element={
+              <PowerUserOnly>
+                <CountArea />
+              </PowerUserOnly>
+            }
+          />
           <Route
             path="/admin"
             element={

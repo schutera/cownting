@@ -1,6 +1,8 @@
 """Auth + user-management tests: the login gate blocks un-authenticated /api
 calls, the bootstrap admin can sign in and manage users, non-admins are kept out
-of the admin routes, and the store refuses to orphan the last admin.
+of the admin routes, the full poweruser surface (POWERUSER_SURFACE) is exercised
+as a role x route matrix, a policy scan asserts every mutating /api route
+carries a role gate, and the store refuses to orphan the last admin.
 
 No pytest. Run either way:
     .venv/bin/python -m tests.test_auth
@@ -11,10 +13,12 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fastapi.routing import APIRoute  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from cownting import auth, db  # noqa: E402
@@ -138,9 +142,29 @@ def test_gate_and_admin_flow():
         check("after logout /api/site -> 401", r.status_code == 401, str(r.status_code))
 
 
+# Every route a poweruser may touch — the full data-management surface. The
+# targets are fictitious ("nope"), so a passed gate shows up as an ordinary
+# 4xx (404/400/422), never 403, and leaves no data behind.
+POWERUSER_SURFACE = [
+    ("POST",   "/api/uploads", None),                                  # add a new day
+    ("GET",    "/api/export.csv", None),                               # download data
+    ("DELETE", "/api/datasets/nope?confirm=x", None),                  # delete a day
+    ("GET",    "/api/dataset/nope/camera-health", None),               # per-camera health
+    ("DELETE", "/api/dataset/nope/camera/cam", None),                  # drop one stream
+    ("POST",   "/api/dataset/nope/camera", None),                      # add/replace a stream
+    ("POST",   "/api/dataset/nope/camera/cam/clip",
+     {"start": "2025-10-15T08:00:00", "end": "2025-10-15T09:00:00"}),  # cut stream to a window
+    ("POST",   "/api/dataset/nope/camera/cam/restore", None),          # undo the cut
+    ("POST",   "/api/areas", {"areas": {}}),                           # save count areas
+    ("POST",   "/api/panel-areas", {"areas": {}}),                     # save panel areas
+    ("POST",   "/api/localize", None),                                 # recount placements
+]
+
+
 def test_poweruser_data_gate():
-    """Data-management routes (export / upload / delete) are open to admin and
-    poweruser but blocked for plain `user` accounts."""
+    """Role x route matrix over the full poweruser surface: every entry is 403
+    for a plain `user`, past the gate (anything but 403) for a real poweruser,
+    and an admin acting as poweruser mirrors the real poweruser exactly."""
     with tempfile.TemporaryDirectory() as d:
         app, _dbp = _app(d)
 
@@ -155,27 +179,62 @@ def test_poweruser_data_gate():
         viewer = TestClient(app)
         viewer.post("/api/login", json={"username": "viewer", "password": "pw"})
 
-        # CSV export: admin + poweruser allowed, plain user forbidden.
-        check("admin can export CSV", admin.get("/api/export.csv").status_code == 200)
-        check("poweruser can export CSV", pow_.get("/api/export.csv").status_code == 200)
-        check("plain user blocked from export -> 403",
-              viewer.get("/api/export.csv").status_code == 403)
+        # The gate runs before the handler, so a plain user is exactly 403 on
+        # every entry; a poweruser gets past the gate and the fictitious target
+        # then fails with a normal not-found/validation error (i.e. NOT 403).
+        for method, url, body in POWERUSER_SURFACE:
+            r = viewer.request(method, url, json=body)
+            check(f"user {method} {url} -> 403", r.status_code == 403, str(r.status_code))
+            r = pow_.request(method, url, json=body)
+            check(f"poweruser {method} {url} passes gate (not 403)",
+                  r.status_code != 403, str(r.status_code))
 
-        # Delete a day: the gate runs before the handler, so a plain user is 403
-        # regardless of whether the dataset exists; poweruser gets past the gate
-        # (then a normal not-found/confirm error, i.e. NOT 403).
-        r = viewer.delete("/api/datasets/nope?confirm=x")
-        check("plain user blocked from delete -> 403", r.status_code == 403, str(r.status_code))
-        r = pow_.delete("/api/datasets/nope?confirm=x")
-        check("poweruser passes delete gate (not 403)", r.status_code != 403, str(r.status_code))
+        # An admin previewing the poweruser role must mirror a real poweruser
+        # exactly: the same non-403 across the whole surface.
+        admin.post("/api/act-as", json={"role": "poweruser"})
+        for method, url, body in POWERUSER_SURFACE:
+            r = admin.request(method, url, json=body)
+            check(f"acting poweruser {method} {url} passes gate (not 403)",
+                  r.status_code != 403, str(r.status_code))
+        r = admin.post("/api/act-as", json={"role": "admin"})
+        check("switch back to admin -> 200", r.status_code == 200, str(r.status_code))
 
-        # Upload: plain user rejected at the gate (multipart body not even needed).
-        r = viewer.post("/api/uploads")
-        check("plain user blocked from upload -> 403", r.status_code == 403, str(r.status_code))
-
-        # Powerusers are still NOT admins — user management stays admin-only.
+        # Powerusers are still NOT admins — user management and the act-as
+        # preview stay admin-only.
         check("poweruser blocked from admin routes -> 403",
               pow_.get("/api/admin/users").status_code == 403)
+        check("poweruser cannot act-as -> 403",
+              pow_.post("/api/act-as", json={"role": "user"}).status_code == 403)
+
+        # POST /api/areas + /api/panel-areas kicked off a background localize
+        # worker that opens the DuckDB file; on Windows the TemporaryDirectory
+        # cleanup would crash while that thread still holds it, so drain first.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if pow_.get("/api/localize/status").json().get("status") in ("idle", "done", "failed"):
+                break
+            time.sleep(0.1)
+
+
+def test_every_mutating_route_is_gated():
+    """Policy scan over the live route table: every mutating /api route must
+    carry an explicit role gate (require_poweruser or require_admin), except the
+    session handshake routes that gate internally. A new mutating endpoint
+    added without a gate fails here — that is the point."""
+    with tempfile.TemporaryDirectory() as d:
+        app, _dbp = _app(d)
+        MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+        SELF_GATING = {"/api/login", "/api/logout", "/api/act-as"}
+        missing = []
+        for route in app.routes:
+            if not isinstance(route, APIRoute) or not route.path.startswith("/api/"):
+                continue
+            if not (route.methods & MUTATING) or route.path in SELF_GATING:
+                continue
+            gates = {dep.call.__name__ for dep in route.dependant.dependencies if dep.call}
+            if not gates & {"require_poweruser", "require_admin"}:
+                missing.append(f"{'/'.join(sorted(route.methods & MUTATING))} {route.path}")
+        check("every mutating /api route carries a role gate", not missing, "; ".join(missing))
 
 
 def test_act_as_role_preview():
@@ -249,6 +308,7 @@ def main():
     test_password_hash_roundtrip()
     test_gate_and_admin_flow()
     test_poweruser_data_gate()
+    test_every_mutating_route_is_gated()
     test_act_as_role_preview()
     test_auth_disabled_is_open()
     print("=================")

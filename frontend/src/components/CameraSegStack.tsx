@@ -175,27 +175,31 @@ export default function CameraSegStack({
                       {placeholderText(cs, frame, shownIdx)}
                     </div>
                   )}
-                  {/* gear — opens the count-area editor for this camera */}
-                  <span
-                    role="button"
-                    tabIndex={0}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      if (dataset) navigate(`/count-area/${dataset}/${cam}`);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
+                  {/* gear — opens the count-area editor for this camera. Editing
+                      is poweruser-gated (saving 403s and the route bounces), so
+                      viewers don't get a door that only leads to a wall. */}
+                  {canManage && dataset ? (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      onClick={(e) => {
                         e.stopPropagation();
                         e.preventDefault();
-                        if (dataset) navigate(`/count-area/${dataset}/${cam}`);
-                      }
-                    }}
-                    title={`Edit count areas for ${cam}`}
-                    className="absolute top-2 right-2 grid place-items-center w-7 h-7 rounded-lg bg-black/45 text-white opacity-0 group-hover:opacity-100 hover:bg-black/70 transition-opacity duration-150 cursor-pointer"
-                  >
-                    <CogIcon className="w-4 h-4" />
-                  </span>
+                        navigate(`/count-area/${dataset}/${cam}`);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          navigate(`/count-area/${dataset}/${cam}`);
+                        }
+                      }}
+                      title={`Edit count areas for ${cam}`}
+                      className="absolute top-2 right-2 grid place-items-center w-7 h-7 rounded-lg bg-black/45 text-white opacity-0 group-hover:opacity-100 hover:bg-black/70 transition-opacity duration-150 cursor-pointer"
+                    >
+                      <CogIcon className="w-4 h-4" />
+                    </span>
+                  ) : null}
                   <div className="absolute inset-x-0 bottom-0 flex items-center gap-1.5 px-2.5 py-1.5 bg-gradient-to-t from-black/55 to-transparent">
                     <span className="w-2 h-2 rounded-full" style={{ background: color }} />
                     <span className="font-mono text-[11px] text-white tracking-wide">
