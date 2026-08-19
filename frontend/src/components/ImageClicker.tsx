@@ -50,6 +50,7 @@ export function ImageClicker({
   preview,
   onMovePoint,
   onDeletePoint,
+  maxHeight = "68vh",
 }: {
   src: string;
   naturalWidth: number;
@@ -65,6 +66,7 @@ export function ImageClicker({
   preview?: number[][][]; // provisional polygons (e.g. an import preview), drawn dashed in a distinct colour
   onMovePoint?: (index: number, pt: [number, number]) => void; // polyline: drag a current-line vertex
   onDeletePoint?: (index: number) => void; // polyline: double-click a current-line vertex to remove it
+  maxHeight?: string; // any CSS length — caps the viewport so a tall image still fits on screen
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -249,7 +251,7 @@ export function ImageClicker({
         }
         style={{
           aspectRatio: `${naturalWidth} / ${naturalHeight}`,
-          maxHeight: "68vh",
+          maxHeight,
           margin: "0 auto",
           touchAction: "none",
         }}

@@ -16,6 +16,7 @@ import {
   getSite,
   orthoImg,
   refImg,
+  runLocalize,
   saveAreas,
   savePanelAreas,
 } from "../lib/api";
@@ -38,6 +39,13 @@ const LOCALIZE_POLL_MS = 700;
 const LOCALIZE_DONE_LINGER_MS = 4000;
 const LOCALIZE_MAX_WATCH_MS = 120_000;
 type LocalizePhase = "idle" | "working" | "done" | "failed";
+
+// Canvas height cap. Subtracting the editor's fixed chrome (sticky toolbar, hint,
+// chip row, card padding, frame slider, poly controls) keeps BOTH canvases and
+// their controls on one laptop screen; the 20rem floor stops a short window from
+// squeezing the drawing area down to nothing, and 68vh remains the ceiling on a
+// tall monitor. Overflow past the cap is reachable by scrolling as before.
+const CANVAS_MAX_H = "min(68vh, max(20rem, calc(100vh - 24rem)))";
 
 /**
  * Per-camera count-area editor. A count area is a named region drawn twice: its
@@ -365,8 +373,25 @@ export default function CountArea() {
       // Watch it in the background without ever blocking the UI.
       if (routeDataset) watchLocalize(routeDataset);
     } catch (e) {
-      setSaveErr(String(e));
+      setSaveErr(e instanceof Error ? e.message : String(e));
       setSaveState("error");
+    }
+  }
+
+  // Re-enqueue this day's localize pass after a failed one — the only direct
+  // entry to /api/localize (saves and camera ops trigger it implicitly). Rides
+  // the same ?dataset the editor's saves use.
+  async function retryLocalize() {
+    if (!routeDataset) return;
+    try {
+      await runLocalize();
+      watchLocalize(routeDataset);
+    } catch (e) {
+      setLocalize({
+        phase: "failed",
+        updated: null,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 
@@ -377,34 +402,100 @@ export default function CountArea() {
 
   return (
     <div className="animate-fade-slide-in">
-      <div className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <Link to="/" className="font-mono text-[11px] text-gray-tertiary hover:text-accent">
+      {/* Editor toolbar. Pulled up into <main>'s top padding and stuck just under
+          the app header, so Save — and whether the last one landed — is in view
+          from the moment the page opens and stays there while you draw. On a
+          laptop the old bottom-of-page Save sat well below the fold. */}
+      <div
+        className={
+          "sticky top-[var(--app-header-h)] z-40 -mx-6 sm:-mx-10 -mt-10 sm:-mt-12 mb-3 " +
+          "px-6 sm:px-10 pt-3.5 pb-3 bg-bg border-b border-border"
+        }
+      >
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <Link
+            to="/"
+            className="font-mono text-[11px] text-gray-tertiary hover:text-accent shrink-0"
+          >
             ← Dashboard
           </Link>
-          <h1 className="font-sans text-2xl text-near-black mt-2">
+          <h1 className="font-sans text-xl text-near-black leading-none">
             {isPanel ? "Panel areas" : "Count areas"} ·{" "}
             <span className="text-accent">{camera}</span>
           </h1>
-          <p className="text-[13px] text-text mt-1 max-w-3xl">
-            {isPanel ? (
+          <ModeToggle mode={mode} onMode={switchMode} />
+          <span className="font-mono text-[11px] text-gray-tertiary tabular-nums">
+            {areas.length} area{areas.length === 1 ? "" : "s"} · {totalVerts} point
+            {totalVerts === 1 ? "" : "s"}
+          </span>
+
+          {/* Save + what happened to it, pinned right. */}
+          <div className="ml-auto flex items-center gap-3">
+            {saveState === "saved" && localize.phase === "idle" ? (
+              <span className="font-mono text-[11px] text-accent">✓ Saved</span>
+            ) : null}
+            {localize.phase === "working" ? (
+              <Working label="Assigning cows to areas…" className="font-mono text-[11px]" />
+            ) : null}
+            {localize.phase === "done" ? (
+              <Working
+                done
+                className="font-mono text-[11px]"
+                label={
+                  localize.updated != null
+                    ? `Updated · ${localize.updated} reassigned`
+                    : "Updated"
+                }
+              />
+            ) : null}
+            {localize.phase === "failed" ? (
               <>
-                Draw the <strong>shade under a panel</strong> on the{" "}
-                <strong>camera frame</strong> (left) — a cow whose ground point falls
-                inside it counts as <strong>under a panel</strong>. Draw the matching shape
-                on the <strong>orthophoto</strong> (right) for the map.
+                <span
+                  className="font-mono text-[11px] text-[#e76f51] truncate max-w-[14rem]"
+                  title={localize.error ?? undefined}
+                >
+                  Localize failed — {localize.error}
+                </span>
+                <Button variant="ghost" onClick={retryLocalize}>
+                  Retry
+                </Button>
               </>
-            ) : (
-              <>
-                Draw a region on the <strong>camera frame</strong> (left) — its polygon is
-                what counts cows. Draw the matching region on the{" "}
-                <strong>orthophoto</strong> (right) to place it on the map.
-              </>
-            )}
-          </p>
+            ) : null}
+            {saveState === "error" ? (
+              <span
+                className="font-mono text-[11px] text-[#e76f51] truncate max-w-[14rem]"
+                title={saveErr ?? undefined}
+              >
+                Save failed — {saveErr}
+              </span>
+            ) : null}
+            <Button onClick={save} disabled={saveState === "saving"}>
+              {saveState === "saving"
+                ? "Saving…"
+                : isPanel
+                  ? "Save panel areas"
+                  : "Save count areas"}
+            </Button>
+          </div>
         </div>
-        <ModeToggle mode={mode} onMode={switchMode} />
       </div>
+
+      <p className="text-[12.5px] text-text mb-3 max-w-4xl">
+        {isPanel ? (
+          <>
+            Draw the <strong>shade under a panel</strong> on the{" "}
+            <strong>camera frame</strong> (left) — a cow whose ground point falls inside
+            it counts as <strong>under a panel</strong>; draw the matching shape on the{" "}
+            <strong>orthophoto</strong> (right) for the map.
+          </>
+        ) : (
+          <>
+            Draw a region on the <strong>camera frame</strong> (left) — its polygon is
+            what counts cows; draw the matching region on the{" "}
+            <strong>orthophoto</strong> (right) to place it on the map.
+          </>
+        )}
+      </p>
 
       {loadErr ? (
         <Card className="p-5">
@@ -413,7 +504,7 @@ export default function CountArea() {
       ) : null}
 
       {/* Area chips: add / select / rename / delete. */}
-      <div className="mb-5 flex flex-wrap gap-2 items-center">
+      <div className="mb-3 flex flex-wrap gap-2 items-center">
         {areas.map((a, i) => {
           const nCam = a.camera_polygon.length;
           const nOrtho = a.ortho_polygon.length;
@@ -471,15 +562,15 @@ export default function CountArea() {
         />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* LEFT — camera reference frame: edits camera_polygon (does the counting). */}
-        <Card className="p-4">
+        <Card className="p-3.5">
           {ref ? (
             <>
               {/* Frame picker sits here (not spanning both cards) because it only
                   changes THIS camera backdrop — never the orthophoto. */}
               {frames.length ? (
-                <div className="mb-3 flex items-center gap-2.5 flex-wrap text-[12px]">
+                <div className="mb-2 flex items-center gap-2.5 flex-wrap text-[12px]">
                   <span className="text-gray-tertiary shrink-0">Frame</span>
                   <input
                     type="range"
@@ -517,6 +608,7 @@ export default function CountArea() {
                 onMovePoint={moveCamPoint}
                 onDeletePoint={deleteCamPoint}
                 preview={camPreview}
+                maxHeight={CANVAS_MAX_H}
               />
               <PolyControls
                 label={activeArea ? `${activeArea.name} · camera` : "camera"}
@@ -533,7 +625,7 @@ export default function CountArea() {
         </Card>
 
         {/* RIGHT — orthophoto: edits ortho_polygon (display placement only). */}
-        <Card className="p-4">
+        <Card className="p-3.5">
           {ortho ? (
             <>
               <ImageClicker
@@ -554,6 +646,7 @@ export default function CountArea() {
                 onMovePoint={moveOrthoPoint}
                 onDeletePoint={deleteOrthoPoint}
                 preview={orthoPreview}
+                maxHeight={CANVAS_MAX_H}
               />
               <PolyControls
                 label={activeArea ? `${activeArea.name} · map` : "map"}
@@ -570,44 +663,6 @@ export default function CountArea() {
         </Card>
       </div>
 
-      <div className="mt-6 flex flex-wrap items-center gap-4">
-        <Button onClick={save} disabled={saveState === "saving"}>
-          {saveState === "saving"
-            ? "Saving…"
-            : isPanel
-              ? "Save panel areas"
-              : "Save count areas"}
-        </Button>
-        <span className="font-mono text-[11px] text-gray-tertiary">
-          {areas.length} area{areas.length === 1 ? "" : "s"} · {totalVerts} point
-          {totalVerts === 1 ? "" : "s"} total
-        </span>
-        {saveState === "saved" && localize.phase === "idle" ? (
-          <span className="font-mono text-[11px] text-accent">✓ Saved</span>
-        ) : null}
-        {localize.phase === "working" ? (
-          <Working label="Assigning cows to areas…" className="font-mono text-[11px]" />
-        ) : null}
-        {localize.phase === "done" ? (
-          <Working
-            done
-            className="font-mono text-[11px]"
-            label={
-              localize.updated != null
-                ? `Updated · ${localize.updated} reassigned`
-                : "Updated"
-            }
-          />
-        ) : null}
-        {localize.phase === "failed" ? (
-          <span className="font-mono text-[11px] text-[#e76f51]">
-            Localize failed — {localize.error}
-          </span>
-        ) : null}
-        {saveState === "error" ? (
-          <span className="font-mono text-[11px] text-[#e76f51]">Save failed — {saveErr}</span>
-        ) : null}
-      </div>
     </div>
   );
 }
@@ -654,7 +709,7 @@ function PolyControls({
 }) {
   const ready = poly.length >= 3;
   return (
-    <div className="mt-3 flex flex-wrap items-center gap-3">
+    <div className="mt-2.5 flex flex-wrap items-center gap-3">
       <Button variant="ghost" disabled={!poly.length} onClick={onUndo}>
         Undo point
       </Button>

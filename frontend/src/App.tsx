@@ -138,6 +138,9 @@ function AppInner() {
   const isAdmin = !!user && (user.role === "admin" || !!user.auth_disabled);
   return (
     <TimelineProvider key={dataset ?? "whole-db"}>
+      {/* Fixed height (40px logo + py-4 + 1px border) is mirrored by the
+          --app-header-h token in index.css, which page-level sticky toolbars
+          offset by. Change one, change the other. */}
       <header className="sticky top-0 z-50 border-b border-border bg-bg">
         <div className="flex justify-between items-center px-6 sm:px-10 py-4">
           <div className="flex items-center gap-3">

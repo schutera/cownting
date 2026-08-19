@@ -58,3 +58,7 @@ body {
 
 /* soft, seamless default corners; individual components can override */
 :root { --radius: 14px; }
+
+/* Height of the sticky app header (App.tsx: 40px logo + py-4 + 1px border).
+   Page-level sticky toolbars offset by this so they park just under it. */
+:root { --app-header-h: 73px; }
