@@ -17,6 +17,22 @@ import type {
   CameraCoverage,
   User,
   Role,
+  Taxonomy,
+  LabelQueue,
+  LabelQueueMine,
+  LabelQueueOrder,
+  LabelStats,
+  LabelMinePage,
+  LabelSubmitReq,
+  LabelSkipReq,
+  LabelEventReq,
+  LabelWriteResult,
+  LabelUndoResult,
+  LabelGroupReq,
+  LabelGroupPatchReq,
+  LabelClassReq,
+  LabelClassPatchReq,
+  LabelMoveDir,
 } from "./types";
 
 // The selected data-package (day). Held module-level so every /api call carries
@@ -41,10 +57,16 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
   onUnauthorized = fn;
 }
 
-async function j<T>(url: string, init?: RequestInit): Promise<T> {
+// The shared fetch body behind every /api call: the session cookie, the single
+// 401 handler, and the JSON error-detail unwrapping. It takes the URL EXACTLY as
+// given — no ?dataset is appended. Split out of j() so the label calls can opt
+// out of withDs(): the label queue is cross-day by design, and stamping the
+// selected day onto it would silently shrink the corpus to whatever the day
+// picker happens to show. Everything else goes through j().
+async function jRaw<T>(url: string, init?: RequestInit): Promise<T> {
   // credentials:"include" so the session cookie rides along even when the dev
   // Vite server and the API sit on different origins.
-  const res = await fetch(withDs(url), { credentials: "include", ...init });
+  const res = await fetch(url, { credentials: "include", ...init });
   if (res.status === 401) {
     onUnauthorized?.();
     throw new Error("session expired — please sign in again");
@@ -60,6 +82,12 @@ async function j<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(detail);
   }
   return res.json() as Promise<T>;
+}
+
+// Still `async`, so a throw out of withDs() surfaces as a rejected promise
+// exactly as it did before the split rather than synchronously at the call site.
+async function j<T>(url: string, init?: RequestInit): Promise<T> {
+  return jRaw<T>(withDs(url), init);
 }
 
 // ------------------------------------------------------------------------ auth
@@ -494,5 +522,212 @@ export function getCrosstab(
 // The features the backend can cross-filter on, plus per-feature availability.
 export function getFeatures(): Promise<FeatureInfo[]> {
   return j<FeatureInfo[]>("/api/features");
+}
+
+// --------------------------------------------------------------------- labeling
+// Every call below goes through jRaw, NOT j. Labeling is cross-day by design —
+// an annotator labels the whole corpus, not the day the picker happens to show —
+// so withDs() stamping ?dataset onto these URLs would quietly filter the queue,
+// the progress panel and the annotator's own history down to one day. The one URL
+// the client never builds at all is the crop: the server hands it over on each
+// item as `crop_url`, for exactly the same reason.
+
+export function getTaxonomy(): Promise<Taxonomy> {
+  return jRaw<Taxonomy>("/api/label/taxonomy");
+}
+
+export interface LabelQueueOpts {
+  limit?: number;
+  exclude?: string[];   // instance keys already in the client's buffer
+  dataset?: string;     // omitted -> the WHOLE database, which is the default
+  camera?: string;
+  day?: string;
+  mine?: LabelQueueMine;
+  order?: LabelQueueOrder;
+}
+
+// A batch of instances to label. There is no offset and no cursor: `exclude`
+// carries what the client already holds, and the queue is self-consuming, so
+// re-fetching always advances. `exclude` is comma-joined rather than repeated —
+// an instance_key is 32 hex chars so a comma can never occur inside one, and 200
+// repeated `&exclude=` params would push the URL past what proxies accept. The
+// 200 cap is the server's; slicing here keeps a runaway buffer from 414ing.
+export function getLabelQueue(opts?: LabelQueueOpts): Promise<LabelQueue> {
+  const q = new URLSearchParams();
+  if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
+  if (opts?.dataset) q.set("dataset", opts.dataset);
+  if (opts?.camera) q.set("camera", opts.camera);
+  if (opts?.day) q.set("day", opts.day);
+  if (opts?.mine) q.set("mine", opts.mine);
+  if (opts?.order) q.set("order", opts.order);
+  const exclude = (opts?.exclude ?? []).slice(0, 200);
+  if (exclude.length) q.set("exclude", exclude.join(","));
+  const qs = q.toString();
+  return jRaw<LabelQueue>(`/api/label/queue${qs ? `?${qs}` : ""}`);
+}
+
+// Effort + pool stats for the progress panel. Unscoped by default (the whole
+// corpus); pass a dataset or camera to narrow it deliberately.
+export function getLabelProgress(opts?: { dataset?: string; camera?: string }): Promise<LabelStats> {
+  const q = new URLSearchParams();
+  if (opts?.dataset) q.set("dataset", opts.dataset);
+  if (opts?.camera) q.set("camera", opts.camera);
+  const qs = q.toString();
+  return jRaw<LabelStats>(`/api/label/progress${qs ? `?${qs}` : ""}`);
+}
+
+// The caller's own recent submissions, newest first. `before` is the previous
+// page's `next_before` (a submitted_at timestamp), never an offset.
+export function getMyLabels(opts?: { limit?: number; before?: string }): Promise<LabelMinePage> {
+  const q = new URLSearchParams();
+  if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
+  if (opts?.before) q.set("before", opts.before);
+  const qs = q.toString();
+  return jRaw<LabelMinePage>(`/api/label/mine${qs ? `?${qs}` : ""}`);
+}
+
+// Thrown when a submit or skip carries a taxonomy revision the server has moved
+// past (a poweruser edited the questions mid-session). The caller re-fetches the
+// taxonomy, keeps whichever selections still resolve and re-presents the item —
+// it is emphatically NOT a network error and must never go into a retry loop.
+export class TaxonomyStaleError extends Error {
+  readonly revision: number;
+  constructor(message: string, revision: number) {
+    super(message);
+    this.name = "TaxonomyStaleError";
+    this.revision = revision;
+  }
+}
+
+// The two writes that carry a taxonomy revision, and therefore the two that can
+// come back 409 `taxonomy_stale` with a body the caller has to branch on. jRaw
+// consumes the error body to build its message, so these post by hand — the same
+// shape uploadVideos uses to surface `capture_day_required`.
+async function labelWrite<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include", // session cookie must ride even cross-origin (see j())
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) {
+    onUnauthorized?.();
+    throw new Error("session expired — please sign in again");
+  }
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText} — ${url}`;
+    let code: string | undefined;
+    let revision: number | undefined;
+    try {
+      const parsed = await res.json();
+      const d = parsed?.detail;
+      if (d && typeof d === "object") {
+        code = d.code;
+        revision = d.revision;
+        detail = d.message || detail;
+      } else if (d) {
+        detail = d;
+      }
+    } catch {
+      /* non-JSON error body */
+    }
+    if (res.status === 409 && code === "taxonomy_stale") {
+      throw new TaxonomyStaleError("the questions changed — re-check your answers", revision ?? 0);
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<T>;
+}
+
+// Record an answer. Appends a new version rather than overwriting: annotator
+// variability IS the product of this feature, so a changed mind is a measurement,
+// not a correction. The anchor is echoed back verbatim from the queue item — the
+// server re-hashes it and 400s a mismatch.
+export function submitLabel(req: LabelSubmitReq): Promise<LabelWriteResult> {
+  return labelWrite<LabelWriteResult>("/api/label/submit", req);
+}
+
+// A skip is an annotation with an outcome, not an error and not a 400. It is
+// counted separately from coverage: an instance one annotator could not judge is
+// still served to the next, and only retires after `skip_retire` distinct declines.
+export function skipLabel(req: LabelSkipReq): Promise<LabelWriteResult> {
+  return labelWrite<LabelWriteResult>("/api/label/skip", req);
+}
+
+// Supersede the caller's OWN last answer on an instance (scoped server-side, so
+// it can never touch another annotator's row). Nothing is deleted — the row stays
+// with outcome 'undone' — which is what makes undo safe to reach for on a mis-key.
+export function undoLabel(instanceKey: string): Promise<LabelUndoResult> {
+  return jRaw<LabelUndoResult>("/api/label/undo", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instance_key: instanceKey }),
+  });
+}
+
+// Effort telemetry (session boundaries, info_opened). Fire-and-forget at the call
+// site: a dropped event must never interrupt labeling.
+export function postLabelEvent(event: LabelEventReq): Promise<{ ok: boolean }> {
+  return jRaw<{ ok: boolean }>("/api/label/events", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(event),
+  });
+}
+
+// ---- taxonomy editing (poweruser)
+// Every mutation returns the WHOLE taxonomy, so the editor has no optimistic
+// state to reconcile and the revision on screen is always the server's.
+
+export function createLabelGroup(req: LabelGroupReq): Promise<Taxonomy> {
+  return jRaw<Taxonomy>("/api/label/groups", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+// Archiving is `{active: false}` and restoring `{active: true}` — the same field
+// and polarity the server declares. There is no delete route in this feature.
+export function updateLabelGroup(groupKey: string, patch: LabelGroupPatchReq): Promise<Taxonomy> {
+  return jRaw<Taxonomy>(`/api/label/groups/${encodeURIComponent(groupKey)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+// Reordering changes which hotkey row the group takes, so the editor shows a live
+// key preview beside it.
+export function moveLabelGroup(groupKey: string, dir: LabelMoveDir): Promise<Taxonomy> {
+  return jRaw<Taxonomy>(`/api/label/groups/${encodeURIComponent(groupKey)}/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dir }),
+  });
+}
+
+export function createLabelClass(groupKey: string, req: LabelClassReq): Promise<Taxonomy> {
+  return jRaw<Taxonomy>(`/api/label/groups/${encodeURIComponent(groupKey)}/classes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export function updateLabelClass(classKey: string, patch: LabelClassPatchReq): Promise<Taxonomy> {
+  return jRaw<Taxonomy>(`/api/label/classes/${encodeURIComponent(classKey)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+export function moveLabelClass(classKey: string, dir: LabelMoveDir): Promise<Taxonomy> {
+  return jRaw<Taxonomy>(`/api/label/classes/${encodeURIComponent(classKey)}/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dir }),
+  });
 }
 

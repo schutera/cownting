@@ -27,6 +27,10 @@
   --color-heat: #e58a3c;        /* warm amber */
   --color-heat-hot: #d5513a;    /* terracotta */
   --color-warn: #d98236;        /* nudges / attention */
+  --color-danger: #b4523f;      /* a refusal, not a nudge: a failed submit, a crop
+                                   the server would not serve, a destructive
+                                   confirm. Deliberately distinct from --color-warn
+                                   so an advisory and a dead end never look alike. */
 
   --animate-fade-slide-in: fade-slide-in 0.6s ease-out both;
   --animate-shimmer: shimmer 1.8s ease-in-out infinite;

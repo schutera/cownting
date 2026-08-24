@@ -46,6 +46,58 @@ label:                             # `cownting label-select` + `label-export`
   anno_key: cownting_stage1b       # FiftyOne annotation-run key (push + pull)
   label_field: cows
 
+# --- In-app labeling: the Label page in the dashboard (docs/roadmap/M3_labeling.md) ---
+# NOT the `label:` block above — that one is the Stage-1b CVAT round-trip. One word
+# apart, two unrelated features: everything on the Label page is `annotation:`.
+annotation:
+  # How many DIFFERENT annotators should judge each instance. 2, not 1: at a target
+  # of 1 the first submission drops the instance out of every other annotator's
+  # queue, so nothing is ever judged twice and agreement can never be measured.
+  targets_per_instance: 2
+  # A slice of the instances gets a deeper target so Fleiss' kappa has a real rater
+  # count somewhere. Membership is derived from the instance key itself, so every
+  # annotator independently picks the same slice with zero coordination.
+  overlap_fraction: 0.20
+  overlap_targets: 3
+  skip_retire: 3                   # distinct annotators who may skip an instance
+                                   # before it stops being served to anyone
+  batch_size: 8                    # instances handed out per queue fetch
+  max_batch_size: 50               # ceiling on a client-requested batch size
+  # Context around the cow, as a fraction of the LONGER bbox side. Sun exposure and
+  # lying/standing are read off the surroundings, not off the animal, so a tight
+  # crop is simply unanswerable.
+  crop_pad: 0.35
+  crop_max_width: 768              # crops are served square, at most this wide
+  # A time-lapse camera burns the wall clock into the bottom ~4% of every frame, and
+  # time of day is a direct hint at the sun-exposure answer — a visible banner hands
+  # the annotator the answer and inflates agreement. Blank it before serving.
+  mask_timestamp_banner: true
+  # These cameras look down and the herd crosses the bottom of the frame, so a padded
+  # crop of a low cow can be mostly banner. Above this share the crop is refused
+  # rather than served as a grey rectangle: a featureless tile collects honest
+  # "Cannot tell" answers about nothing, contaminating the statistic we're after.
+  max_banner_fraction: 0.6
+  max_note_chars: 500              # per-annotation free-text note cap
+
+# --- Weekly off-box backup of the annotation store ---
+# data/labels.duckdb is the only state here a re-ingest cannot rebuild: frames,
+# detections and overlays all come back, annotator hours do not. The job zips the
+# store plus a CSV export, rotates locally, and (if COWNTING_DISCORD_WEBHOOK is set
+# in the environment — never in this file) posts the zip to a Discord channel.
+# Opt in deliberately: the first run has no watermark and so backs up and posts
+# EVERYTHING, and the zip carries annotator usernames and per-annotator timings, so
+# the channel it lands in has to be one chosen for that.
+backup:
+  enabled: false
+  # A thread ticks every 15 min and asks "has this long passed since the last good
+  # run?", so redeploys don't reset the clock the way a sleep(7 days) would.
+  every_days: 7
+  keep: 8                          # zips kept in <backups_dir>/labels/, pruned by name
+  # Discord rejects (rather than truncates) an upload over ~10 MiB, so past this
+  # budget the run degrades: full zip -> CSV-only zip -> a message naming the file it
+  # kept on disk. All three still count as a run.
+  max_upload_bytes: 9500000
+
 finetune:                          # `cownting train` + `eval-detect`
   dataset_dir: data/finetune/dataset
   runs_dir: runs/finetune
@@ -75,3 +127,9 @@ paths:
   count_areas: data/count_areas.json  # per-camera count-area polygons; drawn via the camera gear icon
   orthophoto: null                    # path to a top-down site image; backdrop for the count-area map
   panels: data/panels.json            # per-camera + ortho panel footprints (shelter test)
+  # Annotations live in their OWN DuckDB file. A re-ingest purges that day's
+  # detections from the main DB and deleting a day moves them to the archive, so
+  # labels kept in there would be destroyed by routine data management. Nothing in
+  # the ingest path ever opens this file.
+  labels_db_path: data/labels.duckdb
+  backups_dir: data/backups           # weekly label zips land in <backups_dir>/labels/

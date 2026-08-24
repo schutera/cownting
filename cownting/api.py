@@ -4,8 +4,11 @@ Serves the React frontend in production (mounts frontend/dist at /).
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
+import re
 import secrets
 import shutil
 import uuid
@@ -19,9 +22,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
+from . import __version__
 from . import auth as auth_mod
 from . import db
 from . import features as features_mod
+from . import labeling
+from . import labels_backup
+from . import labels_db
 from . import uploads as uploads_mod
 from .config import Config
 from .ingest import capture_time
@@ -62,6 +69,96 @@ class UpdateUserReq(BaseModel):
     role: str | None = None
 
 
+class InstanceAnchor(BaseModel):
+    # The provenance the queue served with an item, echoed back verbatim on
+    # submit/skip. The server re-hashes it (labeling.verify_anchor) — the
+    # instance key IS the hash of this, so a stored row whose key and anchor
+    # disagree is unrepresentable. Field names frozen in M3 §4.1.
+    dataset_id: str | None = None
+    camera_id: str
+    frame_file: str          # basename, "00000450.jpg"
+    bbox: list[float]        # [x1, y1, x2, y2] full-frame px
+    ordinal: int = 0
+    ts: str | None = None
+    frame_sig: str | None = None
+
+
+class LabelSubmitReq(BaseModel):
+    instance_key: str
+    anchor: InstanceAnchor
+    answers: dict[str, str | list[str]]   # group_key -> class_key(s)
+    taxonomy_revision: int
+    serve_event_id: int | None = None
+    session_id: str | None = None
+    client_elapsed_ms: int | None = None
+    input_mode: str | None = None         # 'key' | 'mouse'
+    note: str | None = None
+
+
+class LabelSkipReq(BaseModel):
+    instance_key: str
+    anchor: InstanceAnchor
+    reason: str                            # labels_db.SKIP_REASONS
+    serve_event_id: int | None = None
+    session_id: str | None = None
+    client_elapsed_ms: int | None = None
+    note: str | None = None
+
+
+class LabelUndoReq(BaseModel):
+    instance_key: str
+
+
+class LabelEventReq(BaseModel):
+    # Client-side effort telemetry: session boundaries + info_opened. The
+    # server refuses the kinds it writes itself (see the route).
+    session_id: str
+    kind: str
+    instance_key: str | None = None
+    class_key: str | None = None
+
+
+class LabelGroupReq(BaseModel):
+    group_key: str
+    name: str
+    description: str | None = None
+    multi_select: bool = False
+    required: bool = True
+
+
+class LabelGroupPatchReq(BaseModel):
+    # All optional: send only the field(s) to change. `active` False archives,
+    # True restores — there is no DELETE anywhere in the label feature.
+    name: str | None = None
+    description: str | None = None
+    multi_select: bool | None = None
+    required: bool | None = None
+    active: bool | None = None
+
+
+class LabelClassReq(BaseModel):
+    name: str
+    description: str        # required server-side: an undefined option is the
+                            # largest source of annotator disagreement (§5.4)
+    class_key: str | None = None
+    is_escape: bool = False
+
+
+class LabelClassPatchReq(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    is_escape: bool | None = None
+    active: bool | None = None
+
+
+class LabelMoveReq(BaseModel):
+    dir: str                # "up" | "down"
+
+
+class LabelBackupRunReq(BaseModel):
+    force: bool = False
+
+
 def _session_secret(config: Config) -> str:
     """The signing key for the session cookie. `COWNTING_SECRET` wins; otherwise a
     key is generated once and persisted next to the DB so restarts don't log
@@ -93,6 +190,35 @@ def _safe_path_id(value: str) -> bool:
     so any id that becomes an rmtree/mkdir path segment is checked before use."""
     return bool(value) and value not in (".", "..") \
         and "/" not in value and "\\" not in value and ".." not in value
+
+
+# A frame filename as ingest writes it: digits + ".jpg", nothing else. This is a
+# TOTAL whitelist, deliberately narrower than "a safe filename" — the label-crop
+# endpoint rebuilds an on-disk path from it (M3 §4.5), and the frame name is one
+# of the very few places in this codebase where a total whitelist is available.
+# Never loosen it to accept a general filename; treat any change here as a
+# security review, not a feature.
+_FRAME_FILE_RE = re.compile(r"^[0-9]{1,12}\.jpg$")
+
+
+def _safe_frame_file(value: str) -> bool:
+    return bool(_FRAME_FILE_RE.fullmatch(value or ""))
+
+
+def _clip(value: str | None, limit: int) -> str | None:
+    """Length-cap a client-supplied string at the API boundary (M3 §4.1).
+    `require_labeler` admits every known role, so a viewer session can write
+    label rows; unbounded strings would let a scripted client bloat the store
+    that later gets zipped under Discord's ~10 MB cap."""
+    return value if value is None else value[:limit]
+
+
+def _dict_rows(cur) -> list[dict]:
+    """DuckDB cursor -> list of dicts, WITHOUT pandas: `.df()` would coerce the
+    label store's NULL columns (dataset_id, skip_reason, median_ms) to NaN,
+    which is not JSON and does not compare equal to None downstream."""
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 def _img_size(path: str) -> tuple[int, int]:
@@ -153,6 +279,37 @@ def create_app(config: Config) -> FastAPI:
         if not auth_mod.can_manage_data(effective_role(request)):
             raise HTTPException(403, "poweruser or admin only")
 
+    def require_labeler(request: Request):
+        """Labeling is the one mutation a plain `user` may perform — that is the
+        entire point of the Label page — so this admits every KNOWN role. It is a
+        real gate, not a bypass: it re-derives effective_role(), so an admin
+        previewing a role is treated as that role, and it 403s an unknown or absent
+        one. A no-op when auth is disabled, like the other two."""
+        if not auth_on:
+            return
+        if effective_role(request) not in auth_mod.ROLES:
+            raise HTTPException(403, "login required to label")
+
+    def current_user(request: Request) -> dict:
+        """The REAL identity behind the session, for stamping label writes.
+
+        Identity is split from gating on purpose (M3 §3.3): the `annotator`
+        column must always carry the real account — if it followed an admin's
+        act-as preview, their labels would masquerade as another annotator and
+        poison agreement — while the gates always use effective_role(), so the
+        preview genuinely enforces. `acting_role` is non-None exactly when a
+        preview is active, which the writes stamp as `acting_preview` so
+        reporting can exclude those rows explicitly. Touches request.session
+        only behind auth_on: SessionMiddleware is mounted only when auth is on,
+        and tests run with AuthCfg(enabled=False)."""
+        if not auth_on:
+            return {"username": "local", "role": "admin", "acting_role": None}
+        user = request.session.get("user") or {}
+        acting = request.session.get("acting_role")
+        acting_role = acting if (acting in auth_mod.ROLES and user.get("role") == "admin") else None
+        return {"username": user.get("username"), "role": user.get("role"),
+                "acting_role": acting_role}
+
     app = FastAPI(title="Cownting API", dependencies=[Depends(require_login)])
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
     # SessionMiddleware must be added AFTER CORS here so it ends up the inner
@@ -177,6 +334,18 @@ def create_app(config: Config) -> FastAPI:
     # progress bar survives a restart (interrupted jobs are marked failed, not
     # left pretending to run). Also fixes the job store's on-disk location.
     uploads_mod.recover_jobs(config)
+    # The label store lives in its OWN DuckDB file (labels must survive the
+    # purge/archive the main DB routinely undergoes). Schema-init + seed it here
+    # the same way init_db heals the main DB — on its own short-lived connection
+    # (labels_db.init_labels_db via ensure_labels_db), never by ATTACHing first:
+    # ATTACH on a missing path silently creates an empty database.
+    labeling.ensure_labels_db(config)
+    # The weekly label-store backup ticker (M3 §6.1) — in-process so its files
+    # land owned by uid 10001 by construction and zero cross-process DuckDB lock
+    # contention. Started unconditionally: `backup.enabled` is read on every
+    # tick, and its 120 s first tick outlives any test run, so the ~20 apps the
+    # test suite builds never fire a backup or hold a file handle.
+    labels_backup.start_scheduler(config)
     if auth_on:
         # Users live in the same DuckDB; guarantee one admin so a fresh install
         # is reachable (bootstrap creds via COWNTING_ADMIN_* env, else admin/admin).
@@ -1080,6 +1249,556 @@ def create_app(config: Config) -> FastAPI:
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="cownting_export.csv"'},
         )
+
+    # ------------------------------------------------------------------ label
+    # The in-app annotation tool (docs/roadmap/M3_labeling.md). Handlers stay
+    # thin: the store, the key arithmetic and the queue SQL live in labels_db /
+    # labeling; this section owns HTTP shapes, gates and boundary validation.
+    # Registered BEFORE the static-frontend block below — the SPA catch-all
+    # shadows anything added after it.
+
+    def _labels_con():
+        # A fresh read-write connection to the LABEL store (data/labels.duckdb),
+        # one per request: submit_annotation runs its own explicit transaction
+        # and must never nest inside another. Read-write even for readers —
+        # DuckDB refuses a second connection to one file with a different mode
+        # in one process (the same trap con() documents for the main DB).
+        return labeling.labels_connect(config)
+
+    def _valid_anchor(a: InstanceAnchor) -> None:
+        """The anchor's ids become provenance and (rebuilt server-side) a stored
+        frame_path, and the client can compute a valid hash over ANY strings —
+        verify_anchor proves consistency, not cleanliness — so the same
+        whitelists the crop endpoint applies run here first."""
+        if not uploads_mod.valid_camera_id(a.camera_id):
+            raise HTTPException(400, f"invalid camera name {a.camera_id!r}")
+        if not _safe_frame_file(a.frame_file):
+            raise HTTPException(400, f"invalid frame file {a.frame_file!r}")
+        if a.dataset_id is not None and not _safe_path_id(a.dataset_id):
+            raise HTTPException(400, f"invalid dataset id {a.dataset_id!r}")
+
+    def _anchor_ts(a: InstanceAnchor) -> datetime | None:
+        if not a.ts:
+            return None
+        try:
+            return datetime.fromisoformat(a.ts)
+        except ValueError:
+            raise HTTPException(400, "anchor.ts must be an ISO 8601 timestamp")
+
+    def _anchor_provenance(a: InstanceAnchor, ts: datetime | None) -> dict:
+        """The denormalised columns that keep a label self-describing after its
+        detection row is purged/archived/clipped (M3 §3.1). frame_path is
+        rebuilt from config + the whitelisted ids — the client never supplies a
+        path. det_score is absent on purpose: the key does not hash it, so the
+        anchor does not carry it."""
+        return {
+            "dataset_id": a.dataset_id,
+            "camera_id": a.camera_id,
+            "frame_path": str(labeling.frame_path_for(config, a.dataset_id,
+                                                      a.camera_id, a.frame_file)),
+            "frame_basename": a.frame_file,
+            "frame_sig": _clip(a.frame_sig, 128),
+            "ts": ts,
+            "bbox_x1": float(a.bbox[0]), "bbox_y1": float(a.bbox[1]),
+            "bbox_x2": float(a.bbox[2]), "bbox_y2": float(a.bbox[3]),
+            "ordinal": int(a.ordinal),
+        }
+
+    def _label_telemetry(request: Request, user: dict, *, revision: int,
+                         session_id: str | None, serve_event_id: int | None,
+                         client_elapsed_ms: int | None, input_mode: str | None = None,
+                         skip_reason: str | None = None, note: str | None = None) -> dict:
+        """Everything a submission reports about the act of answering. The role
+        columns record the acting-preview split (§3.3) and `auth_disabled`, so
+        reporting can exclude both populations from the headline agreement
+        numbers instead of discovering them later."""
+        return {
+            "skip_reason": skip_reason,
+            "flag_note": _clip(note, config.annotation.max_note_chars),
+            "session_id": _clip(session_id, 64),
+            "serve_event_id": serve_event_id,
+            "client_elapsed_ms": client_elapsed_ms,
+            "input_mode": input_mode if input_mode in ("key", "mouse") else None,
+            "annotator_role": user["acting_role"] or user["role"],
+            "annotator_real_role": user["role"],
+            "acting_preview": user["acting_role"] is not None,
+            "auth_disabled": not auth_on,
+            "app_version": __version__,
+            "taxonomy_revision": revision,
+            "client_info": _clip(request.headers.get("user-agent"), 200),
+        }
+
+    def _annotation_version(lc, annotation_id: int) -> int:
+        # The one value the response needs that submit_annotation computes but
+        # does not return (LabelWriteResult carries `version` for the client's
+        # relabel indicator).
+        row = lc.execute("SELECT version FROM annotations WHERE annotation_id = ?",
+                         [annotation_id]).fetchone()
+        return int(row[0]) if row else 1
+
+    @app.get("/api/label/taxonomy")
+    def label_taxonomy():
+        """The questions, their options, and the current revision — the one the
+        client must echo on submit. Archived rows ARE included (`active` False):
+        the Label page filters to active client-side (labelKeys does), while the
+        poweruser editor needs archived rows on first load or restoring one
+        would be impossible before the first mutation."""
+        lc = _labels_con()
+        try:
+            return labels_db.taxonomy(lc, include_archived=True)
+        finally:
+            lc.close()
+
+    @app.get("/api/label/queue")
+    def label_queue(request: Request, limit: int | None = None,
+                    exclude: str | None = None, camera: str | None = None,
+                    day: str | None = None, dataset: str | None = None,
+                    mine: str = "todo", order: str = "fresh"):
+        """One batch of instances to label (M3 §4.2). No leasing, no cursor:
+        `exclude` is the comma-joined keys already in the client's buffer, and
+        the queue is self-consuming, so re-fetching always advances. `dataset`
+        deliberately does NOT go through resolve_ds — labeling is cross-day by
+        design, and the response echoes the applied scope in `filters` as the
+        defence against the frontend's withDs() stamping the selected day on."""
+        if day is not None:
+            try:
+                date.fromisoformat(day)
+            except ValueError:
+                raise HTTPException(400, "day must be an ISO date 'YYYY-MM-DD'")
+        keys = [k for k in (exclude or "").split(",") if k]
+        user = current_user(request)
+        c = con()
+        try:
+            return labeling.queue(c, config, annotator=user["username"] or "local",
+                                  limit=limit, exclude=keys, camera=camera,
+                                  day=day, dataset=dataset, mine=mine, order=order)
+        finally:
+            c.close()
+
+    @app.get("/api/label/progress")
+    def label_progress(request: Request, dataset: str | None = None,
+                       camera: str | None = None):
+        """Pool + per-annotator effort for the progress panel. The pool numbers
+        need the main DB (labeling.progress); effort is the label store's
+        SQL_EFFORT_BY_ANNOTATOR — this route merges the two rather than either
+        module growing the other's SQL. `auth_disabled` rides along because with
+        auth off every row is annotator='local' and agreement is undefined by
+        construction; the page says so instead of showing a meaningless kappa."""
+        user = current_user(request)
+        annotator = user["username"] or "local"
+        c = con()
+        try:
+            pool = labeling.progress(c, config, annotator=annotator,
+                                     dataset=dataset, camera=camera)
+        finally:
+            c.close()
+        lc = _labels_con()
+        try:
+            effort = _dict_rows(lc.execute(labels_db.SQL_EFFORT_BY_ANNOTATOR))
+        finally:
+            lc.close()
+        me = next((r for r in effort if r["annotator"] == annotator), {})
+        return {
+            # The LabelStats shape types.ts declares...
+            "pool_total": pool.get("pool_total", 0),
+            "pool_labeled": pool.get("labeled", 0),
+            "pool_covered": pool.get("at_target", 0),
+            "remaining": pool.get("remaining", 0),
+            "my_labeled": int(me.get("labeled") or 0),
+            "my_skipped": int(me.get("skipped") or 0),
+            "my_median_ms": int(me["median_ms"]) if me.get("median_ms") is not None else None,
+            "annotators": len(effort),
+            "auth_disabled": not auth_on,
+            "filters": {"dataset": dataset, "camera": camera},
+            # ...plus the rest of the scan, which costs nothing extra to return.
+            "mine_remaining": pool.get("mine_remaining", 0),
+            "retired": pool.get("retired", 0),
+            "annotations_labeled": pool.get("annotations_labeled", 0),
+            "targets_total": pool.get("targets_total", 0),
+            "policy": pool.get("policy", {}),
+        }
+
+    @app.get("/api/label/mine")
+    def label_mine(request: Request, limit: int = 50, before: str | None = None):
+        """The caller's own CURRENT answers, newest first, for the review strip.
+        Pagination is a `submitted_at` cursor (`before` = the previous page's
+        `next_before`), never an offset: the list only ever changes at the head.
+
+        The two SELECTs below are a noted exception to "api.py contains no SQL":
+        the M3 ownership table gives this read no owning function, so it reads
+        the views labels_db declares (v_current_annotations, annotation_choices)
+        rather than inventing an unlisted labels_db export. Move it there when
+        the spec grows one."""
+        n = max(1, min(int(limit), 200))
+        cut = None
+        if before:
+            try:
+                cut = datetime.fromisoformat(before)
+            except ValueError:
+                raise HTTPException(400, "before must be an ISO 8601 timestamp")
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            where = "WHERE annotator = ?"
+            params: list = [user["username"] or "local"]
+            if cut is not None:
+                where += " AND submitted_at < ?"
+                params.append(cut)
+            rows = _dict_rows(lc.execute(
+                "SELECT annotation_id, instance_key, version, outcome, skip_reason, "
+                "submitted_at, dataset_id, camera_id, frame_basename, "
+                "bbox_x1, bbox_y1, bbox_x2, bbox_y2 "
+                f"FROM v_current_annotations {where} "
+                "ORDER BY submitted_at DESC, annotation_id DESC LIMIT ?",
+                params + [n],
+            ))
+            choices: dict[int, list[dict]] = {}
+            ids = [r["annotation_id"] for r in rows]
+            if ids:
+                for ch in _dict_rows(lc.execute(
+                    "SELECT annotation_id, group_key, class_key, class_name "
+                    "FROM annotation_choices "
+                    f"WHERE annotation_id IN ({', '.join('?' * len(ids))}) "
+                    "ORDER BY annotation_id, ordinal",
+                    ids,
+                )):
+                    choices.setdefault(int(ch["annotation_id"]), []).append({
+                        "group_key": ch["group_key"], "class_key": ch["class_key"],
+                        "class_name": ch["class_name"],
+                    })
+        finally:
+            lc.close()
+        cfg = config.annotation
+        items = []
+        for r in rows:
+            bbox = [float(r[k] if r[k] is not None else 0.0)
+                    for k in ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2")]
+            items.append({
+                "annotation_id": int(r["annotation_id"]),
+                "instance_key": r["instance_key"],
+                "version": int(r["version"]),
+                "outcome": r["outcome"],
+                "skip_reason": r["skip_reason"],
+                "submitted_at": r["submitted_at"].isoformat()
+                                if r["submitted_at"] is not None else None,
+                "dataset_id": r["dataset_id"],
+                "camera_id": r["camera_id"],
+                "frame_file": r["frame_basename"],
+                # Server-built, like the queue's: a client-built crop URL would
+                # route through withDs() and 404 items from another day.
+                "crop_url": labeling.crop_url(
+                    camera_id=r["camera_id"] or "", frame_file=r["frame_basename"] or "",
+                    bbox=bbox, dataset_id=r["dataset_id"],
+                    pad=cfg.crop_pad, max_width=cfg.crop_max_width),
+                "choices": choices.get(int(r["annotation_id"]), []),
+            })
+        next_before = items[-1]["submitted_at"] if len(items) == n and items else None
+        return {"items": items, "next_before": next_before}
+
+    @app.get("/api/img/label-crop/{camera}/{frame_file}")
+    def img_label_crop(camera: str, frame_file: str, request: Request,
+                       x1: float, y1: float, x2: float, y2: float,
+                       pad: float | None = None, w: int | None = None,
+                       dataset: str | None = None):
+        """The padded square crop a queue item points at — ringless (the client
+        draws the ring as SVG from the crop-local `ring` the queue supplied) and
+        banner-masked server-side (the burned-in Brinno clock IS the sun-exposure
+        answer). NOT an extension of /api/img/frame's `kind=`: that endpoint
+        silently falls back to the raw frame on an unknown kind, and a typo here
+        would show an uncropped, unringed image the annotator would confidently
+        mislabel (M3 §4.5).
+
+        Path safety is three whitelists + a resolve-under-artifacts_dir check, a
+        deliberate departure from "the path always comes from the DB": a lookup
+        here is a full frames scan per image an annotator sees, and the frame
+        filename admits a TOTAL whitelist (_safe_frame_file — never loosen it)."""
+        if not uploads_mod.valid_camera_id(camera):
+            raise HTTPException(400, f"invalid camera name {camera!r}")
+        if not _safe_frame_file(frame_file):
+            raise HTTPException(400, f"invalid frame file {frame_file!r}")
+        if dataset is not None and not _safe_path_id(dataset):
+            raise HTTPException(400, f"invalid dataset id {dataset!r}")
+        bbox = [x1, y1, x2, y2]
+        if not all(math.isfinite(v) for v in bbox):
+            raise HTTPException(400, "bbox coordinates must be finite")
+        cfg = config.annotation
+        pad_v = cfg.crop_pad if pad is None else min(max(float(pad), 0.0), 2.0)
+        w_v = cfg.crop_max_width if w is None else max(16, min(int(w), 4096))
+        src, out, _ring = labeling.crop_geometry(bbox, pad_v, w_v)
+        if src[2] - src[0] > 8192:
+            # The square's side is client-controlled through the bbox; without a
+            # ceiling the renderer would allocate a gigapixel canvas. No real
+            # frame is anywhere near this large.
+            raise HTTPException(400, "crop region too large")
+
+        p = labeling.frame_path_for(config, dataset, camera, frame_file)
+        root = Path(config.paths.artifacts_dir).resolve()
+        candidate = p.resolve()
+        if candidate != root and root not in candidate.parents:
+            raise HTTPException(400, "invalid path")
+        try:
+            st = candidate.stat()
+        except OSError:
+            # Routine, not exceptional: a re-ingest rmtrees the frames out from
+            # under a queue the client is still holding.
+            raise HTTPException(404, "frame not found")
+
+        # A computed Response gets no validators of its own (unlike every other
+        # image route's FileResponse), so paging back and forth would re-decode a
+        # full-res JPEG per keystroke: strong ETag + 304 fast path, computed
+        # BEFORE any decode. `private` is load-bearing — the image is
+        # session-gated and must never be stored by Caddy or a shared proxy. Not
+        # `immutable`: a re-ingest rewrites the JPEG at the same path, and
+        # mtime_ns here is what invalidates it.
+        etag = '"' + hashlib.sha256(repr(
+            (str(candidate), st.st_mtime_ns, st.st_size, tuple(bbox), pad_v, out,
+             labeling.RENDER_VERSION)
+        ).encode()).hexdigest() + '"'
+        headers = {"ETag": etag, "Cache-Control": "private, max-age=3600"}
+        if etag in (request.headers.get("if-none-match") or ""):
+            return Response(status_code=304, headers=headers)
+
+        jpeg, sig = labeling.render_crop(candidate, bbox, pad=pad_v,
+                                         max_width=w_v, cfg=cfg)
+        if not jpeg:
+            # Missing/torn JPEG and a mostly-banner crop come back the same way
+            # (§5.6's single terminal state): 404, never a 500, never a blank tile.
+            raise HTTPException(404, "crop unavailable")
+        if sig:
+            # The fingerprint from the bytes just read, so the submit body can
+            # carry it without a second pass over the file.
+            headers["X-Frame-Sig"] = sig
+        return Response(content=jpeg, media_type="image/jpeg", headers=headers)
+
+    @app.post("/api/label/submit", dependencies=[Depends(require_labeler)])
+    def label_submit(body: LabelSubmitReq, request: Request):
+        """Record an answer. NEVER opens the main DB (M3 §4.3): the client echoes
+        the anchor the queue served, verify_anchor re-hashes it in Python, and a
+        mismatch is a 400 — no contention with localize_worker on the hottest
+        mutation, and no dependency on a detection row that may be purged.
+
+        Validation is against the taxonomy the annotator was SERVED: class keys
+        are checked against ever-existing keys (archiving mid-session must not
+        400 an answer already on screen), and any revision skew is a 409
+        `taxonomy_stale` the client recovers from with one refetch — never a
+        permanent 400 loop."""
+        a = body.anchor
+        _valid_anchor(a)
+        if not labeling.verify_anchor(body.instance_key, a):
+            raise HTTPException(400, "anchor does not hash to instance_key")
+        ts = _anchor_ts(a)
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            current = labels_db.taxonomy_revision(lc)
+            if body.taxonomy_revision != current:
+                raise HTTPException(409, detail={
+                    "code": "taxonomy_stale", "revision": current,
+                    "message": "the questions changed while you were answering — "
+                               "refresh the taxonomy and resubmit",
+                })
+            try:
+                choices = labels_db.resolve_choices(lc, body.answers)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            if not choices:
+                raise HTTPException(400, "no answers submitted")
+            try:
+                annotation_id = labels_db.submit_annotation(
+                    lc,
+                    instance_key=body.instance_key,
+                    annotator=user["username"] or "local",
+                    outcome="labeled",
+                    choices=choices,
+                    provenance=_anchor_provenance(a, ts),
+                    telemetry=_label_telemetry(
+                        request, user, revision=body.taxonomy_revision,
+                        session_id=body.session_id,
+                        serve_event_id=body.serve_event_id,
+                        client_elapsed_ms=body.client_elapsed_ms,
+                        input_mode=body.input_mode, note=body.note),
+                )
+            except ValueError as e:
+                # The lost UNIQUE (instance_key, annotator, version) race — a
+                # concurrent submit won; the client re-fetches and resubmits.
+                raise HTTPException(409, str(e))
+            version = _annotation_version(lc, annotation_id)
+        finally:
+            lc.close()
+        return {"ok": True, "annotation_id": annotation_id, "version": version}
+
+    @app.post("/api/label/skip", dependencies=[Depends(require_labeler)])
+    def label_skip(body: LabelSkipReq, request: Request):
+        """A skip is an annotation with outcome='skipped', not an error and not a
+        400 (M3 §3.3): it carries the same provenance and uniqueness rule, and
+        `multiple_cows` in particular is a direct signal the detector merged two
+        animals. Counted separately from coverage, so the instance still serves
+        to the next annotator until `skip_retire` distinct declines. No revision
+        check: a skip names no classes, so the frozen body carries no revision —
+        the current one is stamped as telemetry."""
+        a = body.anchor
+        _valid_anchor(a)
+        if not labeling.verify_anchor(body.instance_key, a):
+            raise HTTPException(400, "anchor does not hash to instance_key")
+        if body.reason not in labels_db.SKIP_REASONS:
+            raise HTTPException(400, f"reason must be one of {list(labels_db.SKIP_REASONS)}")
+        ts = _anchor_ts(a)
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            try:
+                annotation_id = labels_db.submit_annotation(
+                    lc,
+                    instance_key=body.instance_key,
+                    annotator=user["username"] or "local",
+                    outcome="skipped",
+                    provenance=_anchor_provenance(a, ts),
+                    telemetry=_label_telemetry(
+                        request, user,
+                        revision=labels_db.taxonomy_revision(lc),
+                        session_id=body.session_id,
+                        serve_event_id=body.serve_event_id,
+                        client_elapsed_ms=body.client_elapsed_ms,
+                        skip_reason=body.reason, note=body.note),
+                )
+            except ValueError as e:
+                raise HTTPException(409, str(e))
+            version = _annotation_version(lc, annotation_id)
+        finally:
+            lc.close()
+        return {"ok": True, "annotation_id": annotation_id, "version": version}
+
+    @app.post("/api/label/undo", dependencies=[Depends(require_labeler)])
+    def label_undo(body: LabelUndoReq, request: Request):
+        """Supersede the caller's OWN current answer on one instance. Scoped to
+        the real session user inside undo_last, so B can never undo A's row, and
+        never keyed by annotation_id — a dense sequence any client could guess.
+        Nothing is deleted: the row stays with outcome='undone' (§3.3). A no-op
+        (annotation_id null) when there is nothing to undo."""
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            annotation_id = labels_db.undo_last(
+                lc, user["username"] or "local", _clip(body.instance_key, 64) or "")
+        finally:
+            lc.close()
+        return {"ok": True, "instance_key": body.instance_key,
+                "annotation_id": annotation_id}
+
+    # The event kinds a CLIENT may post: session boundaries + the info-icon
+    # signal (+ relabel, the client-side "re-answering after undo" marker).
+    # 'served' is minted only by the queue and 'submitted'/'skipped'/'undo' only
+    # inside the write transactions — accepting them here would let a scripted
+    # client forge the served clock that makes time_on_task_ms non-forgeable,
+    # and double-log the rest.
+    _CLIENT_EVENT_KINDS = frozenset({"session_start", "session_end",
+                                     "info_opened", "relabel"})
+
+    @app.post("/api/label/events", dependencies=[Depends(require_labeler)])
+    def label_event(body: LabelEventReq, request: Request):
+        """Effort telemetry from the client. `info_opened` carries the class_key
+        whose description was read — the cheapest available signal that a class
+        definition is ambiguous, and what makes SQL_INFO_ICON_PRESSURE return
+        anything at all."""
+        if body.kind not in _CLIENT_EVENT_KINDS:
+            raise HTTPException(400, f"kind must be one of {sorted(_CLIENT_EVENT_KINDS)}")
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            labels_db.log_event(
+                lc, kind=body.kind, session_id=_clip(body.session_id, 64),
+                annotator=user["username"] or "local",
+                instance_key=_clip(body.instance_key, 64),
+                class_key=_clip(body.class_key, 128))
+        finally:
+            lc.close()
+        return {"ok": True}
+
+    def _taxonomy_write(request: Request, fn, *args, **kwargs):
+        """Shared shell for the six taxonomy mutations: real-actor stamping (the
+        audit trail records who, by their account, with the effective role that
+        authorised it), the ValueError -> 400 mapping, and the whole-taxonomy
+        response the editor replaces its state with (M3 §5.7)."""
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            try:
+                return fn(lc, *args,
+                          actor=user["username"] or "local",
+                          actor_role=user["acting_role"] or user["role"],
+                          **kwargs)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+        finally:
+            lc.close()
+
+    @app.post("/api/label/groups", dependencies=[Depends(require_poweruser)])
+    def label_create_group(body: LabelGroupReq, request: Request):
+        """Add a question."""
+        return _taxonomy_write(
+            request, labels_db.create_group,
+            group_key=_clip(body.group_key, 64) or "",
+            name=_clip(body.name, 200) or "",
+            description=_clip(body.description, 4000),
+            multi_select=body.multi_select, required=body.required)
+
+    @app.patch("/api/label/groups/{group_key}", dependencies=[Depends(require_poweruser)])
+    def label_update_group(group_key: str, body: LabelGroupPatchReq, request: Request):
+        """Edit a question; `{"active": false}` archives, `{"active": true}`
+        restores. There are no DELETE routes anywhere in this feature — a hard
+        delete would orphan every stored answer."""
+        return _taxonomy_write(
+            request, labels_db.update_group, group_key,
+            name=_clip(body.name, 200), description=_clip(body.description, 4000),
+            multi_select=body.multi_select, required=body.required,
+            active=body.active)
+
+    @app.post("/api/label/groups/{group_key}/move", dependencies=[Depends(require_poweruser)])
+    def label_move_group(group_key: str, body: LabelMoveReq, request: Request):
+        """Reorder a question one slot up/down. sort_order is ALSO the hotkey
+        row index, so the editor shows a live key preview beside it."""
+        return _taxonomy_write(request, labels_db.move_group, group_key, body.dir)
+
+    @app.post("/api/label/groups/{group_key}/classes", dependencies=[Depends(require_poweruser)])
+    def label_create_class(group_key: str, body: LabelClassReq, request: Request):
+        """Add an option to a question (description required — enforced in
+        labels_db, not only by the editor's disabled button)."""
+        return _taxonomy_write(
+            request, labels_db.create_class, group_key,
+            name=_clip(body.name, 200) or "",
+            description=_clip(body.description, 4000) or "",
+            class_key=_clip(body.class_key, 128),
+            is_escape=body.is_escape)
+
+    @app.patch("/api/label/classes/{class_key}", dependencies=[Depends(require_poweruser)])
+    def label_update_class(class_key: str, body: LabelClassPatchReq, request: Request):
+        """Edit an option; `active` archives/restores. Safe by construction —
+        answers snapshot class_name at label time."""
+        return _taxonomy_write(
+            request, labels_db.update_class, class_key,
+            name=_clip(body.name, 200), description=_clip(body.description, 4000),
+            is_escape=body.is_escape, active=body.active)
+
+    @app.post("/api/label/classes/{class_key}/move", dependencies=[Depends(require_poweruser)])
+    def label_move_class(class_key: str, body: LabelMoveReq, request: Request):
+        """Reorder an option within its group."""
+        return _taxonomy_write(request, labels_db.move_class, class_key, body.dir)
+
+    @app.get("/api/labels/backup/status", dependencies=[Depends(require_poweruser)])
+    def labels_backup_status():
+        """Scheduler + recent-runs snapshot for the weekly label-store backup.
+        Reports WHETHER a webhook is configured, never the URL; degrades to an
+        `error` field rather than 500ing when the store is held elsewhere."""
+        return labels_backup.status(config)
+
+    @app.post("/api/labels/backup/run", dependencies=[Depends(require_poweruser)])
+    def labels_backup_run(body: LabelBackupRunReq | None = None):
+        """Trigger a backup inside the process that already holds the store —
+        the contention-free path §6.2 designs for, so an operator without shell
+        access never converts a transient lock into a disabled weekly job.
+        run_backup never raises; contention comes back status='skipped'."""
+        return labels_backup.run_backup(config, trigger="api",
+                                        force=bool(body and body.force))
 
     # ------------------------------------------------------------------ static frontend (prod)
     dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
