@@ -269,7 +269,7 @@ def test_schema_is_idempotent_and_seeded():
         n_groups = con.execute("SELECT count(*) FROM label_groups").fetchone()[0]
         n_classes = con.execute("SELECT count(*) FROM label_classes").fetchone()[0]
         check("three boots do not duplicate the seed (2 groups)", n_groups == 2, str(n_groups))
-        check("three boots do not duplicate the seed (9 classes)", n_classes == 9, str(n_classes))
+        check("three boots do not duplicate the seed (10 classes)", n_classes == 10, str(n_classes))
         rev = labels_db.taxonomy_revision(con)
         check("re-boots do not bump the revision (only the first seed did)",
               rev == 1, str(rev))

@@ -797,19 +797,37 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 ),
             },
             {
+                "class_key": "behaviour.not_visible",
+                "name": "Not visible",
+                "icon": "eye-off",
+                "sort_order": 45,
+                "is_escape": False,
+                "description": (
+                    "The animal is in the frame — that is why it was detected — but "
+                    "you cannot see enough BODY to read its posture: it is cut off by "
+                    "the frame edge, hidden behind a panel leg or another animal, or "
+                    "the crop is too dark, too small or too motion-blurred to resolve "
+                    "a leg line. This is for a physical or optical obstruction. If you "
+                    "can see the animal fine but Feeding vs Head probing is a coin "
+                    "flip, that is Cannot tell, not this."
+                ),
+            },
+            {
                 "class_key": "behaviour.cannot_tell",
                 "name": "Cannot tell",
                 "icon": "question",
                 "sort_order": 50,
                 "is_escape": True,
                 "description": (
-                    "The pose is not decidable from this crop: occluded by another "
-                    "animal or a panel, cut off at the frame edge, motion-blurred, too "
-                    "small or too dark to resolve a leg line, or facing the camera "
-                    "head-on so the head/body geometry is foreshortened away. Also use "
-                    "it when the animal is perfectly visible but Feeding vs Head "
-                    "probing is a coin flip. Choose this rather than guessing — the "
-                    "Cannot tell rate per camera is one of the numbers we report."
+                    "You can see the animal, but the pose is not decidable: it faces "
+                    "the camera head-on so the head/body geometry is foreshortened "
+                    "away, the leg line is visible but reads equally as folded or "
+                    "standing, or Feeding vs Head probing is a coin flip because you "
+                    "cannot resolve what the muzzle is at. This is a CORRECT answer, "
+                    "not a failure — never guess to avoid it. If the body is obscured "
+                    "rather than ambiguous, that is Not visible. Choose this rather "
+                    "than guessing — the Cannot tell rate per camera is one of the "
+                    "numbers we report."
                 ),
             },
         ),

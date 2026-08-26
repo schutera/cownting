@@ -14,6 +14,7 @@ import shutil
 import uuid
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -124,6 +125,7 @@ class LabelEventReq(BaseModel):
     kind: str
     instance_key: str | None = None
     class_key: str | None = None
+    detail: dict[str, Any] | None = None
 
 
 class LabelGroupReq(BaseModel):
@@ -1773,7 +1775,9 @@ def create_app(config: Config) -> FastAPI:
                 lc, kind=body.kind, session_id=_clip(body.session_id, 64),
                 annotator=user["username"] or "local",
                 instance_key=_clip(body.instance_key, 64),
-                class_key=_clip(body.class_key, 128))
+                class_key=_clip(body.class_key, 128),
+                detail=_clip(json.dumps(body.detail), 2000)
+                if body.detail is not None else None)
         finally:
             lc.close()
         return {"ok": True}

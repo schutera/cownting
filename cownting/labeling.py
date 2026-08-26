@@ -366,11 +366,11 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
     skip as coverage would retire exactly the ambiguous instances where inter-rater
     variability is most informative.
 
-    **Pagination is `limit` + `exclude`, never an offset or a cursor.** The ordering
-    key starts with `n_labeled`, which other annotators change while you work, so
-    any positional cursor would skip or repeat items. The queue is self-consuming
-    instead: whatever you label or skip drops out of the anti-join, so re-fetching
-    always advances.
+    **Pagination is `limit` + `exclude`, never an offset or a cursor.** Other
+    annotators retire items out from under you — whatever reaches `target` leaves
+    the pool mid-session — so any positional cursor would skip or repeat items.
+    The queue is self-consuming instead: whatever you label or skip drops out of
+    the anti-join, so re-fetching always advances.
 
     `dataset` defaults to the whole DB and deliberately does not go through
     `resolve_ds` — labeling is cross-day by design. Every response echoes the
@@ -398,6 +398,12 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         # stratified sample across the whole season. The md5 tail is a stable
         # per-annotator permutation: two annotators walk the same pool in different
         # orders, so they meet in the middle rather than racing down one list.
+        #
+        # Deliberately NOT ordered by `n_labeled ASC` (M3 UX §6.7): sorting
+        # zero-coverage items ahead of once-labeled ones means no instance gets its
+        # second label until the whole pool has been swept once, so every pair
+        # feeding the kappa queries would come from the fatigued back half of each
+        # session. The WHERE clause already caps coverage at target.
         day_term = "s.day DESC NULLS LAST, " if order == "fresh" else ""
         params.append(annotator)
         params.append(n)
@@ -405,7 +411,7 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             SELECT s.*, count(*) OVER () AS matching
             FROM scoped s
             WHERE {' AND '.join(where)}
-            ORDER BY s.n_labeled ASC, {day_term}md5(? || s.instance_key)
+            ORDER BY {day_term}md5(? || s.instance_key)
             LIMIT ?
             """, params)
 

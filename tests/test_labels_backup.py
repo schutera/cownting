@@ -208,7 +208,7 @@ def test_snapshot_is_a_real_db():
         n_cls = sc.execute("SELECT count(*) FROM label_classes").fetchone()[0]
         check("the snapshot opens and is complete (annotations)", n_ann == 3, str(n_ann))
         check("the snapshot carries the whole taxonomy",
-              n_grp == 2 and n_cls == 9, f"{n_grp} groups, {n_cls} classes")
+              n_grp == 2 and n_cls == 10, f"{n_grp} groups, {n_cls} classes")
         n_ans = sc.execute("SELECT count(*) FROM v_current_answers").fetchone()[0]
         check("views travel too (v_current_answers works)", n_ans == 4, str(n_ans))
         wm = labels_db.get_meta(sc, labels_backup.META_WATERMARK)

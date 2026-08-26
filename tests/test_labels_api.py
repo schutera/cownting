@@ -12,6 +12,7 @@ No pytest. Run either way:
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -240,9 +241,11 @@ def test_queue_policy():
         items = client.get("/api/label/queue").json()["items"]
         rev = _rev(client)
 
-        # Coverage-first ordering: give one instance a label from a second
-        # annotator (written straight into the store, as another session would)
-        # and it must sort to the back of everyone else's queue.
+        # An instance labeled by another annotator stays in the pool at its own
+        # place in this annotator's permutation. It is deliberately NOT sorted to
+        # the back (M3 UX §6.7): coverage-first ordering would withhold every
+        # second label until the pool had been swept once, so pairs would only
+        # ever form under fatigue.
         covered = items[0]["instance_key"]
         lc = db.connect(config.paths.labels_db_path)
         labels_db.submit_annotation(
@@ -251,11 +254,12 @@ def test_queue_policy():
                       "class_name": "Shaded"}])
         lc.close()
         got = client.get("/api/label/queue").json()["items"]
-        check("coverage-first: the once-labeled instance is served LAST",
-              got and got[-1]["instance_key"] == covered and got[-1]["n_annotators"] == 1,
+        by_key = {it["instance_key"]: it for it in got}
+        check("an under-target instance labeled by someone else is still served",
+              covered in by_key, str(sorted(by_key)[:3]))
+        check("...and it carries that annotator's coverage",
+              by_key[covered]["n_annotators"] == 1 if covered in by_key else False,
               str([(it["instance_key"][:8], it["n_annotators"]) for it in got]))
-        check("...after every zero-coverage instance",
-              all(it["n_annotators"] == 0 for it in got[:-1]))
 
         # Never re-served to the same annotator: local labels one, refetches.
         mine = got[0]
@@ -352,6 +356,38 @@ def test_serve_event_and_time_on_task():
               row is not None and row[0] is not None, str(row))
         check("time_on_task_ms is server-measured and positive",
               row is not None and row[1] is not None and int(row[1]) > 0, str(row))
+
+
+def test_decision_event_detail_is_stored():
+    """The `answered` payload (M3 UX §6.1) must survive the API boundary.
+
+    Regression: `LabelEventReq` once had no `detail` field, so pydantic's
+    default `extra='ignore'` dropped the whole object silently — every event
+    landed with detail NULL and per-decision latency was unrecoverable."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        items = client.get("/api/label/queue").json()["items"]
+        detail = {"group_key": "sun_exposure", "class_key": "sun_exposure.shaded",
+                  "ms_since_group_shown": 812, "ms_since_item_shown": 1503,
+                  "replaced_class_key": None, "input_mode": "key"}
+        r = client.post("/api/label/events", json={
+            "session_id": "sess-detail", "kind": "answered",
+            "instance_key": items[0]["instance_key"],
+            "class_key": "sun_exposure.shaded", "detail": detail})
+        check("answered event -> 200", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+        lc = db.connect(config.paths.labels_db_path)
+        row = lc.execute(
+            "SELECT detail FROM label_events WHERE kind = 'answered'").fetchone()
+        lc.close()
+        check("the answered event stored its detail payload",
+              row is not None and row[0] is not None, str(row))
+        stored = json.loads(row[0]) if row and row[0] else {}
+        check("every prescribed field survived the round trip",
+              stored.get("group_key") == "sun_exposure"
+              and stored.get("ms_since_group_shown") == 812
+              and stored.get("ms_since_item_shown") == 1503
+              and stored.get("input_mode") == "key", str(stored))
 
 
 def test_undo_is_scoped_to_me():
@@ -482,6 +518,7 @@ def main():
     test_queue_policy()
     test_multi_annotator_default()
     test_serve_event_and_time_on_task()
+    test_decision_event_detail_is_stored()
     test_undo_is_scoped_to_me()
     test_crop_endpoint_safety_and_caching()
     test_banner_mask_does_not_blank_the_tile()
