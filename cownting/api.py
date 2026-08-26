@@ -96,6 +96,13 @@ class LabelSubmitReq(BaseModel):
 
 
 class LabelSkipReq(BaseModel):
+    # The FLAG body. Skipping is no longer a user-facing concept: an instance that
+    # cannot be answered is flagged, and a flag must say why. `reason` picks from
+    # the SKIP_REASONS vocabulary and `explanation` is the annotator's own words —
+    # both required (see label_skip). The route path and the stored outcome stay
+    # 'skipped' so existing rows and the frozen M3 §4.1 route table still hold.
+    # `note` is that frozen field name and remains the wire spelling; `explanation`
+    # is accepted as its alias so the request reads as what it now is.
     instance_key: str
     anchor: InstanceAnchor
     reason: str                            # labels_db.SKIP_REASONS
@@ -103,6 +110,7 @@ class LabelSkipReq(BaseModel):
     session_id: str | None = None
     client_elapsed_ms: int | None = None
     note: str | None = None
+    explanation: str | None = None
 
 
 class LabelUndoReq(BaseModel):
@@ -141,12 +149,15 @@ class LabelClassReq(BaseModel):
     description: str        # required server-side: an undefined option is the
                             # largest source of annotator disagreement (§5.4)
     class_key: str | None = None
+    icon: str | None = None  # a labels_db.CLASS_ICONS name, picked from the fixed
+                             # vocabulary — never free text, never markup
     is_escape: bool = False
 
 
 class LabelClassPatchReq(BaseModel):
     name: str | None = None
     description: str | None = None
+    icon: str | None = None
     is_escape: bool | None = None
     active: bool | None = None
 
@@ -1172,6 +1183,21 @@ def create_app(config: Config) -> FastAPI:
         # rather than duplicates (ingest purges the dataset before re-inserting).
         the_label = (label or "").strip() or date.fromisoformat(iso_day).strftime("%b %d, %Y")
 
+        # Different days queue up freely, but the SAME day twice at once cannot:
+        # the rmtree below would delete the videos a running ingest is still
+        # reading, and ingest purges that dataset's rows underneath it. Checked
+        # here, before anything destructive, and the incoming clips are dropped.
+        busy = uploads_mod.active_job_for(iso_day)
+        if busy is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise HTTPException(409, detail={
+                "code": "day_already_processing",
+                "dataset_id": iso_day,
+                "message": (f"{busy.label} is already being processed "
+                            f"({busy.message}). Wait for it to finish before "
+                            "uploading that same day again."),
+            })
+
         # Fresh inbox per (re-)upload of this day so a replaced camera set leaves no
         # stale videos behind.
         inbox = Path(config.paths.artifacts_dir) / "_uploads" / iso_day
@@ -1629,19 +1655,43 @@ def create_app(config: Config) -> FastAPI:
 
     @app.post("/api/label/skip", dependencies=[Depends(require_labeler)])
     def label_skip(body: LabelSkipReq, request: Request):
-        """A skip is an annotation with outcome='skipped', not an error and not a
-        400 (M3 §3.3): it carries the same provenance and uniqueness rule, and
-        `multiple_cows` in particular is a direct signal the detector merged two
-        animals. Counted separately from coverage, so the instance still serves
-        to the next annotator until `skip_retire` distinct declines. No revision
-        check: a skip names no classes, so the frozen body carries no revision —
-        the current one is stamped as telemetry."""
+        """FLAG an instance that cannot be answered. Stored as an annotation with
+        outcome='skipped' — the same provenance and uniqueness rule as an answer,
+        counted separately from coverage, and re-served to the next annotator
+        until `skip_retire` distinct declines. `multiple_cows` in particular is a
+        direct signal the detector merged two animals.
+
+        A reason ALONE is no longer enough: a free-text explanation is required
+        and a blank one is a 400. The tool has no skip button any more, so this
+        route is the only escape hatch left, and an escape hatch nobody has to
+        justify is exactly what silently drains the ambiguous instances out of
+        the corpus — the ones inter-rater variability is most informative about.
+        The five-item `reason` vocabulary cannot describe a crop we have not
+        thought of; the sentence beside it can.
+
+        Enforced here rather than in `submit_annotation`, because it is a rule
+        about this ENDPOINT's contract, not about the store: rows written before
+        the rework carry no explanation and are deliberately left alone (no
+        migration), and the CLI/reconciler paths must keep writing them.
+
+        The outcome, the route path and the stored columns are unchanged — this
+        is a validation tightening, not a schema change. No revision check: a
+        flag names no classes, so the frozen body carries no revision, and the
+        current one is stamped as telemetry."""
         a = body.anchor
         _valid_anchor(a)
         if not labeling.verify_anchor(body.instance_key, a):
             raise HTTPException(400, "anchor does not hash to instance_key")
         if body.reason not in labels_db.SKIP_REASONS:
             raise HTTPException(400, f"reason must be one of {list(labels_db.SKIP_REASONS)}")
+        # `explanation` wins, `note` is the frozen wire name (see LabelSkipReq).
+        # Whitespace-only is blank: " " would satisfy a truthiness check and turn
+        # the requirement back into a button press.
+        explanation = ((body.explanation or "").strip()
+                       or (body.note or "").strip())
+        if not explanation:
+            raise HTTPException(400, "a flag needs an explanation: say in your own "
+                                     "words why this instance cannot be answered")
         ts = _anchor_ts(a)
         user = current_user(request)
         lc = _labels_con()
@@ -1659,7 +1709,7 @@ def create_app(config: Config) -> FastAPI:
                         session_id=body.session_id,
                         serve_event_id=body.serve_event_id,
                         client_elapsed_ms=body.client_elapsed_ms,
-                        skip_reason=body.reason, note=body.note),
+                        skip_reason=body.reason, note=explanation),
                 )
             except ValueError as e:
                 raise HTTPException(409, str(e))
@@ -1691,8 +1741,22 @@ def create_app(config: Config) -> FastAPI:
     # inside the write transactions — accepting them here would let a scripted
     # client forge the served clock that makes time_on_task_ms non-forgeable,
     # and double-log the rest.
+    # 'presented'/'answered' are the per-decision timing pair (M3_labeling_ux.md
+    # §6.1). They MUST come from the client: only the browser knows when the crop
+    # actually reached the screen and when a key was pressed, and 'served' is
+    # written once per BATCH so it cannot separate "how long did Sun exposure
+    # take" from "how long did Behaviour take" — which is exactly what the
+    # redesign is judged on.
+    #
+    # Accepting them does not weaken the paragraph above. They are advisory
+    # measurements stored beside the server's own timestamps, never a substitute
+    # for them: served_at and submitted_at still come from the server, so
+    # time_on_task_ms stays non-forgeable and a client that lies about these two
+    # only corrupts its own effort statistics, which the server/client delta then
+    # exposes. They are read-only telemetry, not a write path.
     _CLIENT_EVENT_KINDS = frozenset({"session_start", "session_end",
-                                     "info_opened", "relabel"})
+                                     "info_opened", "relabel",
+                                     "presented", "answered"})
 
     @app.post("/api/label/events", dependencies=[Depends(require_labeler)])
     def label_event(body: LabelEventReq, request: Request):
@@ -1762,21 +1826,29 @@ def create_app(config: Config) -> FastAPI:
     @app.post("/api/label/groups/{group_key}/classes", dependencies=[Depends(require_poweruser)])
     def label_create_class(group_key: str, body: LabelClassReq, request: Request):
         """Add an option to a question (description required — enforced in
-        labels_db, not only by the editor's disabled button)."""
+        labels_db, not only by the editor's disabled button).
+
+        `icon` is validated against labels_db.CLASS_ICONS and a ValueError there
+        becomes a 400 through _taxonomy_write. It is checked server-side because
+        the editor's picker is not the only way to reach this route and the value
+        is rendered into every annotator's DOM."""
         return _taxonomy_write(
             request, labels_db.create_class, group_key,
             name=_clip(body.name, 200) or "",
             description=_clip(body.description, 4000) or "",
             class_key=_clip(body.class_key, 128),
+            icon=_clip(body.icon, 32),
             is_escape=body.is_escape)
 
     @app.patch("/api/label/classes/{class_key}", dependencies=[Depends(require_poweruser)])
     def label_update_class(class_key: str, body: LabelClassPatchReq, request: Request):
         """Edit an option; `active` archives/restores. Safe by construction —
-        answers snapshot class_name at label time."""
+        answers snapshot class_name at label time. `icon` takes a CLASS_ICONS
+        name ('dot' is the neutral one); anything else is a 400."""
         return _taxonomy_write(
             request, labels_db.update_class, class_key,
             name=_clip(body.name, 200), description=_clip(body.description, 4000),
+            icon=_clip(body.icon, 32),
             is_escape=body.is_escape, active=body.active)
 
     @app.post("/api/label/classes/{class_key}/move", dependencies=[Depends(require_poweruser)])

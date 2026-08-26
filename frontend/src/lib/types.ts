@@ -121,9 +121,31 @@ export interface CameraCoverage {
 // drive — one word apart, two unrelated features. Naming, once: a GROUP is a
 // question ("Sun exposure"), a CLASS is an answer inside it ("Shaded").
 
+// The fixed icon vocabulary. Icons are stored as a NAME, never as markup: a
+// poweruser adding a class at runtime must not be able to inject SVG, and a
+// strict CSP forbids external assets anyway. This union is the CLIENT side of the
+// contract — what the taxonomy editor may offer — while `LabelClass.icon` stays a
+// bare string, because the server is free to hand back a name from a vocabulary
+// this build has not heard of and <ClassIcon> must fall back to the neutral dot
+// rather than have the type lie about what arrived.
+export type LabelIconName =
+  | "shade"
+  | "sun"
+  | "eye-off"
+  | "question"
+  | "grass"
+  | "lying"
+  | "standing"
+  | "probe"
+  | "dot";
+
 // One answer option. `description` is required server-side and is what the (i)
 // disclosure reveals: an option with no written definition is the single largest
-// source of annotator disagreement, which is the whole reason the icon exists.
+// source of annotator disagreement.
+// `icon` is a LabelIconName the option renders beside its text so the row is
+// spottable at a glance instead of read word by word. It cannot be hardcoded per
+// class_key anywhere in the frontend, because powerusers add classes at runtime;
+// it therefore travels with the class. Empty or unrecognised -> the neutral dot.
 // `active` is a soft archive — nothing in this feature is ever deleted, so an
 // answer recorded against an archived class still resolves and still counts.
 export interface LabelClass {
@@ -131,12 +153,15 @@ export interface LabelClass {
   group_key: string;
   name: string;
   description: string;
+  icon: string;          // a LabelIconName; unknown/'' renders the neutral dot
   sort_order: number;
   is_escape: boolean;    // the 'Cannot tell' hatch: a forced guess is noise
   active: boolean;
 }
-// One question. Position (not the literal `sort_order` value) decides the hotkey
-// row in labelKeys.ts, so reordering groups moves annotators' muscle memory.
+// One question. Position (not the literal `sort_order` value) decides the ORDER
+// the groups are answered in — sun exposure first, behaviour second — and only
+// the active group listens to the number keys, so reordering groups changes the
+// sequence an annotator works through rather than which keys exist.
 export interface LabelGroup {
   group_key: string;
   name: string;
@@ -216,7 +241,10 @@ export interface LabelQueueFilters {
 // from the same scan, free. There is no cursor and no offset on purpose: other
 // annotators change an instance's coverage while you work, so any positional
 // cursor would skip or repeat items. The queue is self-consuming instead —
-// whatever you label or skip is anti-joined away, so re-fetching always advances.
+// whatever you answer or flag is anti-joined away, so re-fetching always
+// advances. Going BACK along the tape does not re-fetch: the page keeps the
+// items it has already been served, which is what lets a revisited instance
+// reappear with the answers already given.
 export interface LabelQueue {
   items: LabelItem[];
   matching: number;
@@ -242,17 +270,28 @@ export interface LabelStats {
   filters: { dataset: string | null; camera: string | null };
 }
 
-// A skip IS an annotation, with the same provenance and uniqueness rule as a
-// label — not a 400 and not a separate table. `multiple_cows` in particular is a
-// direct signal that the crop padding or the detector merged two animals.
+// Why an instance could not be answered. There is no silent skip: an instance
+// the annotator cannot judge is FLAGGED, and a flag carries one of these reasons
+// AND a written explanation. `multiple_cows` in particular is a direct signal
+// that the crop padding or the detector merged two animals. The name still says
+// "skip" because this mirrors the backend's unchanged `labels_db.SKIP_REASONS`
+// and the unchanged stored `skip_reason` column — only the word the annotator
+// sees changed, and stored rows are deliberately not migrated.
 export type LabelSkipReason = "bad_crop" | "no_cow" | "multiple_cows" | "occluded" | "other";
-// Undo is a supersede, never a delete: the row stays with outcome 'undone'.
+// Storage terms, not user-facing ones. 'skipped' is the stored outcome of a FLAG
+// — it means "not answered" and predates the rename, and stored rows are not
+// migrated. 'undone' only ever appears on rows written before ArrowLeft replaced
+// the undo action; nothing in the app produces it any more.
 export type LabelOutcome = "labeled" | "skipped" | "undone";
 // Recorded per annotation so a report can ask whether keyboard-first annotators
 // disagree differently from mouse users.
 export type LabelInputMode = "key" | "mouse";
-// Effort telemetry. 'served' is written by the queue itself and is the
-// non-forgeable time-on-task clock; the rest come from POST /api/label/events.
+// Effort telemetry, describing what is STORED rather than what the client may
+// post. 'served' is written by the queue itself and is the non-forgeable
+// time-on-task clock; 'submitted'/'skipped' are minted inside the write
+// transactions; 'undo' survives only on historical rows. The client posts
+// 'session_start', 'session_end', 'info_opened' and 'relabel' — the last when a
+// revisited instance is re-answered after moving back along the tape.
 export type LabelEventKind =
   | "session_start"
   | "served"
@@ -291,14 +330,23 @@ export interface LabelSubmitReq {
   input_mode?: LabelInputMode | null;
   note?: string | null;
 }
-export interface LabelSkipReq {
+// Flagging an instance the annotator cannot answer. `explanation` is REQUIRED
+// and must not be whitespace — that requirement is the entire point of replacing
+// skip with flag: an escape hatch nobody has to justify gets pulled whenever the
+// work gets hard, and the resulting rows are indistinguishable from genuinely
+// unjudgeable crops. The dialog keeps Submit disabled until both fields are
+// present and the server 400s a blank one, so neither side is load-bearing alone.
+// A flag is still an annotation with the same provenance and uniqueness rule as
+// an answer — not a 400 — and it is counted separately from coverage, so an
+// instance one annotator could not judge is still served to the next.
+export interface LabelFlagReq {
   instance_key: string;
   anchor: InstanceAnchor;
   reason: LabelSkipReason;
+  explanation: string;                 // non-empty, non-whitespace; server-checked
   serve_event_id?: number | null;
   session_id?: string | null;
   client_elapsed_ms?: number | null;
-  note?: string | null;
 }
 export interface LabelEventReq {
   session_id: string;
@@ -307,22 +355,17 @@ export interface LabelEventReq {
   class_key?: string | null;   // info_opened: WHICH description was read
 }
 // Submits append version n+1; they never overwrite, so a second annotator (or the
-// same annotator changing their mind) is a new row, not a lost one.
+// same annotator changing their mind) is a new row, not a lost one. This is what
+// makes moving back along the tape safe: correcting a revisited instance re-posts
+// it and yields version 2, superseding the earlier row without losing it.
 export interface LabelWriteResult {
   ok: boolean;
   annotation_id: number;
   version: number;
 }
-// `annotation_id` is null when there was nothing of the annotator's own to undo.
-// Undo is scoped to the caller: it can never supersede someone else's answer.
-export interface LabelUndoResult {
-  ok: boolean;
-  instance_key: string;
-  annotation_id: number | null;
-}
 
 // GET /api/label/mine — the annotator's own recent submissions, newest first.
-// `choices` is empty for a skip, which is why `outcome` and `skip_reason` are
+// `choices` is empty for a flag, which is why `outcome` and `skip_reason` are
 // both on the row.
 export interface LabelChoice {
   group_key: string;
@@ -368,15 +411,20 @@ export interface LabelGroupPatchReq {
   required?: boolean;
   active?: boolean;
 }
+// `icon` is typed to the vocabulary rather than to string on the WRITE side: the
+// editor picks from a fixed list and free text is rejected, so a typo cannot
+// reach the database and leave a class with no icon anyone can explain.
 export interface LabelClassReq {
   class_key?: string;    // omitted -> '<group_key>.<slug of name>'
   name: string;
   description: string;   // required: the editor disables Add until it is written
+  icon?: LabelIconName;  // omitted -> the server's default ('dot')
   is_escape?: boolean;
 }
 export interface LabelClassPatchReq {
   name?: string;
   description?: string;
+  icon?: LabelIconName;
   is_escape?: boolean;
   active?: boolean;
 }

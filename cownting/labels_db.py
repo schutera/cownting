@@ -230,9 +230,33 @@ OUTCOMES: tuple[str, ...] = ("labeled", "skipped", "undone")
 # animals, which is why skips are annotations and not a 400.
 SKIP_REASONS: tuple[str, ...] = ("bad_crop", "no_cow", "multiple_cows", "occluded", "other")
 
+# The class-icon vocabulary. `label_classes.icon` stores a NAME from this tuple and
+# nothing else. Powerusers add classes at runtime, so the icon cannot be hardcoded
+# per class key in the frontend — but the value is rendered into the DOM by
+# <ClassIcon>, so free text here would be a stored-XSS hole wearing a taxonomy hat,
+# and a filename would be an asset request the deployment's strict CSP refuses. The
+# names are deliberately generic (`probe`, not `head_probing`) so a hand-created
+# class can reuse one. `dot` is the neutral member and the way to say "no icon";
+# the frontend also falls back to it for NULL and for any name it does not know, so
+# a value this list once contained can never break the renderer.
+CLASS_ICONS: tuple[str, ...] = (
+    "shade", "sun", "eye-off", "question", "grass", "lying", "standing", "probe", "dot",
+)
+
 EVENT_KINDS: tuple[str, ...] = (
     "session_start", "served", "submitted", "skipped", "undo", "relabel",
     "info_opened", "session_end",
+    # Per-decision timing (M3_labeling_ux.md §6.1). `served` is written once per
+    # BATCH, so the time it yields for item k of 8 includes items 1..k-1 — useful
+    # as the abandonment denominator, useless as effort. `presented` fires when an
+    # item actually reaches the screen and `answered` fires per QUESTION, which is
+    # the only way to separate "how long did Sun exposure take" from "how long did
+    # Behaviour take". The acceptance targets are stated per decision, so without
+    # these two the redesign cannot be evaluated at all.
+    #
+    # These were emitted by the page before they were accepted here, so every one
+    # 400'd and was dropped on the floor while the UI carried on looking healthy.
+    "presented", "answered",
 )
 
 RECONCILE_STATES: tuple[str, ...] = (
@@ -252,6 +276,25 @@ SCHEMA_VERSION = "1"
 
 _GROUP_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _CLASS_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
+
+
+def _valid_icon(icon: str | None) -> str | None:
+    """`icon` normalised, or `ValueError` when it is not a CLASS_ICONS name.
+
+    `None` passes through as None (the caller's "not given"/"leave unchanged"), which
+    renders as the neutral dot — so an operator who wants no icon picks 'dot' rather
+    than needing a null-out path. Everything else is rejected rather than stored and
+    rendered: this string reaches the DOM, and the taxonomy editor is
+    poweruser-writable at runtime."""
+    if icon is None:
+        return None
+    name = icon.strip()
+    if name not in CLASS_ICONS:
+        raise ValueError(
+            f"icon must be one of {list(CLASS_ICONS)}, got {icon!r} — icons are drawn "
+            "from a fixed vocabulary by name, never supplied as markup or a filename"
+        )
+    return name
 
 
 # ---------------------------------------------------------------------------- DDL
@@ -295,7 +338,9 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
     )
     # A CLASS is an option inside a group ("Shaded"). `description` is NOT NULL: an
     # option with no written definition is the single largest source of annotator
-    # disagreement, which is the whole reason the (i) icon exists.
+    # disagreement, which is the whole reason the (i) icon exists. `icon` is nullable
+    # and holds a NAME from CLASS_ICONS — never markup, never an asset path (see
+    # CLASS_ICONS for why); NULL renders as the neutral dot.
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS label_classes (
@@ -303,6 +348,7 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
             group_key    VARCHAR NOT NULL,
             name         VARCHAR NOT NULL,
             description  VARCHAR NOT NULL,
+            icon         VARCHAR,
             sort_order   INTEGER NOT NULL DEFAULT 100,
             is_escape    BOOLEAN NOT NULL DEFAULT FALSE,
             active       BOOLEAN NOT NULL DEFAULT TRUE,
@@ -476,6 +522,13 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("ALTER TABLE annotations ADD COLUMN IF NOT EXISTS frame_sig VARCHAR")
     con.execute("ALTER TABLE annotations ADD COLUMN IF NOT EXISTS queue_reason VARCHAR")
     con.execute("UPDATE annotations SET effective_key = instance_key WHERE effective_key IS NULL")
+    # An existing data/labels.duckdb upgrades in place here — there is no migration
+    # step for this store and a boot that needed one would take the WHOLE app down,
+    # not just the Label page. The seed below backfills the shipped icons onto rows
+    # where this arrives NULL; it deliberately does not DEFAULT to anything, because
+    # NULL is how "nobody has picked an icon yet" is told apart from a deliberate
+    # neutral 'dot'.
+    con.execute("ALTER TABLE label_classes ADD COLUMN IF NOT EXISTS icon VARCHAR")
 
     # PK/UNIQUE already build ART indexes; these cover the remaining hot paths — the
     # queue's anti-join on effective_key above all.
@@ -573,7 +626,9 @@ def taxonomy_revision(con: duckdb.DuckDBPyConnection) -> int:
 # and are deliberately long: an option with no written definition is the single
 # largest source of disagreement, and these were written against real frames. Every
 # group carries a "Cannot tell" escape, because a forced guess is noise that looks
-# like disagreement.
+# like disagreement. Every class also carries a CLASS_ICONS name: an annotator
+# answering by number key spots a shape long before they read a word, and the icon is
+# what keeps the option list scannable at speed rather than re-read per instance.
 SEED_GROUPS: tuple[dict[str, Any], ...] = (
     {
         "group_key": "sun_exposure",
@@ -592,6 +647,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "sun_exposure.shaded",
                 "name": "Shaded",
+                "icon": "shade",
                 "sort_order": 10,
                 "is_escape": False,
                 "description": (
@@ -609,6 +665,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "sun_exposure.direct_sun",
                 "name": "Direct sun",
+                "icon": "sun",
                 "sort_order": 20,
                 "is_escape": False,
                 "description": (
@@ -626,6 +683,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "sun_exposure.not_visible",
                 "name": "Not visible",
+                "icon": "eye-off",
                 "sort_order": 30,
                 "is_escape": False,
                 "description": (
@@ -641,6 +699,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "sun_exposure.cannot_tell",
                 "name": "Cannot tell",
+                "icon": "question",
                 "sort_order": 40,
                 "is_escape": True,
                 "description": (
@@ -672,6 +731,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "behaviour.feeding",
                 "name": "Feeding",
+                "icon": "grass",
                 "sort_order": 10,
                 "is_escape": False,
                 "description": (
@@ -689,6 +749,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "behaviour.lying",
                 "name": "Lying",
+                "icon": "lying",
                 "sort_order": 20,
                 "is_escape": False,
                 "description": (
@@ -705,6 +766,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "behaviour.standing",
                 "name": "Standing",
+                "icon": "standing",
                 "sort_order": 30,
                 "is_escape": False,
                 "description": (
@@ -719,6 +781,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "behaviour.head_probing",
                 "name": "Head probing",
+                "icon": "probe",
                 "sort_order": 40,
                 "is_escape": False,
                 "description": (
@@ -736,6 +799,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "class_key": "behaviour.cannot_tell",
                 "name": "Cannot tell",
+                "icon": "question",
                 "sort_order": 50,
                 "is_escape": True,
                 "description": (
@@ -768,18 +832,29 @@ def seed_taxonomy(
     sharpened after watching annotators disagree must never be reverted by a
     container restart.
 
+    The ONE in-place write on an existing row is the icon backfill, and it is guarded
+    by `icon IS NULL` for exactly the same reason: a store created before the icon
+    column existed must get the shipped icons without a migration step, while an icon
+    a poweruser has since picked is an operator edit and is left alone. The candidate
+    set is read BEFORE the insert loop, so a row inserted below (which already carries
+    its icon) is never also counted as a backfill.
+
     The revision is bumped (and an audit row written) only when something actually
-    changed. Bumping unconditionally would make every boot 409 every in-flight
-    submission.
+    changed — inserts or backfilled icons. Bumping unconditionally would make every
+    boot 409 every in-flight submission. The count returned covers both, which is what
+    `cownting labels reseed` prints as "rows touched".
 
     `force` is the escape hatch behind `cownting labels reseed --force`: it refreshes
-    names, descriptions and ordering from this module onto existing keys — but never
-    `active`/`archived_at`, because reverting an operator's archive decision is
+    names, descriptions, icons and ordering from this module onto existing keys — but
+    never `active`/`archived_at`, because reverting an operator's archive decision is
     exactly what the presence-of-key rule exists to prevent — and always audits and
     bumps, so before/after agreement stays comparable."""
     have_groups = {r[0] for r in con.execute("SELECT group_key FROM label_groups").fetchall()}
     have_classes = {r[0] for r in con.execute("SELECT class_key FROM label_classes").fetchall()}
+    iconless = {r[0] for r in con.execute(
+        "SELECT class_key FROM label_classes WHERE icon IS NULL").fetchall()}
     written = 0
+    icons = 0
     for g in SEED_GROUPS:
         if g["group_key"] not in have_groups:
             con.execute(
@@ -802,24 +877,35 @@ def seed_taxonomy(
             if c["class_key"] not in have_classes:
                 con.execute(
                     "INSERT INTO label_classes (class_key, group_key, name, description, "
-                    "sort_order, is_escape, created_by, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, now())",
+                    "icon, sort_order, is_escape, created_by, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, now())",
                     [c["class_key"], g["group_key"], c["name"], c["description"],
-                     c["sort_order"], c["is_escape"], actor],
+                     _valid_icon(c["icon"]), c["sort_order"], c["is_escape"], actor],
                 )
                 written += 1
-            elif force:
+                continue
+            if c["class_key"] in iconless:
+                # `AND icon IS NULL` is repeated in SQL, not left to the set read
+                # above: a poweruser picking an icon between the read and here must
+                # win, and losing that race would silently overwrite their choice.
                 con.execute(
-                    "UPDATE label_classes SET name = ?, description = ?, sort_order = ?, "
-                    "is_escape = ?, updated_by = ?, updated_at = now() WHERE class_key = ?",
-                    [c["name"], c["description"], c["sort_order"], c["is_escape"],
-                     actor, c["class_key"]],
+                    "UPDATE label_classes SET icon = ? WHERE class_key = ? AND icon IS NULL",
+                    [_valid_icon(c["icon"]), c["class_key"]],
                 )
-    if written or force:
+                icons += 1
+            if force:
+                con.execute(
+                    "UPDATE label_classes SET name = ?, description = ?, icon = ?, "
+                    "sort_order = ?, is_escape = ?, updated_by = ?, updated_at = now() "
+                    "WHERE class_key = ?",
+                    [c["name"], c["description"], _valid_icon(c["icon"]),
+                     c["sort_order"], c["is_escape"], actor, c["class_key"]],
+                )
+    if written or icons or force:
         _audit(con, actor=actor, actor_role=actor_role, action="seed",
                target_kind="group", target_key=None, before=None,
-               after={"written": written, "force": force})
-    return written
+               after={"written": written, "icons": icons, "force": force})
+    return written + icons
 
 
 def taxonomy(con: duckdb.DuckDBPyConnection, *, include_archived: bool = False) -> dict[str, Any]:
@@ -835,7 +921,7 @@ def taxonomy(con: duckdb.DuckDBPyConnection, *, include_archived: bool = False) 
         f"{gwhere} ORDER BY sort_order, group_key"
     ))
     classes = _rows(con.execute(
-        "SELECT class_key, group_key, name, description, sort_order, is_escape, "
+        "SELECT class_key, group_key, name, description, icon, sort_order, is_escape, "
         "active, archived_at FROM label_classes"
         f"{cwhere} ORDER BY group_key, sort_order, class_key"
     ))
@@ -1026,6 +1112,7 @@ def create_class(
     description: str,
     class_key: str | None = None,
     slug: str | None = None,
+    icon: str | None = None,
     is_escape: bool = False,
     sort_order: int | None = None,
     actor: str = "system",
@@ -1036,7 +1123,10 @@ def create_class(
     `description` is required and refused when blank — server-side, not only in the
     editor's disabled button. An option with no written definition is the single
     largest source of annotator disagreement, and it is the reason the (i) icon
-    exists at all."""
+    exists at all.
+
+    `icon` is optional and must name a CLASS_ICONS member; omitted, it stays NULL and
+    the option renders with the neutral dot. It is never free text (`_valid_icon`)."""
     if _one(con, "label_groups", "group_key", group_key) is None:
         raise ValueError(f"unknown group {group_key!r}")
     if not (name or "").strip():
@@ -1058,10 +1148,11 @@ def create_class(
     if sort_order is None:
         sort_order = _next_sort(con, "label_classes", "group_key", group_key)
     con.execute(
-        "INSERT INTO label_classes (class_key, group_key, name, description, sort_order, "
-        "is_escape, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, now())",
-        [class_key, group_key, name.strip(), description.strip(), sort_order,
-         bool(is_escape), actor],
+        "INSERT INTO label_classes (class_key, group_key, name, description, icon, "
+        "sort_order, is_escape, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, now())",
+        [class_key, group_key, name.strip(), description.strip(), _valid_icon(icon),
+         sort_order, bool(is_escape), actor],
     )
     _audit(con, actor=actor, actor_role=actor_role, action="create_class",
            target_kind="class", target_key=class_key, before=None,
@@ -1075,6 +1166,7 @@ def update_class(
     *,
     name: str | None = None,
     description: str | None = None,
+    icon: str | None = None,
     sort_order: int | None = None,
     is_escape: bool | None = None,
     active: bool | None = None,
@@ -1085,7 +1177,10 @@ def update_class(
 
     Archiving is safe by construction: `annotation_choices` snapshots `class_name` at
     label time and `v_current_answers` reads that snapshot, so an answer given before
-    the archive keeps rendering with the name the annotator actually saw."""
+    the archive keeps rendering with the name the annotator actually saw.
+
+    `icon` must name a CLASS_ICONS member; 'dot' is how an operator clears one back to
+    neutral, since `None` here already means "leave unchanged"."""
     before = _one(con, "label_classes", "class_key", class_key)
     if before is None:
         raise ValueError(f"unknown class {class_key!r}")
@@ -1094,6 +1189,7 @@ def update_class(
     sets, params = _set_clause({
         "name": name.strip() if isinstance(name, str) else None,
         "description": description.strip() if isinstance(description, str) else None,
+        "icon": _valid_icon(icon),
         "sort_order": sort_order,
         "is_escape": is_escape,
         "active": active,

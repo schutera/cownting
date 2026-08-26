@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type {
   LabelClass,
   LabelGroup,
+  LabelIconName,
   LabelMoveDir,
   Taxonomy,
 } from "../lib/types";
@@ -15,14 +16,14 @@ import {
   updateLabelClass,
   updateLabelGroup,
 } from "../lib/api";
-import type { LabelGroupKeys } from "../lib/labelKeys";
-import { buildKeyMap } from "../lib/labelKeys";
+import { numberKeysFor, visibleClasses, visibleGroups } from "../lib/labelKeys";
 import { Button, Card, INPUT_CLS, Kbd, SectionLabel } from "../components/ui";
+import { ClassIcon } from "../components/ClassIcon";
 
 /* The poweruser taxonomy editor (docs/roadmap/M3_labeling.md §5.7). Route-gated
  * by PowerUserOnly in App.tsx; it lives on its own route rather than as a Label
- * page toggle because a text input mounted in the Label tree would steal
- * 1/Q/S/Enter from the hotkey layer.
+ * page toggle because a text input mounted in the Label tree would steal the
+ * digits, the arrows and F from the hotkey layer.
  *
  * Every mutation returns the WHOLE taxonomy (the Admin.tsx idiom), so there is
  * no optimistic state to reconcile and the revision on screen is always the
@@ -36,10 +37,12 @@ import { Button, Card, INPUT_CLS, Kbd, SectionLabel } from "../components/ui";
  * user re-checks their edit against the new state and saves again.
  */
 
-/* Sorting mirrors labelKeys.buildKeyMap's byOrder (not exported from there):
-   ties on sort_order are real — everything a poweruser adds defaults to 100 —
-   so the immutable key is the tiebreak, or the rows would reshuffle between
-   reloads. The editor MUST show the same order the annotator's hotkeys use. */
+/* Ordering for ARCHIVED rows only. Everything an annotator can still see is
+   ordered by labelKeys.visibleGroups/visibleClasses instead, so the editor's
+   rows and the annotator's digits come out of the same function rather than out
+   of two sorts that agree by luck. Ties on sort_order are real — everything a
+   poweruser adds defaults to 100 — so the immutable key is the tiebreak, or the
+   archived list would reshuffle between reloads. */
 function ordered<T extends { sort_order: number }>(rows: T[], key: (row: T) => string): T[] {
   return [...rows].sort((a, b) => {
     if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
@@ -65,6 +68,38 @@ function isStaleMessage(msg: string): boolean {
    block — the server is the source of truth). A dot is what makes a class_key
    ('group.slug'); a group_key must never contain one. */
 const GROUP_KEY_RE = /^[a-z][a-z0-9_]*$/;
+
+/* The fixed icon vocabulary as VALUES. types.ts can only hand us LabelIconName
+   as a type, and the list an operator picks from has to exist at runtime, so it
+   lives here — this editor is the only place in the app that offers a choice.
+   It mirrors labels_db.CLASS_ICONS and the server re-validates the name on
+   write, so a build that drifts from the backend earns a 400 rather than
+   writing a class whose icon nobody can render. Free text is never accepted:
+   the icon value is rendered into the DOM, and a poweruser adding a class at
+   runtime must not be able to hand us markup. */
+const ICON_CHOICES: readonly LabelIconName[] = [
+  "shade",
+  "sun",
+  "eye-off",
+  "question",
+  "grass",
+  "lying",
+  "standing",
+  "probe",
+  "dot",
+];
+
+/* `LabelClass.icon` is a bare string because the server may serve a name this
+   build has never heard of. The picker cannot offer such a name, so it falls
+   back to the neutral dot — and saving that form then WRITES 'dot'. That is the
+   deliberate choice: a picker silently holding a value it cannot render is
+   harder to explain than an icon that visibly reset to neutral. */
+function isIconName(icon: string): icon is LabelIconName {
+  return (ICON_CHOICES as readonly string[]).includes(icon);
+}
+function asIconName(icon: string): LabelIconName {
+  return isIconName(icon) ? icon : "dot";
+}
 
 type Run = (p: Promise<Taxonomy>) => Promise<boolean>;
 
@@ -114,10 +149,9 @@ export default function LabelClasses() {
   };
 
   const groups = useMemo(() => taxonomy?.groups ?? [], [taxonomy]);
-  // The live key preview — the same derivation the Label page's hotkeys use, so
-  // what the editor promises is what the annotator's hands get (§5.5, §5.7).
-  const keys = useMemo(() => buildKeyMap(groups), [groups]);
-  const activeGroups = useMemo(() => ordered(groups.filter((g) => g.active), (g) => g.group_key), [groups]);
+  // The same derivation the Label page uses, so the order shown here is the
+  // order annotators answer in — sun exposure first, behaviour second.
+  const activeGroups = useMemo(() => visibleGroups(groups), [groups]);
   const archivedGroups = useMemo(
     () => ordered(groups.filter((g) => !g.active), (g) => g.group_key),
     [groups],
@@ -153,8 +187,14 @@ export default function LabelClasses() {
           A <span className="text-text">group</span> is a question, a{" "}
           <span className="text-text">class</span> is an answer inside it. Nothing here is ever
           deleted: archiving hides a question or answer from annotators, but every answer already
-          recorded against it stays and still counts — restore brings it back. Reordering moves the
-          keys annotators' hands have learned, so each row previews its live binding.
+          recorded against it stays and still counts — restore brings it back.
+        </p>
+        <p className="text-gray-mid text-sm mt-2 max-w-xl">
+          Annotators answer one question at a time, in the order below, and the question they are on
+          binds its answers to <Kbd>1</Kbd>…<Kbd>9</Kbd> top to bottom. Reordering therefore moves
+          the digits their hands have learned, so each row previews its live binding. Each answer
+          also carries an icon, which is what makes an option spottable at a glance instead of read
+          word by word — pick one that survives being seen for a fifth of a second.
         </p>
         <p className="font-mono text-[11px] text-gray-tertiary mt-2">
           taxonomy revision {taxonomy.revision}
@@ -175,7 +215,7 @@ export default function LabelClasses() {
           <GroupCard
             key={g.group_key}
             group={g}
-            groupKeys={keys.groups.find((k) => k.group_key === g.group_key)}
+            position={i + 1}
             isFirst={i === 0}
             isLast={i === activeGroups.length - 1}
             busy={busy}
@@ -216,33 +256,34 @@ export default function LabelClasses() {
 
 function GroupCard({
   group,
-  groupKeys,
+  position,
   isFirst,
   isLast,
   busy,
   run,
 }: {
   group: LabelGroup;
-  /** The group's slice of the live key map — undefined never happens for an
-      active group, but the lookup is honest about it. */
-  groupKeys: LabelGroupKeys | undefined;
+  /** 1-based position in the answering order. Not sort_order: the VALUE is
+      meaningless to an annotator, the position is the whole story. */
+  position: number;
   isFirst: boolean;
   isLast: boolean;
   busy: boolean;
   run: Run;
 }) {
   const [editOpen, setEditOpen] = useState(false);
-  const activeClasses = ordered(group.classes.filter((c) => c.active), (c) => c.class_key);
+  // Rows and badges both come off visibleClasses(), via numberKeysFor() for the
+  // second — the digits are POSITIONAL, so rendering a different order than the
+  // keymap computed would make every badge a quiet lie.
+  const activeClasses = visibleClasses(group);
   const archivedClasses = ordered(group.classes.filter((c) => !c.active), (c) => c.class_key);
-  const keyByClass = new Map((groupKeys?.options ?? []).map((o) => [o.class_key, o.label]));
-  // A group past the end of the key ladder gets no bindings; say so plainly
-  // rather than pretending (§5.7).
-  const pastLadder = groupKeys === undefined || groupKeys.row === null;
+  const keyByClass = new Map(numberKeysFor(group).map((o) => [o.class_key, o.label]));
 
   return (
     <Card className="p-5">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-baseline gap-2.5 min-w-0">
+          <span className="font-mono text-[11px] text-gray-tertiary">#{position}</span>
           <span className="font-display text-xl text-near-black leading-none">{group.name}</span>
           <span className="font-mono text-[11px] text-gray-tertiary">{group.group_key}</span>
           {group.multi_select ? (
@@ -278,11 +319,6 @@ function GroupCard({
       {group.description !== null && group.description !== "" ? (
         <p className="text-[12px] leading-snug text-gray-mid mt-1.5">{group.description}</p>
       ) : null}
-      {pastLadder ? (
-        <p className="text-[11px] text-gray-tertiary mt-1.5">
-          Past the key ladder — annotators answer this question with the mouse only.
-        </p>
-      ) : null}
 
       {editOpen ? (
         <GroupEditForm
@@ -310,7 +346,10 @@ function GroupCard({
             key={c.class_key}
             className="flex items-center justify-between gap-3 rounded-xl border border-border px-3 py-2 opacity-70"
           >
-            <div className="flex items-baseline gap-2.5 min-w-0">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <span className="text-gray-tertiary">
+                <ClassIcon name={c.icon} />
+              </span>
               <span className="text-[13px] text-text">{c.name}</span>
               <span className="font-mono text-[11px] text-gray-tertiary">archived</span>
             </div>
@@ -493,6 +532,59 @@ function AddGroupForm({ busy, run }: { busy: boolean; run: Run }) {
   );
 }
 
+/* ------------------------------------------------------------------- icons */
+
+/* Pick an icon by SEEING it. A name list would make an operator translate
+   "probe" into the shape an annotator will actually scan for, and they would
+   get it wrong roughly as often as they got it right. Rendered as a radiogroup
+   of buttons rather than a <select>, because a native select cannot show the
+   glyphs and because there is no free-text path to leave open: the value ends up
+   in the DOM, so the only names that exist are the nine in ICON_CHOICES (the
+   server checks the same list again on write). */
+function IconPicker({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: LabelIconName;
+  onChange: (icon: LabelIconName) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[12px] text-gray-tertiary">
+        Icon — what the annotator's eye lands on before the word
+      </span>
+      <div role="radiogroup" aria-label="answer icon" className="flex items-center gap-1.5 flex-wrap">
+        {ICON_CHOICES.map((name) => {
+          const on = name === value;
+          return (
+            <button
+              key={name}
+              type="button"
+              role="radio"
+              aria-checked={on}
+              aria-label={name}
+              title={name}
+              disabled={disabled}
+              onClick={() => onChange(name)}
+              className={
+                "w-9 h-9 grid place-items-center rounded-xl border transition-colors duration-150 " +
+                (on
+                  ? "border-accent bg-accent-soft text-accent-deep"
+                  : "border-border text-gray-mid hover:border-accent hover:text-accent-deep") +
+                (disabled ? " opacity-40 cursor-not-allowed" : "")
+              }
+            >
+              <ClassIcon name={name} />
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /* ----------------------------------------------------------------- classes */
 
 function ClassRow({
@@ -504,8 +596,8 @@ function ClassRow({
   run,
 }: {
   cls: LabelClass;
-  /** The live hotkey badge from labelKeys — "" means the row ran out of
-      characters and this answer is mouse-only. */
+  /** The live hotkey badge from labelKeys — "" means this answer sits past the
+      ninth in its question and is mouse-only. */
   keyLabel: string;
   isFirst: boolean;
   isLast: boolean;
@@ -521,13 +613,19 @@ function ClassRow({
           {keyLabel !== "" ? (
             <Kbd>{keyLabel}</Kbd>
           ) : (
+            /* Past the ninth answer: say "mouse only" rather than showing a
+               blank slot, which reads as a rendering bug. A question this long
+               is a taxonomy problem — the digits deliberately do not wrap. */
             <span
-              className="inline-grid place-items-center min-w-6 h-6 text-[11px] text-gray-tertiary"
-              title="No key left on this row — mouse only"
+              className="inline-grid place-items-center h-6 px-1.5 rounded-md border border-dashed border-border font-mono text-[10px] leading-none text-gray-tertiary"
+              title="Past the ninth answer in this question — annotators pick it with the mouse"
             >
-              ·
+              mouse only
             </span>
           )}
+          <span className="text-gray-mid">
+            <ClassIcon name={cls.icon} />
+          </span>
           <span className="text-[13px] text-text">{cls.name}</span>
           {cls.is_escape ? (
             <span className="text-[11px] font-mono uppercase tracking-wider text-gray-tertiary border border-border rounded-full px-2 py-0.5">
@@ -581,6 +679,7 @@ function ClassEditForm({
 }) {
   const [name, setName] = useState(cls.name);
   const [desc, setDesc] = useState(cls.description);
+  const [icon, setIcon] = useState<LabelIconName>(asIconName(cls.icon));
   const [escape, setEscape] = useState(cls.is_escape);
 
   async function save() {
@@ -588,6 +687,7 @@ function ClassEditForm({
       updateLabelClass(cls.class_key, {
         name: name.trim(),
         description: desc.trim(),
+        icon,
         is_escape: escape,
       }),
     );
@@ -606,6 +706,7 @@ function ClassEditForm({
           <input className={INPUT_CLS + " w-full"} value={desc} onChange={(e) => setDesc(e.target.value)} />
         </label>
       </div>
+      <IconPicker value={icon} onChange={setIcon} disabled={busy} />
       <div className="flex items-center gap-5 flex-wrap">
         <label className="flex items-center gap-2 cursor-pointer text-[12px] text-gray-mid">
           <input
@@ -633,15 +734,25 @@ function ClassEditForm({
 function AddClassForm({ groupKey, busy, run }: { groupKey: string; busy: boolean; run: Run }) {
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
+  /* 'dot' is the neutral default, and it is a real choice rather than an absent
+     one: an answer with no icon still has to occupy the same slot on the option
+     row, or the rows would jump between iconed and un-iconed answers. */
+  const [icon, setIcon] = useState<LabelIconName>("dot");
   const [escape, setEscape] = useState(false);
 
   async function add() {
     const ok = await run(
-      createLabelClass(groupKey, { name: name.trim(), description: desc.trim(), is_escape: escape }),
+      createLabelClass(groupKey, {
+        name: name.trim(),
+        description: desc.trim(),
+        icon,
+        is_escape: escape,
+      }),
     );
     if (ok) {
       setName("");
       setDesc("");
+      setIcon("dot");
       setEscape(false);
     }
   }
@@ -659,7 +770,10 @@ function AddClassForm({ groupKey, busy, run }: { groupKey: string; busy: boolean
           <input className={INPUT_CLS + " w-full"} value={desc} onChange={(e) => setDesc(e.target.value)} />
         </label>
       </div>
-      <div className="flex items-center gap-5 flex-wrap mt-2.5">
+      <div className="mt-3">
+        <IconPicker value={icon} onChange={setIcon} disabled={busy} />
+      </div>
+      <div className="flex items-center gap-5 flex-wrap mt-3">
         <label className="flex items-center gap-2 cursor-pointer text-[12px] text-gray-mid">
           <input
             type="checkbox"
@@ -672,7 +786,9 @@ function AddClassForm({ groupKey, busy, run }: { groupKey: string; busy: boolean
         <span className="ml-auto">
           {/* Disabled until BOTH name and definition are written (§5.4): an
               option with no definition is the single largest source of
-              annotator disagreement. */}
+              annotator disagreement. The icon is never a gate — 'dot' is a
+              legitimate answer to "which icon", and blocking on it would only
+              teach powerusers to pick one at random. */}
           <Button
             variant="ghost"
             onClick={() => void add()}
@@ -706,7 +822,7 @@ function MoveButtons({
       <button
         type="button"
         aria-label={`move ${what} up`}
-        title="Move up (changes the hotkeys annotators see)"
+        title="Move up (changes the number keys annotators see)"
         disabled={disabledUp}
         onClick={() => onMove("up")}
         className={
@@ -721,7 +837,7 @@ function MoveButtons({
       <button
         type="button"
         aria-label={`move ${what} down`}
-        title="Move down (changes the hotkeys annotators see)"
+        title="Move down (changes the number keys annotators see)"
         disabled={disabledDown}
         onClick={() => onMove("down")}
         className={

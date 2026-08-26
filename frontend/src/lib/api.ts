@@ -24,10 +24,9 @@ import type {
   LabelStats,
   LabelMinePage,
   LabelSubmitReq,
-  LabelSkipReq,
+  LabelFlagReq,
   LabelEventReq,
   LabelWriteResult,
-  LabelUndoResult,
   LabelGroupReq,
   LabelGroupPatchReq,
   LabelClassReq,
@@ -599,10 +598,12 @@ export class TaxonomyStaleError extends Error {
   }
 }
 
-// The two writes that carry a taxonomy revision, and therefore the two that can
-// come back 409 `taxonomy_stale` with a body the caller has to branch on. jRaw
+// The annotation writes. `submitLabel` carries a taxonomy revision and can come
+// back 409 `taxonomy_stale` with a body the caller has to branch on; jRaw
 // consumes the error body to build its message, so these post by hand — the same
-// shape uploadVideos uses to surface `capture_day_required`.
+// shape uploadVideos uses to surface `capture_day_required`. `flagLabel` shares
+// the helper so it cannot silently lose that branch if the route ever starts
+// checking the revision, and so both writes fail identically.
 async function labelWrite<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
@@ -647,22 +648,25 @@ export function submitLabel(req: LabelSubmitReq): Promise<LabelWriteResult> {
   return labelWrite<LabelWriteResult>("/api/label/submit", req);
 }
 
-// A skip is an annotation with an outcome, not an error and not a 400. It is
-// counted separately from coverage: an instance one annotator could not judge is
-// still served to the next, and only retires after `skip_retire` distinct declines.
-export function skipLabel(req: LabelSkipReq): Promise<LabelWriteResult> {
-  return labelWrite<LabelWriteResult>("/api/label/skip", req);
-}
-
-// Supersede the caller's OWN last answer on an instance (scoped server-side, so
-// it can never touch another annotator's row). Nothing is deleted — the row stays
-// with outcome 'undone' — which is what makes undo safe to reach for on a mis-key.
-export function undoLabel(instanceKey: string): Promise<LabelUndoResult> {
-  return jRaw<LabelUndoResult>("/api/label/undo", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ instance_key: instanceKey }),
-  });
+// Flag an instance that cannot be answered. This REPLACES the old bare skip:
+// there is no longer a call that declines an instance without saying why, because
+// an escape hatch nobody has to justify gets pulled whenever the work gets hard.
+// The server 400s a missing or whitespace-only explanation, so a caller that
+// forgets to validate gets a hard error rather than a mystery row.
+//
+// The URL and the stored outcome are unchanged ('skipped', meaning "not
+// answered"): only the annotator-facing concept was renamed and stored rows are
+// deliberately not migrated, so re-pointing the write at a new path would split
+// one history across two names for nothing.
+//
+// The explanation goes out under BOTH `explanation` and `note`. `note` is the
+// field the route has always carried into the existing `annotations.flag_note`
+// column, `explanation` is what this rework calls it, and the two land in the
+// same place; sending both means the client is correct against either spelling
+// while the backend half of the rework is in flight (unknown fields are ignored
+// server-side). Collapse to one key once the route settles.
+export function flagLabel(req: LabelFlagReq): Promise<LabelWriteResult> {
+  return labelWrite<LabelWriteResult>("/api/label/skip", { ...req, note: req.explanation });
 }
 
 // Effort telemetry (session boundaries, info_opened). Fire-and-forget at the call

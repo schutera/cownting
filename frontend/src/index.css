@@ -64,5 +64,51 @@ body {
 :root { --radius: 14px; }
 
 /* Height of the sticky app header (App.tsx: 40px logo + py-4 + 1px border).
-   Page-level sticky toolbars offset by this so they park just under it. */
-:root { --app-header-h: 73px; }
+   Page-level sticky toolbars offset by this so they park just under it.
+
+   75px, not the 73px the arithmetic above suggests: the header's second line
+   ("solar-field herd analytics") is set in a font whose line box rounds the
+   real rendered height to ~74.6px. A sticky toolbar that is 2px short merely
+   looks slightly off, which is why this went unnoticed — but the Label route
+   pins its surface to `100vh - var(--app-header-h)`, so the same 2px became a
+   page scrollbar on a screen the layout is supposed to fit exactly. Measured,
+   not derived; re-measure if the header's type or padding changes. */
+:root { --app-header-h: 75px; }
+
+/* ---- Label route surface (M3 labeling UX §2.2) ----
+   The Label screen is the ONE dark surface in an otherwise warm-paper app, and
+   that is a correctness argument rather than a taste one: question 1 asks the
+   annotator to judge how brightly lit a cow is, and an 888px near-white card
+   wrapped around a 440px photograph biases perceived brightness of the exact
+   region being judged. Diagnostic reading rooms are specified at roughly
+   25-75 lux (ACR/AAPM TG-18 lineage) for the same reason. The crop must be the
+   brightest thing on screen.
+
+   Scoped to `[data-surface="label"]`, which the Label route puts on its own
+   wrapper, so these leak into nothing else. They are plain custom properties and
+   deliberately NOT `@theme` entries: `@theme` would mint `bg-lbl-*` utilities
+   across the whole app and invite this palette onto pages it would be wrong on.
+   Components read them as `var(--lbl-*, #literal)` so they stay legible if one
+   is ever mounted outside the wrapper.
+
+   Two hues plus neutral, and no third hue anywhere in the answer area. The warm
+   / cool pair is the alternation that marks the digit rebind between questions
+   (§5.1) — amber vs teal sits on the blue-yellow axis and so survives both
+   protanopia and deuteranopia, and it is never the only channel carrying that
+   state. `--lbl-accent` is not declared here: QuestionPanel sets it per active
+   question, and that is how the tiles inherit the current question's colour. */
+[data-surface="label"] {
+  --lbl-bg: #16181A;        /* page background */
+  --lbl-card: #1E2124;      /* main column and side panel */
+  --lbl-tile: #262A2E;      /* unselected tile */
+  --lbl-ink: #E8EAEC;       /* primary text */
+  --lbl-ink-dim: #9AA1A7;   /* labels, hints */
+  --lbl-q1: #E0A03C;        /* Sun exposure accent (warm) */
+  --lbl-q1-field: #2A2418;  /* Sun exposure panel field */
+  --lbl-q2: #3FB8AE;        /* Behaviour accent (cool) */
+  --lbl-q2-field: #152526;  /* Behaviour panel field */
+  --lbl-alarm: #C8CDD2;     /* flag / defect states — no hue at all, so a
+                               flagged item can never read as a sun class (§5.4);
+                               the dash and the 45deg hatch are the other two
+                               channels and are drawn by the components. */
+}

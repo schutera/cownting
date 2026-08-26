@@ -265,15 +265,26 @@ def test_queue_policy():
         check("a labeled instance never comes back to the same annotator",
               all(it["instance_key"] != mine["instance_key"] for it in after))
 
-        # A skip removes it from MY queue but leaves it for others (mine=all
+        # Flagging removes it from MY queue but leaves it for others (mine=all
         # shows the pool another annotator would still be offered).
+        #
+        # An UNEXPLAINED escape is refused: skipping as a bare action was removed
+        # deliberately, so this route now demands a written justification as well
+        # as a reason code. An instance nobody could answer is a finding about the
+        # data, and a finding with no explanation attached is not usable later.
         skipped = after[0]
-        r = client.post("/api/label/skip", json={
-            "instance_key": skipped["instance_key"], "anchor": _anchor(skipped),
-            "reason": "occluded"})
-        check("skip -> 200", r.status_code == 200, str(r.status_code))
+        bare = {"instance_key": skipped["instance_key"], "anchor": _anchor(skipped),
+                "reason": "occluded"}
+        r = client.post("/api/label/skip", json=bare)
+        check("flag with no explanation -> 400", r.status_code == 400, str(r.status_code))
+        r = client.post("/api/label/skip", json={**bare, "note": "   "})
+        check("flag with a whitespace-only explanation -> 400",
+              r.status_code == 400, str(r.status_code))
+
+        r = client.post("/api/label/skip", json={**bare, "note": "panel leg hides the whole body"})
+        check("flag with reason + explanation -> 200", r.status_code == 200, str(r.status_code))
         after_skip = client.get("/api/label/queue").json()["items"]
-        check("a skipped instance leaves my queue",
+        check("a flagged instance leaves my queue",
               all(it["instance_key"] != skipped["instance_key"] for it in after_skip))
         pool = client.get("/api/label/queue?mine=all").json()["items"]
         check("...but stays in the pool for other annotators",

@@ -3,94 +3,193 @@ import { Link } from "react-router-dom";
 import { canManageData, useAuth } from "../lib/auth";
 import type {
   InstanceAnchor,
+  LabelClass,
+  LabelFlagReq,
   LabelGroup,
   LabelInputMode,
   LabelItem,
   LabelSkipReason,
-  LabelSkipReq,
   LabelStats,
   LabelSubmitReq,
   Taxonomy,
 } from "../lib/types";
+import { getLabelProgress, getLabelQueue, getTaxonomy, postLabelEvent } from "../lib/api";
 import {
-  getLabelProgress,
-  getLabelQueue,
-  getTaxonomy,
-  postLabelEvent,
-  skipLabel,
-  submitLabel,
-  TaxonomyStaleError,
-  undoLabel,
-} from "../lib/api";
-import type { LabelKeyMap } from "../lib/labelKeys";
-import {
-  actionForEvent,
-  buildKeyMap,
-  groupKeyHint,
   isTypingTarget,
   LABEL_ACTIONS,
-  optionForEvent,
+  resolveLabelKey,
+  visibleClasses,
+  visibleGroups,
 } from "../lib/labelKeys";
+import { emitDecisionEvent, useAnswerQueue } from "../lib/useAnswerQueue";
+import type { AnswerQueueSync, LabelWrite } from "../lib/useAnswerQueue";
+import { ClassIcon } from "../components/ClassIcon";
 import { InstanceCrop } from "../components/InstanceCrop";
-import { LabelGroupList } from "../components/LabelGroup";
+import { PANEL_H, QuestionPanel } from "../components/QuestionPanel";
+import { TILE_GAP, TILE_H, TILE_W } from "../components/OptionTile";
 import { LabelProgress } from "../components/LabelProgress";
-import { Button, Card, Kbd, SectionLabel } from "../components/ui";
+import { MAX_RECENT } from "../components/RecentStrip";
+import type { RecentItem } from "../components/RecentStrip";
 
-/* The labeling screen (docs/roadmap/M3_labeling.md §5). This page owns every
- * keystroke, the prefetch buffer, submit/skip/flag/undo, the served-event
- * plumbing (`serve_event_id` + `client_elapsed_ms` echoed on every write), and
- * the five DISTINCT terminal states of §5.6 — "nothing to label" has different
- * causes with different next actions, so they are never collapsed into one.
+/* The labeling screen (docs/roadmap/M3_labeling_ux.md; data model in
+ * docs/roadmap/M3_labeling.md §5).
  *
- * The queue is self-consuming and idempotent (no leases, §4.2), so the buffer
- * here is purely a latency device: a batch is held client-side, upcoming crops
- * are decoded ahead via `new Image()`, and a refetch with `exclude` always
- * advances. Undo pushes the item back to the HEAD of this buffer with its
- * previous selections re-applied — U means "fix the one option I fumbled",
- * not "answer both questions again".
+ * ONE ITEM = ONE SCREEN = ONE FIXATION REGION + ONE SACCADE PER QUESTION (§2.1).
+ * The previous layout stacked both questions as full-width rows under the crop,
+ * which put the nearest answer 293px and the furthest 737px below the ringed
+ * animal and pushed the second question and the Save button off a 1366x768
+ * viewport entirely. Everything below is arithmetic in service of that one rule:
+ * the crop is sized by SUBTRACTION from the viewport (§2.3), the question panel
+ * is a fixed-height rectangle that Q2 replaces Q1 inside (§2.7), and nothing in
+ * the per-item loop is ever reachable only by scrolling.
+ *
+ * THREE THINGS THIS FILE EXISTS TO NOT DO AGAIN:
+ *
+ *  1. ARROW OWNERSHIP (§3.8). The old option rows were `<input type="radio">` in
+ *     a `role="radiogroup"`, which moves the checked radio on Left/Right and
+ *     fires onChange — so one mouse click on an option armed ArrowLeft to WRITE
+ *     A LABEL instead of moving the tape. The tiles are buttons now, and this
+ *     page's key listener is registered in the CAPTURE phase and preventDefaults
+ *     the arrows and Space before anything else can see them.
+ *
+ *  2. THE KEYBOARD IS NEVER BLOCKED (§3.5). `applyAnswer` has no `busy` guard and
+ *     awaits nothing. Answers go into memory and into the optimistic queue; the
+ *     sync state is displayed rather than waited on. A dropped keypress is worse
+ *     than a slow save, because the annotator presses again and the second press
+ *     lands on the next cow.
+ *
+ *  3. ANSWERS ARE KEYED BY INSTANCE KEY (§3.4, §6.2). There is deliberately no
+ *     single "current answers" object: a shared object is exactly how an answer
+ *     gets recorded against a cow the annotator was not looking at, which is the
+ *     worst bug this feature can have. Every write path reads and writes
+ *     `answersByKey[item.instance_key]` for an item captured in the same closure
+ *     as the keystroke that caused it.
+ *
+ * WHAT IS INHERITED FROM THE OLD SCREEN, because it was right: the prefetch
+ * buffer and its `exclude`-based refill, the served-event plumbing
+ * (`serve_event_id` + `client_elapsed_ms` echoed on every write), the five
+ * DISTINCT terminal states of §5.6 (a caught-up queue, an empty pool, a crop the
+ * server would not serve, a failed write and an unusable taxonomy have different
+ * causes and different next actions, so they are never collapsed into one), the
+ * crop prefetch, and the visibility-aware ACTIVE clock — which is now also what
+ * the per-decision timings of §6.1 are measured on, so a tab-away cannot present
+ * as a five-minute decision.
+ *
+ * WHAT IS GONE, per §7 and the six fixed decisions: Save/Enter (selection IS
+ * submission), Skip/S and the skip dialog (skipping is abolished; an instance
+ * that cannot be answered is FLAGGED, with a reason and a written explanation),
+ * Undo/U (ArrowLeft is the undo), the `?` sheet and the definitions toggle/I
+ * (definitions open one at a time from a tile's info dot into the side panel's
+ * reserved slot), every preference and every localStorage read.
  */
 
-const DEFS_KEY = "cownting.label.defs";
-const AUTOSUBMIT_KEY = "cownting.label.autosubmit";
-/* Refetch when the buffer shrinks to this many items — early enough that the
-   next batch lands before the annotator drains what is left. */
-const REFILL_AT = 3;
-/* Crops decoded ahead of the current one. The server's ETag + max-age makes the
-   later real <img> load a cache hit, so this is one request per item, not two. */
-const PREFETCH_AHEAD = 3;
-/* Keys we just wrote, still excluded from refetches: our own submit may not be
-   visible to the queue scan yet, and being served an item we answered seconds
-   ago reads as a bug even when it is only a race. */
-const RECENT_CAP = 100;
-/* Undo depth. The server can supersede any of our rows by key, so this is only
-   how far back the client can re-present an item with its selections intact. */
-const UNDO_CAP = 50;
+// ---------------------------------------------------------------- §2.3 budget
+// Below the 73px sticky header a 1366x768 browser gives about 620px. The fixed
+// chrome is 302px (28 strip + 16 main pad + 16 card pad + 8 gap + 160 panel +
+// 10 gap + 32 footer + 16 card pad + 16 main pad), and 414 is that plus ~112px
+// of browser chrome. These are a layout CONTRACT with QuestionPanel's PANEL_H
+// and OptionTile's tile box — every pixel added here comes off the crop on a
+// small screen — which is why they are named constants and not utility classes.
+const CROP_MIN = 300;
+const CROP_MAX = 440;
+const CROP_CHROME = 414;
+const STRIP_H = 28;
+const FOOTER_H = 32;
+const CARD_PAD = 16;
+const CROP_GAP = 8;
+const PANEL_GAP = 10;
+// Space-hold (§2.4) blows the crop up to the full column height. It is a
+// transform, never a resize: reflowing the panel under the annotator's hand is
+// the mis-click this whole redesign is about.
+const INSPECT_CHROME = 150;
+const INSPECT_MAX_SCALE = 1.75;
 
-/* Wording for the frozen skip reasons (types.ts LabelSkipReason). The digit is
-   the in-overlay hotkey; the blurb is why the reason exists. */
-const SKIP_REASONS: { reason: LabelSkipReason; label: string; blurb: string }[] = [
-  { reason: "bad_crop", label: "Bad crop", blurb: "the ring doesn't frame a judgeable animal" },
-  { reason: "no_cow", label: "No cow", blurb: "there is no animal in the ring at all" },
-  { reason: "multiple_cows", label: "Multiple cows", blurb: "two or more animals share the ring" },
-  { reason: "occluded", label: "Occluded", blurb: "a panel or another cow hides too much of it" },
-  { reason: "other", label: "Other", blurb: "something else is wrong with this one" },
+// Refetch when this few items remain AHEAD of the cursor — early enough that the
+// next batch lands before the annotator drains what is left.
+const REFILL_AT = 3;
+// Crops decoded ahead of the current one. The server's ETag + max-age makes the
+// later real <img> load a cache hit, so this is one request per item, not two.
+const PREFETCH_AHEAD = 3;
+// Keys we just wrote, still excluded from refetches: our own submit may not be
+// visible to the queue scan yet, and being served an item we answered seconds
+// ago reads as a bug even when it is only a race.
+const RECENT_CAP = 100;
+// Mirrors AnnotationCfg.max_note_chars (config §3.6): the server truncates
+// anyway; matching it here just keeps the annotator from typing past the cap.
+const MAX_NOTE_CHARS = 500;
+// A pool query per answered item would be one GET every ~3s of an eight-hour
+// shift. The panel's numbers are feedback, not state, so they can lag.
+const STATS_MIN_INTERVAL_MS = 5_000;
+// How long a transient footer line stays up. Long enough to read at a glance,
+// short enough that it is gone before the next item is answered.
+const HINT_MS = 2_400;
+// §3.4: answering the last question on a REVISITED item saves and stays; the
+// chip is the only thing that says the correction landed.
+const SAVED_CHIP_MS = 800;
+
+const HAIRLINE = "rgba(255, 255, 255, 0.09)";
+const INK = "var(--lbl-ink, #E8EAEC)";
+const INK_DIM = "var(--lbl-ink-dim, #9AA1A7)";
+const CARD = "var(--lbl-card, #1E2124)";
+const TILE = "var(--lbl-tile, #262A2E)";
+const ALARM = "var(--lbl-alarm, #C8CDD2)";
+// The Q1 accent, reused to light the zoom chip while Space is held. Not a third
+// hue (§2.2 forbids one) — it is the warm tone already on screen.
+const ACCENT_WARM = "var(--lbl-q1, #E0A03C)";
+
+/* The five frozen flag reasons (types.ts LabelSkipReason), as a tile row bound
+   to 1..5. `multiple_cows` in particular is a direct detector-quality signal, so
+   the reason is asked AT THE PIXELS — three hundred items later it cannot be
+   reconstructed from a thumbnail. The glyphs come from the same ClassIcon
+   vocabulary the answers use; there is no flag-specific icon set to keep in
+   sync, and `question` is already the screen's "I don't know" landmark. */
+const FLAG_REASONS: { reason: LabelSkipReason; label: string; icon: string }[] = [
+  { reason: "bad_crop", label: "Bad crop", icon: "eye-off" },
+  { reason: "no_cow", label: "No cow", icon: "question" },
+  { reason: "multiple_cows", label: "Multiple cows", icon: "dot" },
+  { reason: "occluded", label: "Occluded", icon: "shade" },
+  { reason: "other", label: "Other", icon: "question" },
 ];
 
-/* Mirrors AnnotationCfg.max_note_chars (config §3.6): the server truncates
-   anyway; matching it here just keeps the annotator from typing past the cap. */
-const MAX_NOTE_CHARS = 500;
+/* The page's own keyframes. index.css belongs to the whole app and this feature
+   is not allowed to extend it, so the three animations that are genuinely this
+   screen's live here — the same call QuestionPanel makes. */
+const PAGE_CSS = `
+@keyframes lbl-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes lbl-sync-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.lbl-crop-in { animation: lbl-fade-in 100ms ease-out both; }
+.lbl-sync-retry { animation: lbl-sync-pulse 1.2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .lbl-crop-in { animation-duration: 1ms; }
+  .lbl-sync-retry { animation: none; }
+}
+`;
 
-type OverlayKind = "help" | "skip" | "flag";
+/** The tape: every item served this session, in presentation order, plus where
+    the annotator is standing on it. ONE state object rather than three, because
+    `cursor` and `frontier` are indices INTO `items` — trimming the tail of
+    history has to move all three or an ArrowLeft lands on the wrong cow. */
+interface Tape {
+  items: LabelItem[];
+  /** The item on screen. Equals `items.length` only while the buffer refills. */
+  cursor: number;
+  /** The first item not yet answered — the head of the tape. `cursor < frontier`
+      IS the review phase; there is no separate boolean to fall out of step. */
+  frontier: number;
+}
 
-/* A failed submit or skip, held so the `online` event (and a manual "Try again")
-   can re-send the SAME request. The item never advances until it lands. */
-type PendingWrite =
-  | { kind: "submit"; req: LabelSubmitReq; item: LabelItem }
-  | { kind: "skip"; req: LabelSkipReq; item: LabelItem };
+interface FlagDraft {
+  open: boolean;
+  reason: LabelSkipReason | null;
+  explanation: string;
+}
 
-interface UndoEntry {
-  item: LabelItem;
-  answers: Record<string, string | string[]>;
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, v));
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 /* The anchor echoed back verbatim from the queue item — the server re-hashes it
@@ -108,49 +207,16 @@ function anchorOf(item: LabelItem): InstanceAnchor {
   };
 }
 
-function errMsg(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
 /* label_events.session_id is documented as uuid4 hex (32 chars, no dashes).
    Built from getRandomValues, NOT crypto.randomUUID: randomUUID is
    [SecureContext]-only and this dashboard is reachable over plain LAN http,
-   where it would throw on mount. getRandomValues is what Admin.tsx's credential
-   proposer already leans on, so it is a known-good primitive here. */
+   where it would throw on mount. */
 function newSessionId(): string {
   const buf = new Uint8Array(16);
   crypto.getRandomValues(buf);
   buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
   buf[8] = (buf[8] & 0x3f) | 0x80; // RFC 4122 variant
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function loadDefs(): Set<string> {
-  try {
-    const raw = localStorage.getItem(DEFS_KEY);
-    if (raw === null) return new Set();
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((v): v is string => typeof v === "string"));
-  } catch {
-    return new Set();
-  }
-}
-
-/* Drop unanswered groups from the submit body: an empty string or empty list is
-   "no answer", not an answer, and the server 400s a submit with zero choices. */
-function pruneAnswers(
-  answers: Record<string, string | string[]>,
-): Record<string, string | string[]> {
-  const out: Record<string, string | string[]> = {};
-  for (const [k, v] of Object.entries(answers)) {
-    if (Array.isArray(v)) {
-      if (v.length > 0) out[k] = v;
-    } else if (v !== "") {
-      out[k] = v;
-    }
-  }
-  return out;
 }
 
 export default function Label() {
@@ -162,128 +228,185 @@ export default function Label() {
 
   const [taxonomy, setTaxonomy] = useState<Taxonomy | null>(null);
   const [taxonomyError, setTaxonomyError] = useState<string | null>(null);
+  const [staleNotice, setStaleNotice] = useState<string | null>(null);
   const [stats, setStats] = useState<LabelStats | null>(null);
 
-  // The prefetch buffer. `bufferRef` mirrors the state so the async paths and
-  // the (stable, ref-delegated) hotkey handler never act on a stale snapshot.
-  const [buffer, setBuffer] = useState<LabelItem[]>([]);
-  const bufferRef = useRef<LabelItem[]>([]);
-  const setBufferState = useCallback((next: LabelItem[]) => {
-    bufferRef.current = next;
-    setBuffer(next);
+  const [tape, setTapeState] = useState<Tape>({ items: [], cursor: 0, frontier: 0 });
+  // Mirrored so the async refill and the key handler never act on a snapshot
+  // that is one render old — being served a duplicate of the cow on screen, or
+  // advancing past one, both present as data bugs rather than as races.
+  const tapeRef = useRef<Tape>(tape);
+  const setTape = useCallback((next: Tape) => {
+    tapeRef.current = next;
+    setTapeState(next);
   }, []);
+
+  // group_key -> class_key, PER INSTANCE. Never one shared object (see header).
+  const [answersByKey, setAnswersByKey] = useState<Record<string, Record<string, string>>>({});
+  const [flaggedByKey, setFlaggedByKey] = useState<Record<string, LabelSkipReason>>({});
+
+  const [step, setStep] = useState(0);
+  const [flag, setFlag] = useState<FlagDraft>({ open: false, reason: null, explanation: "" });
+  const [openDefinitionKey, setOpenDefinitionKey] = useState<string | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
+  const [shakeNonce, setShakeNonce] = useState(0);
+  const [savedChip, setSavedChip] = useState(false);
+  const [inspect, setInspect] = useState(false);
+  const [failedKey, setFailedKey] = useState<string | null>(null);
+
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   // The last refetch produced nothing new — stop polling until a write changes
   // the pool or the annotator asks to check again.
   const [queueDrained, setQueueDrained] = useState(false);
   const fetchingRef = useRef(false);
-  const recentRef = useRef<string[]>([]);
+  const recentWrittenRef = useRef<string[]>([]);
 
-  const [answers, setAnswers] = useState<Record<string, string | string[]>>({});
-  const [busy, setBusy] = useState(false);
-  const [nudge, setNudge] = useState<string | null>(null);
-  const [staleNotice, setStaleNotice] = useState<string | null>(null);
-  const [writeError, setWriteError] = useState<string | null>(null);
-  const [pending, setPending] = useState<PendingWrite | null>(null);
-  const [overlay, setOverlay] = useState<OverlayKind | null>(null);
-  const [hideRing, setHideRing] = useState(false);
-  const [failedKey, setFailedKey] = useState<string | null>(null);
+  // Side-panel feedback (§2.5). All of it is per-session and owned here: the
+  // corpus-wide LabelStats cannot say how TODAY is going.
+  const [mix, setMix] = useState<Record<string, number>>({});
+  const [recentMs, setRecentMs] = useState<number[]>([]);
+  const [flagCount, setFlagCount] = useState(0);
 
-  const [openDefs, setOpenDefs] = useState<ReadonlySet<string>>(loadDefs);
-  const [autoSubmit, setAutoSubmitState] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(AUTOSUBMIT_KEY) === "1";
-    } catch {
-      return false;
-    }
-  });
+  const [viewportH, setViewportH] = useState(() => window.innerHeight);
 
-  const undoStackRef = useRef<UndoEntry[]>([]);
-  // The modality that ANSWERED (not the one that saved): set by every answer
-  // action, reported as input_mode, reset per item.
-  const lastModeRef = useRef<LabelInputMode | null>(null);
-  const prefetchedRef = useRef<Set<string>>(new Set());
-
-  // Per-item ACTIVE clock for client_elapsed_ms — the tab-away detector. Only
-  // visible time counts: banked on hide, resumed on show, reset per item.
-  const clockAccumRef = useRef(0);
-  const clockVisibleSinceRef = useRef<number | null>(null);
-  const activeElapsedMs = useCallback((): number => {
-    const since = clockVisibleSinceRef.current;
-    const live = since === null ? 0 : performance.now() - since;
-    return Math.max(0, Math.round(clockAccumRef.current + live));
+  // ------------------------------------------------------------- active clock
+  // Only VISIBLE time counts: banked on hide, resumed on show. One running total
+  // for the mount, with two marks taken off it — the item's and the active
+  // question's — so `presented -> answered` and `answered -> answered` are both
+  // measured on the same tab-away-proof clock (§6.1, §8.2).
+  const accumRef = useRef(0);
+  const sinceRef = useRef<number | null>(null);
+  const activeNow = useCallback((): number => {
+    const since = sinceRef.current;
+    return accumRef.current + (since === null ? 0 : performance.now() - since);
   }, []);
+  const itemMarkRef = useRef(0);
+  const groupMarkRef = useRef(0);
+
+  useEffect(() => {
+    sinceRef.current = document.visibilityState === "visible" ? performance.now() : null;
+    const onVis = () => {
+      if (document.visibilityState === "hidden") {
+        if (sinceRef.current !== null) {
+          accumRef.current += performance.now() - sinceRef.current;
+          sinceRef.current = null;
+        }
+      } else if (sinceRef.current === null) {
+        sinceRef.current = performance.now();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  // ------------------------------------------------------------ derived state
 
   const groups = useMemo(() => taxonomy?.groups ?? [], [taxonomy]);
-  const keys = useMemo(() => buildKeyMap(groups), [groups]);
-  const groupByKey = useMemo(() => new Map(groups.map((g) => [g.group_key, g])), [groups]);
-  // "Taxonomy empty" means no active group has an answerable (active) class.
-  const taxonomyUsable = keys.groups.some((g) => g.options.length > 0);
+  // The questions, in the order they are answered. A group whose classes are all
+  // archived is dropped entirely rather than shown as an unanswerable step —
+  // it would be a rectangle with no way out.
+  const steps = useMemo(
+    () => visibleGroups(groups).filter((g) => visibleClasses(g).length > 0),
+    [groups],
+  );
+  const taxonomyUsable = steps.length > 0;
+  // The tile row reserves the WIDEST question's width so the frame does not
+  // resize at the handoff (§2.7).
+  const reserveOptions = useMemo(
+    () => steps.reduce((n, g) => Math.max(n, visibleClasses(g).length), 1),
+    [steps],
+  );
 
-  const current: LabelItem | null = buffer.length > 0 ? buffer[0] : null;
+  const current: LabelItem | null = tape.cursor < tape.items.length ? tape.items[tape.cursor] : null;
   const currentKey = current?.instance_key ?? null;
+  const reviewing = current !== null && tape.cursor < tape.frontier;
   const cropFailed = currentKey !== null && failedKey === currentKey;
+  const flaggedReason = currentKey === null ? undefined : flaggedByKey[currentKey];
 
-  // ------------------------------------------------------------- preferences
+  const EMPTY_ANSWERS: Record<string, string> = useMemo(() => ({}), []);
+  const answers = currentKey === null ? EMPTY_ANSWERS : (answersByKey[currentKey] ?? EMPTY_ANSWERS);
 
-  const updateDefs = useCallback((next: Set<string>) => {
-    setOpenDefs(next);
-    try {
-      localStorage.setItem(DEFS_KEY, JSON.stringify([...next]));
-    } catch {
-      /* private mode etc. — the toggle still works for this session */
-    }
-  }, []);
+  const activeGroup: LabelGroup | null = steps.length === 0 ? null : steps[Math.min(step, steps.length - 1)];
+  const activeOptions = useMemo(
+    () => (activeGroup === null ? [] : visibleClasses(activeGroup)),
+    [activeGroup],
+  );
 
-  const setAutoSubmit = useCallback((on: boolean) => {
-    setAutoSubmitState(on);
-    try {
-      localStorage.setItem(AUTOSUBMIT_KEY, on ? "1" : "0");
-    } catch {
-      /* ditto */
-    }
-  }, []);
-
-  function allDefKeys(): Set<string> {
-    const all = new Set<string>();
+  const definitionClass: LabelClass | null = useMemo(() => {
+    if (openDefinitionKey === null) return null;
     for (const g of groups) {
-      if (!g.active) continue;
-      if (g.description !== null && g.description !== "") all.add(g.group_key);
-      for (const c of g.classes) if (c.active) all.add(c.class_key);
+      for (const c of g.classes) if (c.class_key === openDefinitionKey) return c;
     }
-    return all;
-  }
+    return null;
+  }, [groups, openDefinitionKey]);
 
-  function setAllDefs(on: boolean) {
-    updateDefs(on ? allDefKeys() : new Set());
-  }
+  const recentItems: RecentItem[] = useMemo(() => {
+    const done = tape.items.slice(0, tape.frontier);
+    return done
+      .slice(-MAX_RECENT)
+      .reverse()
+      .map((it) => ({ instance_key: it.instance_key, crop_url: it.crop_url }));
+  }, [tape]);
 
-  function toggleAllDefs() {
-    setAllDefs(openDefs.size === 0);
-  }
+  const cropPx = clamp(CROP_MIN, viewportH - CROP_CHROME, CROP_MAX);
+  const inspectScale = clamp(1, (viewportH - INSPECT_CHROME) / cropPx, INSPECT_MAX_SCALE);
 
-  function onToggleDef(key: string) {
-    const next = new Set(openDefs);
-    if (next.has(key)) {
-      next.delete(key);
-    } else {
-      next.add(key);
-      // A deliberate single open is the "this definition is ambiguous" signal
-      // (SQL_INFO_ICON_PRESSURE); the mass `I` toggle deliberately sends nothing.
-      postLabelEvent({
-        session_id: sessionId,
-        kind: "info_opened",
-        instance_key: bufferRef.current[0]?.instance_key ?? null,
-        class_key: key,
-      }).catch(() => {});
-    }
-    updateDefs(next);
-  }
+  useEffect(() => {
+    const onResize = () => setViewportH(window.innerHeight);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
-  // ------------------------------------------------------------ data fetching
+  // The Label route is the app's ONE dark surface (§2.2), and the argument is
+  // correctness rather than taste: Q1 asks how brightly lit an animal is, and a
+  // near-white page around the photograph biases the judgement. `main` is shared
+  // chrome, so the wrapper cancels its padding with negative margins and the
+  // body colour is set for the mount and restored on the way out — no other
+  // route sees either.
+  useEffect(() => {
+    const previous = document.body.style.backgroundColor;
+    document.body.style.backgroundColor = "#16181A";
+    return () => {
+      document.body.style.backgroundColor = previous;
+    };
+  }, []);
 
-  const refreshStats = useCallback(() => {
+  // ------------------------------------------------------------ nudges & shake
+
+  const hintTimer = useRef<number | null>(null);
+  const showHint = useCallback((text: string) => {
+    setHint(text);
+    if (hintTimer.current !== null) window.clearTimeout(hintTimer.current);
+    hintTimer.current = window.setTimeout(() => setHint(null), HINT_MS);
+  }, []);
+  // A dead key must be SEEN (§3.3): CVAT #8400 shipped a build where keys 0-8
+  // worked and 9 silently did nothing, and a silent no-op on this screen is
+  // indistinguishable from a slow save — the annotator presses again.
+  const shake = useCallback(() => setShakeNonce((n) => n + 1), []);
+
+  const chipTimer = useRef<number | null>(null);
+  const showSavedChip = useCallback(() => {
+    setSavedChip(true);
+    if (chipTimer.current !== null) window.clearTimeout(chipTimer.current);
+    chipTimer.current = window.setTimeout(() => setSavedChip(false), SAVED_CHIP_MS);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (hintTimer.current !== null) window.clearTimeout(hintTimer.current);
+      if (chipTimer.current !== null) window.clearTimeout(chipTimer.current);
+    },
+    [],
+  );
+
+  // ------------------------------------------------------------- data fetching
+
+  const lastStatsRef = useRef(0);
+  const refreshStats = useCallback((force = false) => {
+    const t = Date.now();
+    if (!force && t - lastStatsRef.current < STATS_MIN_INTERVAL_MS) return;
+    lastStatsRef.current = t;
     getLabelProgress()
       .then(setStats)
       .catch(() => {
@@ -296,28 +419,29 @@ export default function Label() {
     fetchingRef.current = true;
     setFetching(true);
     try {
-      const have = bufferRef.current.map((i) => i.instance_key);
-      // Buffer keys first: api.ts slices exclude to the server's 200 cap, and
-      // losing a recent key to the cap is survivable, losing a buffered one
-      // would serve us a duplicate of what is already on screen.
-      const q = await getLabelQueue({ exclude: [...have, ...recentRef.current] });
-      const known = new Set([...have, ...recentRef.current]);
+      const have = tapeRef.current.items.map((i) => i.instance_key);
+      // Tape keys first: api.ts slices `exclude` to the server's 200 cap, and
+      // losing a recently-written key to the cap is survivable while losing a
+      // tape key would serve us a duplicate of what is already on screen.
+      const q = await getLabelQueue({ exclude: [...have, ...recentWrittenRef.current] });
+      const known = new Set([...have, ...recentWrittenRef.current]);
       const fresh = q.items.filter((i) => !known.has(i.instance_key));
       if (fresh.length === 0) {
         setQueueDrained(true);
       } else {
-        setBufferState([...bufferRef.current, ...fresh]);
+        const t = tapeRef.current;
+        setTape({ ...t, items: [...t.items, ...fresh] });
       }
       setFetchError(null);
     } catch (e) {
-      // Only fatal when there is nothing left to work on — with items still
-      // buffered the annotator keeps labeling and the next write retriggers.
-      if (bufferRef.current.length === 0) setFetchError(errMsg(e));
+      // Only fatal when there is nothing left to work on — with items still on
+      // the tape the annotator keeps labeling and the next write retriggers.
+      if (tapeRef.current.items.length === 0) setFetchError(errMsg(e));
     } finally {
       fetchingRef.current = false;
       setFetching(false);
     }
-  }, [setBufferState]);
+  }, [setTape]);
 
   // Boot: taxonomy, stats, session bracket. StrictMode double-mounts this; the
   // extra start/end pair is harmless fire-and-forget telemetry and the GETs are
@@ -346,443 +470,558 @@ export default function Label() {
     };
   }, [sessionId]);
 
-  // Keep the buffer topped up. Waits for the taxonomy: an item without its
-  // questions is unanswerable, and the queue GET writes served events we would
-  // waste (§4.2 — every serve is an abandonment candidate until answered).
+  // Keep the tape topped up AHEAD of the cursor. Waits for the taxonomy: an item
+  // without its questions is unanswerable, and the queue GET writes served
+  // events we would waste (§4.2 — every serve is an abandonment candidate until
+  // it is answered).
+  const ahead = tape.items.length - tape.cursor - 1;
   useEffect(() => {
     if (taxonomy === null || queueDrained) return;
-    if (buffer.length > REFILL_AT) return;
+    if (ahead > REFILL_AT) return;
     void refill();
-  }, [taxonomy, buffer.length, queueDrained, refill]);
+  }, [taxonomy, ahead, queueDrained, refill]);
 
   // Decode upcoming crops off-screen so advancing swaps pixels instantly.
+  const prefetchedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    for (const it of buffer.slice(1, 1 + PREFETCH_AHEAD)) {
+    for (const it of tape.items.slice(tape.cursor + 1, tape.cursor + 1 + PREFETCH_AHEAD)) {
       if (prefetchedRef.current.has(it.crop_url)) continue;
       prefetchedRef.current.add(it.crop_url);
       const img = new Image();
       img.src = it.crop_url;
     }
-  }, [buffer]);
+  }, [tape]);
 
-  // Reset the active clock whenever a different item takes the screen.
-  useEffect(() => {
-    clockAccumRef.current = 0;
-    clockVisibleSinceRef.current =
-      document.visibilityState === "visible" ? performance.now() : null;
-  }, [currentKey]);
+  // -------------------------------------------------------------- write path
 
-  useEffect(() => {
-    const onVis = () => {
-      if (document.visibilityState === "hidden") {
-        if (clockVisibleSinceRef.current !== null) {
-          clockAccumRef.current += performance.now() - clockVisibleSinceRef.current;
-          clockVisibleSinceRef.current = null;
-        }
-      } else if (clockVisibleSinceRef.current === null) {
-        clockVisibleSinceRef.current = performance.now();
-      }
-    };
-    document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
+  const onStale = useCallback(() => {
+    // A 409 is emphatically not a network failure: a poweruser edited the
+    // questions mid-session. The write is dropped by the queue, so the instance
+    // was never answered as far as the server is concerned and the queue will
+    // serve it again — but the annotator has to be TOLD, or a silently vanished
+    // answer is exactly the kind of loss this screen was rebuilt to prevent.
+    getTaxonomy()
+      .then((t) => {
+        setTaxonomy(t);
+        setStaleNotice(
+          "The questions changed while you were labeling — answers that hadn't reached the server were not saved, and those cows will come round again.",
+        );
+      })
+      .catch((e: unknown) => setStaleNotice(errMsg(e)));
   }, []);
 
-  // ------------------------------------------------------------ write actions
-
-  function firstUnansweredIn(a: Record<string, string | string[]>): LabelGroup | null {
-    for (const gk of keys.groups) {
-      if (gk.options.length === 0) continue; // no active class — unanswerable, never blocks
-      const g = groupByKey.get(gk.group_key);
-      if (g === undefined || !g.required) continue;
-      const v: string | string[] | undefined = a[gk.group_key];
-      if (v === undefined || v === "" || (Array.isArray(v) && v.length === 0)) return g;
-    }
-    return null;
-  }
-
-  function afterWrite(item: LabelItem, answersUsed: Record<string, string | string[]>) {
-    setPending(null);
-    setWriteError(null);
-    setStaleNotice(null);
-    setNudge(null);
-    undoStackRef.current = [
-      ...undoStackRef.current.slice(-(UNDO_CAP - 1)),
-      { item, answers: answersUsed },
-    ];
-    const recent = recentRef.current.filter((k) => k !== item.instance_key);
-    recent.push(item.instance_key);
-    recentRef.current = recent.slice(-RECENT_CAP);
-    setBufferState(bufferRef.current.filter((i) => i.instance_key !== item.instance_key));
-    setAnswers({});
-    lastModeRef.current = null;
-    // The pool changed under us, so a "drained" verdict is stale by definition.
-    setQueueDrained(false);
-    refreshStats();
-  }
-
-  async function handleStale() {
-    setPending(null);
-    try {
-      const fresh = await getTaxonomy();
-      setTaxonomy(fresh);
-      // Keep whichever selections still resolve to an ACTIVE class in the new
-      // taxonomy: an archived pick would be invisible in the option list, and a
-      // selection you cannot see is worse than one you re-make.
-      const active = new Set<string>();
-      for (const g of fresh.groups) {
-        if (!g.active) continue;
-        for (const c of g.classes) if (c.active) active.add(c.class_key);
-      }
-      setAnswers((prev) => {
-        const kept: Record<string, string | string[]> = {};
-        for (const [gk, v] of Object.entries(prev)) {
-          if (Array.isArray(v)) {
-            const still = v.filter((ck) => active.has(ck));
-            if (still.length > 0) kept[gk] = still;
-          } else if (active.has(v)) {
-            kept[gk] = v;
-          }
-        }
-        return kept;
-      });
-      setStaleNotice(
-        "The questions just changed — your still-valid answers were kept. Re-check them and save again.",
-      );
-    } catch (e) {
-      setWriteError(errMsg(e));
-    }
-  }
-
-  async function doSubmit(answersToSend: Record<string, string | string[]>, gesture: LabelInputMode) {
-    const item: LabelItem | undefined = bufferRef.current[0];
-    if (item === undefined || busy || taxonomy === null) return;
-    const req: LabelSubmitReq = {
-      instance_key: item.instance_key,
-      anchor: anchorOf(item),
-      answers: answersToSend,
-      taxonomy_revision: taxonomy.revision,
-      serve_event_id: item.serve_event_id,
-      session_id: sessionId,
-      client_elapsed_ms: activeElapsedMs(),
-      input_mode: lastModeRef.current ?? gesture,
-    };
-    setBusy(true);
-    try {
-      await submitLabel(req);
-      afterWrite(item, answersToSend);
-    } catch (e) {
-      if (e instanceof TaxonomyStaleError) {
-        // Emphatically NOT a network failure: refetch, keep what resolves,
-        // re-present. Never into the retry path (api.ts says the same).
-        await handleStale();
-      } else {
-        setPending({ kind: "submit", req, item });
-        setWriteError(errMsg(e));
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function doSkip(reason: LabelSkipReason, note: string | null) {
-    const item: LabelItem | undefined = bufferRef.current[0];
-    if (item === undefined || busy) return;
-    setOverlay(null);
-    const req: LabelSkipReq = {
-      instance_key: item.instance_key,
-      anchor: anchorOf(item),
-      reason,
-      serve_event_id: item.serve_event_id,
-      session_id: sessionId,
-      client_elapsed_ms: activeElapsedMs(),
-      note,
-    };
-    setBusy(true);
-    try {
-      await skipLabel(req);
-      afterWrite(item, {});
-    } catch (e) {
-      if (e instanceof TaxonomyStaleError) {
-        await handleStale();
-      } else {
-        setPending({ kind: "skip", req, item });
-        setWriteError(errMsg(e));
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function retryPending() {
-    const pw = pending;
-    if (pw === null || busy) return;
-    setBusy(true);
-    try {
-      if (pw.kind === "submit") {
-        await submitLabel(pw.req);
-        afterWrite(pw.item, pw.req.answers);
-      } else {
-        await skipLabel(pw.req);
-        afterWrite(pw.item, {});
-      }
-    } catch (e) {
-      if (e instanceof TaxonomyStaleError) {
-        await handleStale();
-      } else {
-        setWriteError(errMsg(e)); // pending stays armed for the next attempt
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function doUndo() {
-    if (busy) return;
-    const entry: UndoEntry | undefined = undoStackRef.current[undoStackRef.current.length - 1];
-    if (entry === undefined) {
-      setNudge("Nothing to undo yet — U rewinds your own last save.");
-      return;
-    }
-    setBusy(true);
-    try {
-      await undoLabel(entry.item.instance_key);
-      undoStackRef.current = undoStackRef.current.slice(0, -1);
-      // Head of the buffer + the previous selections re-applied: "fix the one
-      // option I fumbled", not "start over" (§5.5).
-      const rest = bufferRef.current.filter((i) => i.instance_key !== entry.item.instance_key);
-      setBufferState([entry.item, ...rest]);
-      setAnswers(entry.answers);
-      lastModeRef.current = null;
-      setPending(null);
-      setWriteError(null);
-      setNudge(null);
+  const onWritten = useCallback(
+    (_write: LabelWrite) => {
+      // The pool moved under us, so any "drained" verdict is stale by definition.
       setQueueDrained(false);
       refreshStats();
-    } catch (e) {
-      setWriteError(errMsg(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+    },
+    [refreshStats],
+  );
 
-  function applyAnswer(groupKey: string, classKey: string, mode: LabelInputMode) {
-    if (currentKey === null || busy || cropFailed) return;
-    const group = groupByKey.get(groupKey);
-    if (group === undefined) return;
-    lastModeRef.current = mode;
-    setNudge(null);
-    let next: Record<string, string | string[]>;
-    if (group.multi_select) {
-      const prev = answers[groupKey];
-      const arr = Array.isArray(prev) ? [...prev] : [];
-      const at = arr.indexOf(classKey);
-      if (at >= 0) arr.splice(at, 1);
-      else arr.push(classKey);
-      next = { ...answers, [groupKey]: arr };
-    } else {
-      next = { ...answers, [groupKey]: classKey };
-    }
-    setAnswers(next);
-    // Auto-submit fires ONLY here, on a real answer action. Firing from an
-    // effect that watches `answers` would save the selections U just restored,
-    // making undo save itself straight back.
-    if (autoSubmit && firstUnansweredIn(next) === null) {
-      const pruned = pruneAnswers(next);
-      if (Object.keys(pruned).length > 0) void doSubmit(pruned, mode);
-    }
-  }
+  const queue = useAnswerQueue({ onStale, onWritten });
 
-  function trySave(gesture: LabelInputMode) {
-    if (currentKey === null || busy) return;
-    if (cropFailed) {
-      setNudge("This image can't be judged — press F to flag it, or S to skip.");
-      return;
-    }
-    const missing = firstUnansweredIn(answers);
-    if (missing !== null) {
-      // Never a silent no-op: a swallowed Enter is pressed twice, assumed to
-      // have worked, and the annotator moves on (§5.5).
-      const hint = groupKeyHint(keys, missing.group_key);
-      setNudge(
-        `“${missing.name}” is still unanswered — ${hint !== "" ? `press ${hint}` : "pick an option with the mouse"}.`,
-      );
-      return;
-    }
-    const pruned = pruneAnswers(answers);
-    if (Object.keys(pruned).length === 0) {
-      setNudge("Pick at least one answer before saving.");
-      return;
-    }
-    void doSubmit(pruned, gesture);
-  }
+  const markWritten = useCallback((key: string) => {
+    const next = recentWrittenRef.current.filter((k) => k !== key);
+    next.push(key);
+    recentWrittenRef.current = next.slice(-RECENT_CAP);
+  }, []);
 
-  // -------------------------------------------------------- global hotkeys
+  // ------------------------------------------------------------- the sequence
 
-  // One window-level listener delegating to a ref that is rebuilt every render,
-  // so the handler always sees fresh state without re-binding on each keystroke.
-  const keydownRef = useRef<(e: KeyboardEvent) => void>(() => {});
-  keydownRef.current = (e: KeyboardEvent) => {
-    // Escape first — it must also fire from inside the flag dialog's textarea,
-    // which the typing guard below would otherwise swallow.
-    if (e.key === "Escape") {
-      if (overlay !== null) {
-        e.preventDefault();
-        setOverlay(null);
-      } else if (nudge !== null) {
-        setNudge(null);
+  const firstUnansweredIndex = useCallback(
+    (ans: Record<string, string>): number | null => {
+      for (let i = 0; i < steps.length; i += 1) {
+        if (ans[steps[i].group_key] === undefined) return i;
       }
+      return null;
+    },
+    [steps],
+  );
+
+  // Completeness is about REQUIRED groups only — an optional question left blank
+  // must not wedge the annotator on an item with no way forward but a flag.
+  const isComplete = useCallback(
+    (ans: Record<string, string>): boolean =>
+      steps.every((g) => !g.required || ans[g.group_key] !== undefined),
+    [steps],
+  );
+
+  /** Move the cursor. Never leaves bounds, always re-reads the item from Q1
+      (§3.7: going back means re-reading from the top), and always leaves the
+      flag row — a half-typed flag on the cow you just left is not a state. */
+  const goTo = useCallback(
+    (index: number) => {
+      const t = tapeRef.current;
+      if (t.items.length === 0) return;
+      const clamped = clamp(index, 0, t.items.length - 1);
+      setTape({ ...t, cursor: clamped });
+      setStep(0);
+      setFlag({ open: false, reason: null, explanation: "" });
+      setSavedChip(false);
+      setHint(null);
+    },
+    [setTape],
+  );
+
+  /** Commit the item on screen and move to the head of the tape. The write goes
+      to the optimistic queue and the UI does not wait for it (§3.4's advance is
+      130-230ms with no network on the path). */
+  const advance = useCallback(() => {
+    const t = tapeRef.current;
+    const cursor = Math.min(t.cursor + 1, t.items.length);
+    const frontier = Math.max(t.frontier, cursor);
+    // Prodigy's history_length: the last ten answered items stay in memory with
+    // their answers so ArrowLeft costs no round trip. Everything older is
+    // dropped from the tape — and its answers with it, or the map would grow for
+    // the whole shift holding cows nobody can reach.
+    const drop = Math.max(0, cursor - MAX_RECENT);
+    if (drop > 0) {
+      const dropped = tapeRef.current.items.slice(0, drop);
+      setAnswersByKey((prev) => {
+        const next = { ...prev };
+        for (const it of dropped) delete next[it.instance_key];
+        return next;
+      });
+      setTape({ items: t.items.slice(drop), cursor: cursor - drop, frontier: frontier - drop });
+    } else {
+      setTape({ items: t.items, cursor, frontier });
+    }
+    setStep(0);
+    setFlag({ open: false, reason: null, explanation: "" });
+  }, [setTape]);
+
+  const commitAnswers = useCallback(
+    (item: LabelItem, ans: Record<string, string>, mode: LabelInputMode) => {
+      if (taxonomy === null) return;
+      const req: LabelSubmitReq = {
+        instance_key: item.instance_key,
+        anchor: anchorOf(item),
+        answers: ans,
+        taxonomy_revision: taxonomy.revision,
+        serve_event_id: item.serve_event_id,
+        session_id: sessionId,
+        client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
+        input_mode: mode,
+      };
+      queue.enqueue({ kind: "answer", req });
+      markWritten(item.instance_key);
+    },
+    [activeNow, markWritten, queue, sessionId, taxonomy],
+  );
+
+  /** One answer, from a digit or from a tile click. Synchronous, unguarded, and
+      the only place an advance can be triggered from — never an effect watching
+      `answersByKey`, which is what made the old screen re-commit an item the
+      moment you touched any option on a revisit (§1.6, §3.4). */
+  const applyAnswer = useCallback(
+    (groupKey: string, classKey: string, mode: LabelInputMode) => {
+      if (current === null || currentKey === null) return;
+      if (cropFailed) {
+        // Not a silent refusal: there are no pixels to judge, and F is the way out.
+        shake();
+        showHint("this image can't be shown — press F to flag it");
+        return;
+      }
+      const item = current;
+      const key = currentKey;
+      const previous = answers[groupKey];
+      const now = activeNow();
+      const detail = {
+        group_key: groupKey,
+        ms_since_group_shown: Math.max(0, Math.round(now - groupMarkRef.current)),
+        ms_since_item_shown: Math.max(0, Math.round(now - itemMarkRef.current)),
+        replaced_class_key: previous ?? null,
+        input_mode: mode,
+        phase: reviewing ? "review" : "fresh",
+      };
+
+      // §3.3: pressing the digit of the class already chosen CLEARS it — the
+      // correction path that never leaves the item. Two platforms shipped this
+      // independently (SuperAnnotate, Supervisely). No handoff, no advance.
+      if (previous === classKey) {
+        setAnswersByKey((prev) => {
+          const forItem = { ...(prev[key] ?? {}) };
+          delete forItem[groupKey];
+          return { ...prev, [key]: forItem };
+        });
+        setMix((m) => ({ ...m, [classKey]: Math.max(0, (m[classKey] ?? 0) - 1) }));
+        // class_key null, replaced_class_key set: a clear is still a within-item
+        // correction and A8 has to be able to count it.
+        emitDecisionEvent({
+          session_id: sessionId,
+          kind: "answered",
+          instance_key: key,
+          class_key: null,
+          detail,
+        });
+        return;
+      }
+
+      const next = { ...answers, [groupKey]: classKey };
+      setAnswersByKey((prev) => ({ ...prev, [key]: next }));
+      emitDecisionEvent({
+        session_id: sessionId,
+        kind: "answered",
+        instance_key: key,
+        class_key: classKey,
+        detail,
+      });
+
+      if (reviewing) {
+        // THE REVISIT TRAP (§1.6, §6.2). This branch must never advance. The old
+        // code fired the submit as soon as every group had an answer, which on a
+        // revisited item is true the instant you touch ANY option — so correcting
+        // Q1 skipped past Q2 and moved on. Here the correction is saved in place
+        // and the annotator leaves with ArrowRight, deliberately.
+        if (previous !== undefined) {
+          setMix((m) => ({
+            ...m,
+            [previous]: Math.max(0, (m[previous] ?? 0) - 1),
+            [classKey]: (m[classKey] ?? 0) + 1,
+          }));
+          postLabelEvent({
+            session_id: sessionId,
+            kind: "relabel",
+            instance_key: key,
+            class_key: classKey,
+          }).catch(() => {});
+        } else {
+          setMix((m) => ({ ...m, [classKey]: (m[classKey] ?? 0) + 1 }));
+        }
+        if (isComplete(next)) {
+          commitAnswers(item, next, mode);
+          showSavedChip();
+        }
+        // Hand off by POSITION, not by "first unanswered": on a revisited item
+        // every group is already answered, and "first unanswered" is exactly the
+        // null that used to mean "advance".
+        if (step + 1 < steps.length) setStep(step + 1);
+        return;
+      }
+
+      setMix((m) => ({ ...m, [classKey]: (m[classKey] ?? 0) + 1 }));
+      const nextStep = firstUnansweredIndex(next);
+      if (nextStep !== null) {
+        setStep(nextStep); // the handoff — same rectangle, digits rebound (§3.4)
+        return;
+      }
+      commitAnswers(item, next, mode);
+      setRecentMs((prev) => [Math.max(0, Math.round(now - itemMarkRef.current)), ...prev].slice(0, 200));
+      advance();
+    },
+    [
+      activeNow,
+      advance,
+      answers,
+      commitAnswers,
+      cropFailed,
+      current,
+      currentKey,
+      firstUnansweredIndex,
+      isComplete,
+      reviewing,
+      sessionId,
+      shake,
+      showHint,
+      showSavedChip,
+      step,
+      steps.length,
+    ],
+  );
+
+  const submitFlag = useCallback(() => {
+    if (current === null || currentKey === null) return;
+    const reason = flag.reason;
+    const explanation = flag.explanation.trim();
+    // Decision 6: a reason AND a written explanation. The button is disabled
+    // without both and the server 400s a blank one, so neither side is
+    // load-bearing alone — an escape hatch nobody has to justify gets pulled
+    // whenever the work gets hard.
+    if (reason === null || explanation === "") return;
+    const req: LabelFlagReq = {
+      instance_key: current.instance_key,
+      anchor: anchorOf(current),
+      reason,
+      explanation: explanation.slice(0, MAX_NOTE_CHARS),
+      serve_event_id: current.serve_event_id,
+      session_id: sessionId,
+      client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
+    };
+    queue.enqueue({ kind: "flag", req });
+    markWritten(current.instance_key);
+    setFlaggedByKey((prev) => ({ ...prev, [currentKey]: reason }));
+    setFlagCount((n) => n + 1);
+    if (reviewing) {
+      // Flagging something you had already answered leaves review rather than
+      // advancing the frontier past an item that is still ahead of you.
+      goTo(tapeRef.current.frontier);
+    } else {
+      advance();
+    }
+  }, [activeNow, advance, current, currentKey, flag, goTo, markWritten, queue, reviewing, sessionId]);
+
+  const goPrev = useCallback(() => {
+    const t = tapeRef.current;
+    if (t.cursor <= 0) {
+      shake();
+      showHint("this is as far back as the tape goes");
+      return;
+    }
+    goTo(t.cursor - 1);
+  }, [goTo, shake, showHint]);
+
+  const goNext = useCallback(() => {
+    const t = tapeRef.current;
+    // §3.7: on a revisited item ArrowRight LEAVES review and returns to the head
+    // of the tape, rather than walking forward one answered item at a time.
+    if (t.cursor < t.frontier) {
+      goTo(t.frontier);
+      return;
+    }
+    if (current === null) return;
+    if (!isComplete(answers)) {
+      // There is no skipping. The only ways off an item are answering it and
+      // flagging it, and a silent no-op here would read as a broken key.
+      shake();
+      showHint("answer both questions, or press F to flag");
+      return;
+    }
+    commitAnswers(current, answers, "key");
+    setRecentMs((prev) =>
+      [Math.max(0, Math.round(activeNow() - itemMarkRef.current)), ...prev].slice(0, 200),
+    );
+    advance();
+  }, [activeNow, advance, answers, commitAnswers, current, goTo, isComplete, shake, showHint]);
+
+  const openFlag = useCallback(() => {
+    if (current === null) return;
+    setFlag({ open: true, reason: null, explanation: "" });
+    setHint(null);
+  }, [current]);
+
+  const closeFlag = useCallback(() => {
+    setFlag({ open: false, reason: null, explanation: "" });
+  }, []);
+
+  const onOpenDefinition = useCallback(
+    (classKey: string) => {
+      setOpenDefinitionKey(classKey);
+      // A deliberate single open is the "this definition is ambiguous" signal
+      // (SQL_INFO_ICON_PRESSURE).
+      postLabelEvent({
+        session_id: sessionId,
+        kind: "info_opened",
+        instance_key: tapeRef.current.items[tapeRef.current.cursor]?.instance_key ?? null,
+        class_key: classKey,
+      }).catch(() => {});
+    },
+    [sessionId],
+  );
+
+  // ------------------------------------------------------------- telemetry §6.1
+
+  // `presented` is the real per-item clock. The batch `served` row is written
+  // once per fetch (labeling.py:412-424), so item k of a batch of eight carries
+  // items 1..k-1 as well as its own — keep it as the abandonment denominator,
+  // but never compute effort from it.
+  useEffect(() => {
+    if (currentKey === null) return;
+    const mark = activeNow();
+    itemMarkRef.current = mark;
+    groupMarkRef.current = mark;
+    setInspect(false);
+    const t = tapeRef.current;
+    emitDecisionEvent({
+      session_id: sessionId,
+      kind: "presented",
+      instance_key: currentKey,
+      detail: { phase: t.cursor < t.frontier ? "review" : "fresh" },
+    });
+  }, [activeNow, currentKey, sessionId]);
+
+  // The per-QUESTION clock. A2 (median Q2 time within 1.25x of Q1) is the
+  // sharpest acceptance test in §8.3 and it needs this mark to exist.
+  useEffect(() => {
+    groupMarkRef.current = activeNow();
+  }, [activeNow, currentKey, step]);
+
+  // ---------------------------------------------------------------- keyboard
+
+  // ONE window listener in the CAPTURE phase, delegating to a ref that is
+  // refreshed after every render so the handler always sees fresh state without
+  // re-binding on each keystroke. Capture phase is not a detail: at bubble phase
+  // a focused native control has already acted on ArrowLeft, and only
+  // preventDefault stops it (§3.8).
+  const keydownRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  const keyupRef = useRef<(e: KeyboardEvent) => void>(() => {});
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    // Escape first — it must also fire from inside the flag explanation
+    // textarea, which the typing guard below deliberately swallows keys for.
+    if (e.key === "Escape") {
+      if (flag.open) {
+        e.preventDefault();
+        closeFlag();
+        return;
+      }
+      if (openDefinitionKey !== null) {
+        e.preventDefault();
+        setOpenDefinitionKey(null);
+        return;
+      }
+      if (hint !== null) setHint(null);
       return;
     }
     if (isTypingTarget(e.target)) return;
 
-    if (overlay === "help") {
-      if (actionForEvent(e) === "help") {
-        e.preventDefault();
-        setOverlay(null);
-      }
-      return;
+    // §3.8, the half that cannot be skipped: these three are the page's, and
+    // preventDefault here (before the default action, and before any element
+    // handler, because this listener captures) is what stops the browser
+    // scrolling on Space and any focused widget moving a selection on an arrow.
+    // ONLY for an unmodified press: Alt+ArrowLeft is the browser's Back and
+    // Ctrl/Meta chords belong to the OS, and stealing those would be a second
+    // ownership bug in the opposite direction. labelKeys' own isPlainPress
+    // applies the same rule to the bindings themselves.
+    const plain = !e.ctrlKey && !e.metaKey && !e.altKey;
+    if (plain && (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === " ")) {
+      e.preventDefault();
     }
-    if (overlay === "skip") {
-      const at = "12345".indexOf(e.key);
-      if (at >= 0 && at < SKIP_REASONS.length) {
-        e.preventDefault();
-        void doSkip(SKIP_REASONS[at].reason, null);
-      }
-      return;
-    }
-    if (overlay === "flag") return; // mouse + Esc; its own inputs take the keys
 
-    const action = actionForEvent(e);
-    if (action !== null) {
-      switch (action) {
-        case "save":
-          e.preventDefault();
-          if (!e.repeat) trySave("key");
+    if (e.key === " ") {
+      if (!plain) return;
+      // A HOLD, never a toggle: a mode you can be stranded in is worse than no
+      // mode. `repeat` is ignored so the key's auto-repeat does not re-fire it.
+      if (!e.repeat) setInspect(true);
+      return;
+    }
+
+    // How many digits are live right now. In the flag row it is the five
+    // reasons; on the explanation step it is none (and the textarea has focus
+    // anyway); otherwise it is the ACTIVE question's options, and only that
+    // question's — nothing else listens, which is the whole point of the
+    // sequential flow.
+    const optionCount = flag.open
+      ? flag.reason === null
+        ? FLAG_REASONS.length
+        : 0
+      : activeOptions.length;
+    const hitKey = resolveLabelKey(e, optionCount);
+
+    if (hitKey === null) {
+      if (/^[1-9]$/.test(e.key)) {
+        shake();
+        showHint(`that key isn't bound here — ${optionCount > 0 ? `use 1–${optionCount}` : "nothing is listening"}`);
+      }
+      return;
+    }
+
+    if (hitKey.kind === "action") {
+      switch (hitKey.action) {
+        case "prev":
+          if (!e.repeat) goPrev();
           return;
-        case "skip":
-          e.preventDefault();
-          if (currentKey !== null && !busy) setOverlay("skip");
+        case "next":
+          if (!e.repeat) goNext();
           return;
         case "flag":
           e.preventDefault();
-          if (currentKey === null || busy) return;
-          if (cropFailed) {
-            // The one-key flag of terminal state 3: nothing to judge, so no
-            // dialog — record the refusal and move on.
-            void doSkip("bad_crop", "flagged: the crop failed to load in the browser");
-          } else {
-            setOverlay("flag");
-          }
-          return;
-        case "undo":
-          e.preventDefault();
-          if (!e.repeat) void doUndo();
-          return;
-        case "definitions":
-          e.preventDefault();
-          toggleAllDefs();
-          return;
-        case "hideRing":
-          if (!e.repeat) setHideRing(true);
-          return;
-        case "clear":
-          e.preventDefault(); // Backspace must never navigate
-          if (currentKey !== null && !busy) {
-            setAnswers({});
-            setNudge(null);
-          }
-          return;
-        case "help":
-          e.preventDefault();
-          setOverlay("help");
+          if (!e.repeat && !flag.open) openFlag();
           return;
         case "close":
           return; // Escape is handled above, before the typing guard
+        case "inspect":
+          // Unreachable: the Space keydown/keyup pair is handled further up, so
+          // this table is never consulted for it. The case exists because the
+          // action is in LABEL_ACTIONS (so every legend advertises it), and
+          // without it the switch is non-exhaustive and the narrowing below —
+          // which is what makes `hitKey.index` type-safe — silently stops
+          // working. It is a compile-time guard, not dead code.
+          return;
       }
     }
-    const opt = optionForEvent(keys, e);
-    if (opt !== null && !e.repeat) {
-      e.preventDefault();
-      applyAnswer(opt.group_key, opt.class_key, "key");
+
+    if (e.repeat) return;
+    if (flag.open) {
+      setFlag((f) => ({ ...f, reason: FLAG_REASONS[hitKey.index].reason }));
+      return;
+    }
+    const cls = activeOptions[hitKey.index];
+    if (cls !== undefined && activeGroup !== null) {
+      applyAnswer(activeGroup.group_key, cls.class_key, "key");
     }
   };
 
-  const keyupRef = useRef<(e: KeyboardEvent) => void>(() => {});
-  keyupRef.current = (e: KeyboardEvent) => {
-    if (e.key.toLowerCase() === "h") setHideRing(false);
+  const onKeyUp = (e: KeyboardEvent) => {
+    if (e.key === " ") setInspect(false);
   };
+
+  useEffect(() => {
+    keydownRef.current = onKeyDown;
+    keyupRef.current = onKeyUp;
+  });
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => keydownRef.current(e);
     const up = (e: KeyboardEvent) => keyupRef.current(e);
-    // Alt-tabbing away with H held would otherwise leave the ring hidden forever.
-    const onBlur = () => setHideRing(false);
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
+    // Alt-tabbing away with Space held would otherwise leave the crop enlarged
+    // and the scrim lifted for good.
+    const onBlur = () => setInspect(false);
+    window.addEventListener("keydown", down, { capture: true });
+    window.addEventListener("keyup", up, { capture: true });
     window.addEventListener("blur", onBlur);
     return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
+      window.removeEventListener("keydown", down, { capture: true });
+      window.removeEventListener("keyup", up, { capture: true });
       window.removeEventListener("blur", onBlur);
     };
   }, []);
 
-  // Terminal state 4: a submit that failed while offline retries on the
-  // `online` event. A persistent 4xx is NOT in a loop — this fires once per
-  // reconnect, and the only other retry is the explicit button.
-  const onlineRef = useRef<() => void>(() => {});
-  onlineRef.current = () => {
-    if (pending !== null && !busy) void retryPending();
-  };
-  useEffect(() => {
-    const onOnline = () => onlineRef.current();
-    window.addEventListener("online", onOnline);
-    return () => window.removeEventListener("online", onOnline);
-  }, []);
-
   // ------------------------------------------------------------------ render
 
-  const defsShown = openDefs.size > 0;
+  const provenance =
+    current === null ? "" : `${current.camera_id} · ${current.day ?? "unknown day"}`;
 
   let main: ReactNode;
   if (taxonomyError !== null) {
     main = (
       <TerminalCard title="Couldn't load the questions">
-        <p className="text-sm text-gray-mid">{taxonomyError}</p>
-        <div className="mt-5">
-          <Button
-            variant="ghost"
-            onClick={() => {
-              setTaxonomyError(null);
-              getTaxonomy()
-                .then(setTaxonomy)
-                .catch((e: unknown) => setTaxonomyError(errMsg(e)));
-            }}
-          >
-            Try again
-          </Button>
-        </div>
+        <p className="text-[13px]" style={{ color: INK_DIM }}>
+          {taxonomyError}
+        </p>
+        <DarkButton
+          className="mt-5"
+          onClick={() => {
+            setTaxonomyError(null);
+            getTaxonomy()
+              .then(setTaxonomy)
+              .catch((e: unknown) => setTaxonomyError(errMsg(e)));
+          }}
+        >
+          Try again
+        </DarkButton>
       </TerminalCard>
     );
   } else if (taxonomy === null) {
-    main = <div className="animate-shimmer h-96 bg-surface border border-border rounded-2xl" />;
+    main = <Shimmer />;
   } else if (!taxonomyUsable) {
     // Terminal state 5: the taxonomy has nothing to ask.
     main = (
       <TerminalCard title="There are no questions yet">
-        <p className="text-sm text-gray-mid max-w-md mx-auto">
+        <p className="text-[13px] max-w-md mx-auto" style={{ color: INK_DIM }}>
           The label taxonomy has no active classes, so there is nothing to answer about an animal
           yet.
         </p>
         {canManage ? (
           <Link
             to="/label/classes"
-            className="inline-block mt-4 text-sm text-accent hover:text-accent-deep transition-colors"
+            className="inline-block mt-4 text-[13px] underline underline-offset-2"
+            style={{ color: INK }}
           >
             Set up the questions →
           </Link>
         ) : (
-          <p className="text-[13px] text-gray-tertiary mt-4">
+          <p className="text-[12px] mt-4" style={{ color: INK_DIM }}>
             A poweruser has to set up the questions before labeling can start.
           </p>
         )}
@@ -792,432 +1031,602 @@ export default function Label() {
     // Terminal state 2: no footage has been processed at all.
     main = (
       <TerminalCard title="No footage to label yet">
-        <p className="text-sm text-gray-mid max-w-md mx-auto">
+        <p className="text-[13px] max-w-md mx-auto" style={{ color: INK_DIM }}>
           Nothing has been processed yet, so there are no detections to judge. New footage joins the
           labeling queue by itself as soon as a day finishes processing.
         </p>
         <Link
           to="/data"
-          className="inline-block mt-4 text-sm text-accent hover:text-accent-deep transition-colors"
+          className="inline-block mt-4 text-[13px] underline underline-offset-2"
+          style={{ color: INK }}
         >
           Upload a day of footage →
         </Link>
       </TerminalCard>
     );
-  } else if (current !== null) {
+  } else if (current !== null && activeGroup !== null) {
     main = (
-      <Card className="p-5 sm:p-6">
-        {/* Day + camera, NEVER the clock time — the banner is masked server-side
-            for the same reason: time of day hands the annotator the sun answer. */}
-        <div className="flex items-baseline justify-between gap-3 flex-wrap">
-          <span className="font-mono text-[11px] uppercase tracking-[0.16em] text-gray-tertiary">
-            {current.day ?? "unknown day"} · {current.camera_id}
-          </span>
-          <span className="font-mono text-[11px] text-gray-tertiary tabular-nums">
-            {current.n_annotators} of {current.target} answers so far
-            {current.overlap ? " · overlap set" : ""}
-          </span>
-        </div>
-
-        <InstanceCrop
-          item={current}
-          hideRing={hideRing}
-          onError={(key) => {
-            // A late error from an item already advanced past must not blank
-            // the item now on screen — that is why the key rides along.
-            if (key === bufferRef.current[0]?.instance_key) setFailedKey(key);
-          }}
-          className="mt-3 w-full max-w-[440px] mx-auto"
-        />
-
-        {cropFailed ? (
-          // Terminal state 3: the image is missing or the server refused it
-          // (e.g. a mostly-banner crop, §4.5). One key records that and moves on.
-          <p role="alert" className="mt-3 text-[13px] text-danger text-center">
-            This image can't be shown — press <Kbd>F</Kbd> to flag it and move on.
-          </p>
-        ) : null}
-
-        <div className="mt-5">
-          <LabelGroupList
-            groups={groups}
-            keys={keys}
-            answers={answers}
-            onAnswer={(g, c) => applyAnswer(g, c, "mouse")}
-            openDefs={openDefs}
-            onToggleDef={onToggleDef}
-            disabled={busy || cropFailed}
-          />
-        </div>
-
-        {staleNotice !== null ? (
-          <p role="alert" className="mt-4 text-[13px] text-warn">
-            {staleNotice}
-          </p>
-        ) : null}
-        {nudge !== null ? (
-          <p role="alert" className="mt-4 text-[13px] text-warn">
-            {nudge}
-          </p>
-        ) : null}
-        {writeError !== null ? (
-          <div role="alert" className="mt-4 border border-danger/40 rounded-xl px-3.5 py-3">
-            <p className="text-[13px] text-danger">Couldn't save — {writeError}</p>
-            <p className="text-[12px] text-gray-tertiary mt-1">
-              Your answer is still here
-              {pending !== null ? " and will be retried as soon as the connection returns" : ""}.
-            </p>
-            {pending !== null ? (
-              <div className="mt-2.5">
-                <Button variant="ghost" onClick={() => void retryPending()} disabled={busy}>
-                  Try again
-                </Button>
+      <div
+        className="w-full max-w-[760px] rounded-xl border box-border"
+        style={{ background: CARD, borderColor: HAIRLINE, padding: CARD_PAD }}
+      >
+        {/* The crop is the brightest region on screen (§2.2) and its size is
+            subtraction, not taste (§2.3): clamp(300, 100vh - 414, 440). Space
+            enlarges it by TRANSFORM so nothing below it moves. */}
+        <div className="flex justify-center">
+          <div
+            key={current.crop_url}
+            className="lbl-crop-in relative"
+            style={{
+              width: cropPx,
+              height: cropPx,
+              transform: inspect ? `scale(${inspectScale})` : undefined,
+              transformOrigin: "top center",
+              transition: "transform 120ms ease-out",
+              zIndex: inspect ? 5 : undefined,
+            }}
+          >
+            <InstanceCrop
+              item={current}
+              hideRing={inspect}
+              onError={(k) => {
+                // A late error from an item already advanced past must not blank
+                // the item now on screen — that is why the key rides along.
+                if (k === tapeRef.current.items[tapeRef.current.cursor]?.instance_key) {
+                  setFailedKey(k);
+                }
+              }}
+              className="w-full h-full"
+            />
+            {flaggedReason !== undefined ? <FlaggedOverlay size={cropPx} /> : null}
+            {/* The zoom affordance sits ON the crop because that is the one place
+                the annotator is already looking; as trailing prose in the footer
+                legend it went unread. It is a hold, so it also has to say so —
+                a label reading "Space" alone invites a press-and-release that
+                appears to do nothing. While held it swaps to a release cue, which
+                is what tells a first-time user the enlargement is theirs to end
+                rather than a state they are stuck in. */}
+            {!cropFailed ? (
+              <div
+                className="absolute left-2 bottom-2 flex items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px] pointer-events-none select-none"
+                style={{
+                  background: "rgba(12,14,16,0.72)",
+                  color: inspect ? ACCENT_WARM : INK,
+                  border: `1px solid ${inspect ? ACCENT_WARM : "rgba(255,255,255,0.18)"}`,
+                  transition: "color 120ms ease-out, border-color 120ms ease-out",
+                }}
+              >
+                <ZoomGlyph />
+                {inspect ? "release Space" : "hold Space to zoom"}
               </div>
             ) : null}
           </div>
+        </div>
+
+        {cropFailed ? (
+          // Terminal state 3: the image is missing or the server refused it
+          // (e.g. a mostly-banner crop, §4.5). F records that and moves on.
+          <p role="alert" className="mt-2 text-[12px] text-center" style={{ color: ALARM }}>
+            This image can't be shown — press F to flag it and move on.
+          </p>
         ) : null}
 
-        <div className="mt-5 pt-4 border-t border-border flex items-center gap-x-4 gap-y-2 flex-wrap">
-          <span className="flex items-center gap-1.5">
-            <Button onClick={() => trySave("mouse")} disabled={busy}>
-              {busy ? "Saving…" : "Save"}
-            </Button>
-            <Kbd>Enter</Kbd>
-          </span>
-          <span className="flex items-center gap-1.5">
-            <Button variant="ghost" onClick={() => setOverlay("skip")} disabled={busy}>
-              Skip…
-            </Button>
-            <Kbd>S</Kbd>
-          </span>
-          <span className="flex items-center gap-1.5">
-            <Button
-              variant="ghost"
-              onClick={() => {
-                if (cropFailed) void doSkip("bad_crop", "flagged: the crop failed to load in the browser");
-                else setOverlay("flag");
-              }}
-              disabled={busy}
-            >
-              Flag…
-            </Button>
-            <Kbd>F</Kbd>
-          </span>
-          <span className="flex items-center gap-1.5">
-            <Button variant="ghost" onClick={() => void doUndo()} disabled={busy}>
-              Undo
-            </Button>
-            <Kbd>U</Kbd>
-          </span>
-          <span className="ml-auto text-[11px] text-gray-tertiary">
-            <Kbd>?</Kbd> shows every key
-          </span>
+        <div style={{ marginTop: CROP_GAP }}>
+          {flag.open ? (
+            <FlagRow
+              draft={flag}
+              onPick={(reason) => setFlag((f) => ({ ...f, reason }))}
+              onExplain={(text) => setFlag((f) => ({ ...f, explanation: text }))}
+              onSubmit={submitFlag}
+              onCancel={closeFlag}
+            />
+          ) : (
+            <QuestionPanel
+              group={activeGroup}
+              stepIndex={step}
+              stepCount={steps.length}
+              reserveOptions={reserveOptions}
+              selectedClassKey={answers[activeGroup.group_key] ?? null}
+              reviewing={reviewing}
+              openDefinitionKey={openDefinitionKey}
+              onSelect={(g, c) => applyAnswer(g, c, "mouse")}
+              onOpenDefinition={onOpenDefinition}
+              shakeNonce={shakeNonce}
+            />
+          )}
         </div>
-      </Card>
+
+        {/* Footer, 32px, fixed: the bindings are PERMANENTLY PRINTED here, which
+            is CVAT's shipping alternative to a `?` overlay and what satisfies
+            decision 5. Transient lines replace the legend in place rather than
+            adding a row, so the tile row above never moves. */}
+        <div
+          className="flex items-center gap-3"
+          style={{ marginTop: PANEL_GAP, height: FOOTER_H, color: INK_DIM }}
+        >
+          <div className="min-w-0 grow text-[11px] leading-snug truncate" role="status">
+            {hint !== null ? (
+              <span style={{ color: ALARM }}>{hint}</span>
+            ) : savedChip ? (
+              <span style={{ color: INK }}>saved ✓</span>
+            ) : flaggedReason !== undefined ? (
+              <span style={{ color: ALARM }}>⚑ FLAGGED — {flaggedReason.replace(/_/g, " ")}</span>
+            ) : reviewing ? (
+              <span>✎ reviewing — → to leave · answers already saved</span>
+            ) : (
+              <KeyLegend />
+            )}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <SyncDot sync={queue.sync} />
+            <span className="font-mono text-[11px] tabular-nums">{provenance}</span>
+          </div>
+        </div>
+      </div>
     );
   } else if (fetchError !== null) {
     main = (
       <TerminalCard title="Couldn't fetch the queue">
-        <p className="text-sm text-gray-mid">{fetchError}</p>
-        <div className="mt-5">
-          <Button
-            variant="ghost"
-            onClick={() => {
-              setFetchError(null);
-              setQueueDrained(false);
-              void refill();
-            }}
-          >
-            Try again
-          </Button>
-        </div>
+        <p className="text-[13px]" style={{ color: INK_DIM }}>
+          {fetchError}
+        </p>
+        <DarkButton
+          className="mt-5"
+          onClick={() => {
+            setFetchError(null);
+            setQueueDrained(false);
+            void refill();
+          }}
+        >
+          Try again
+        </DarkButton>
       </TerminalCard>
     );
   } else if (fetching || !queueDrained) {
-    main = <div className="animate-shimmer h-96 bg-surface border border-border rounded-2xl" />;
+    main = <Shimmer />;
   } else {
     // Terminal state 1: genuinely caught up.
     main = (
       <TerminalCard title="You're caught up">
-        <p className="text-sm text-gray-mid max-w-md mx-auto">
+        <p className="text-[13px] max-w-md mx-auto" style={{ color: INK_DIM }}>
           Every instance that still needs your judgement has it. New footage joins the queue by
           itself, and instances other annotators haven't finished stay available to them.
         </p>
-        <div className="mt-5">
-          <Button
-            variant="ghost"
-            onClick={() => {
-              setQueueDrained(false);
-              void refill();
-            }}
-          >
-            Check again
-          </Button>
-        </div>
+        <DarkButton
+          className="mt-5"
+          onClick={() => {
+            setQueueDrained(false);
+            void refill();
+          }}
+        >
+          Check again
+        </DarkButton>
       </TerminalCard>
     );
   }
 
   return (
-    <div className="flex flex-col gap-8 animate-fade-slide-in">
-      <header className="flex items-end justify-between gap-4 flex-wrap">
-        <div>
-          <SectionLabel>LABEL</SectionLabel>
-          <h1 className="font-display text-3xl sm:text-4xl font-light text-near-black leading-tight mt-1">
-            Label cows
-          </h1>
-          <p className="text-gray-mid text-sm mt-2 max-w-xl">
-            One ringed animal at a time — answer the questions under it and save. The keyboard is
-            the fast path; press <Kbd>?</Kbd> for every binding.
-          </p>
-        </div>
-        {/* Hidden, not disabled, for plain users — same rule as every other
+    <div
+      data-surface="label"
+      /* Negative margins cancel `main`'s py-10/sm:py-12 and px-6/sm:px-10 so the
+         dark surface is full-bleed and the page padding becomes §2.2's py-4.
+         App.tsx's shell is shared by every other route and is deliberately not
+         touched. */
+      className="-mx-6 sm:-mx-10 -my-10 sm:-my-12 px-6 sm:px-10 py-4"
+      style={{
+        background: "var(--lbl-bg, #16181A)",
+        color: INK,
+        // height, NOT minHeight, plus a clip: §2.1's rule is that the per-item
+        // loop never requires a scroll, and the crop already sizes itself by
+        // subtraction to honour that. But the side column is naturally longer
+        // than any laptop, and while the surface could merely GROW, the page
+        // scrollbar it produced put the answer tiles below the fold on a
+        // 1366x768 screen — the exact defect the redesign exists to remove.
+        // Pinning the surface to the viewport makes that structural rather than
+        // a number that has to be re-tuned every time the panel gains a row;
+        // the panel scrolls inside itself instead (LabelProgress).
+        height: "calc(100vh - var(--app-header-h))",
+        overflow: "hidden",
+      }}
+    >
+      <style>{PAGE_CSS}</style>
+
+      {/* The page header block collapses to one 28px strip (§2.2). No hero, no
+          paragraph of instructions: they cost the crop 150px of height on the
+          machine where the crop is already smallest. */}
+      <div
+        className="mx-auto w-full max-w-[1104px] flex items-center gap-3"
+        style={{ height: STRIP_H }}
+      >
+        <span className="font-mono text-[11px] truncate" style={{ color: INK_DIM }}>
+          {current === null ? "label" : captionFor(current)}
+        </span>
+        {/* Hidden, not disabled, for plain users — the same rule as every other
             poweruser affordance (§5.1). */}
         {canManage ? (
           <Link
             to="/label/classes"
-            className="font-mono text-[11px] uppercase tracking-[0.16em] text-gray-tertiary hover:text-accent transition-colors"
+            className="ml-auto shrink-0 font-mono text-[11px] uppercase tracking-[0.14em] hover:opacity-100 opacity-70"
+            style={{ color: INK_DIM }}
           >
             Manage classes →
           </Link>
         ) : null}
-      </header>
-
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px] items-start">
-        <div className="min-w-0">{main}</div>
-        <LabelProgress
-          stats={stats}
-          groups={groups}
-          keys={keys}
-          autoSubmit={autoSubmit}
-          onAutoSubmitChange={setAutoSubmit}
-          defsShown={defsShown}
-          onDefsShownChange={setAllDefs}
-          className="lg:sticky lg:top-[calc(var(--app-header-h)+24px)]"
-        />
       </div>
 
-      {overlay === "help" ? (
-        <HelpSheet groups={groups} keys={keys} onClose={() => setOverlay(null)} />
+      {staleNotice !== null ? (
+        <div className="mx-auto w-full max-w-[1104px] mt-2">
+          <p
+            role="alert"
+            className="text-[12px] leading-snug rounded-lg border px-3 py-2"
+            style={{ color: INK, borderColor: ALARM, background: CARD }}
+          >
+            {staleNotice}{" "}
+            <button
+              type="button"
+              onClick={() => setStaleNotice(null)}
+              className="underline underline-offset-2 cursor-pointer"
+            >
+              dismiss
+            </button>
+          </p>
+        </div>
       ) : null}
-      {overlay === "skip" ? (
-        <SkipDialog
-          busy={busy}
-          onPick={(reason) => void doSkip(reason, null)}
-          onClose={() => setOverlay(null)}
-        />
-      ) : null}
-      {overlay === "flag" ? (
-        <FlagDialog
-          busy={busy}
-          onFlag={(reason, note) => void doSkip(reason, note === "" ? null : note)}
-          onClose={() => setOverlay(null)}
-        />
-      ) : null}
-    </div>
-  );
-}
 
-/* One big friendly card per terminal state — same surface, different next action. */
-function TerminalCard({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <Card className="p-8 sm:p-10 text-center">
-      <h2 className="font-display text-2xl text-near-black leading-tight">{title}</h2>
-      <div className="mt-3">{children}</div>
-    </Card>
-  );
-}
-
-/* Modal shell, the DeleteModal idiom: full-screen click-away layer, the card
-   stops propagation. No scrim, matching the house dialogs. */
-function Overlay({
-  children,
-  onClose,
-  labelledBy,
-}: {
-  children: ReactNode;
-  onClose: () => void;
-  labelledBy: string;
-}) {
-  return (
-    <div className="fixed inset-0 z-[100] grid place-items-center px-4" onClick={onClose}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={labelledBy}
-        className="w-full max-w-md bg-surface border border-border rounded-2xl shadow-xl p-6 animate-fade-slide-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {children}
-      </div>
-    </div>
-  );
-}
-
-/* The `?` sheet: the whole key map, fed from the same lib/labelKeys data as the
-   option badges and the legend, so it cannot drift from the real bindings. */
-function HelpSheet({
-  groups,
-  keys,
-  onClose,
-}: {
-  groups: LabelGroup[];
-  keys: LabelKeyMap;
-  onClose: () => void;
-}) {
-  const groupOf = new Map(groups.map((g) => [g.group_key, g]));
-  return (
-    <Overlay onClose={onClose} labelledBy="label-help-title">
-      <h3 id="label-help-title" className="font-display text-xl text-near-black leading-tight">
-        All keys
-      </h3>
-      <div className="mt-4 flex flex-col gap-4 max-h-[60vh] overflow-y-auto pr-1">
-        {keys.groups.map((gk) => {
-          const group = groupOf.get(gk.group_key);
-          if (group === undefined || gk.options.length === 0) return null;
-          const nameOf = new Map(group.classes.map((c) => [c.class_key, c.name]));
-          return (
-            <div key={gk.group_key}>
-              <SectionLabel>{group.name}</SectionLabel>
-              <div className="mt-1.5 flex flex-col gap-1">
-                {gk.options.map((o) => (
-                  <div key={o.class_key} className="flex items-center gap-2.5">
-                    {o.key !== null ? (
-                      <Kbd>{o.label}</Kbd>
-                    ) : (
-                      <span className="inline-grid place-items-center min-w-6 h-6 text-[11px] text-gray-tertiary">
-                        ·
-                      </span>
-                    )}
-                    <span className="text-[13px] text-text">
-                      {nameOf.get(o.class_key) ?? o.class_key}
-                    </span>
-                    {o.key === null ? (
-                      <span className="text-[11px] text-gray-tertiary">mouse only</span>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            </div>
-          );
-        })}
-        <div>
-          <SectionLabel>Actions</SectionLabel>
-          <div className="mt-1.5 flex flex-col gap-1">
-            {LABEL_ACTIONS.map((a) => (
-              <div key={a.action} className="flex items-center gap-2.5">
-                <Kbd>{a.label}</Kbd>
-                <span className="text-[13px] text-text">{a.hint}</span>
-              </div>
-            ))}
-          </div>
+      {/* 760 + 24 + 320 = 1104. Below 1100px the side panel drops beneath the
+          fold and the main column keeps its geometry unchanged — nothing in the
+          panel is needed to answer an item (§2.4). */}
+      <div className="mx-auto w-full max-w-[1104px] mt-2 flex flex-wrap gap-6 justify-center items-start">
+        <div className="min-w-0 grow basis-[760px] max-w-[760px] flex justify-center">{main}</div>
+        <div className="w-[320px] shrink-0 grow-0">
+          <LabelProgress
+            groups={groups}
+            stream={{
+              doneToday: tape.frontier,
+              // What today can still yield: what this session has answered plus
+              // what the queue says is still servable to ME. A corpus-coverage
+              // bar was removed on purpose (§7) — it is a number the annotator
+              // cannot move.
+              targetToday: tape.frontier + (stats?.remaining ?? 0),
+              recentMs,
+              flags: flagCount,
+              // Always zero: decision 6 makes the written explanation mandatory
+              // at flag time, so there is no deferred-notes queue to owe.
+              pendingNotes: 0,
+            }}
+            mix={mix}
+            definition={definitionClass}
+            onClearDefinition={() => setOpenDefinitionKey(null)}
+            recent={recentItems}
+            currentKey={reviewing ? currentKey : null}
+            onJumpToRecent={(key) => {
+              const at = tapeRef.current.items.findIndex((i) => i.instance_key === key);
+              if (at >= 0) goTo(at);
+            }}
+          />
         </div>
       </div>
-      <p className="text-[11px] text-gray-tertiary mt-4">
-        <Kbd>Esc</Kbd> or <Kbd>?</Kbd> closes this sheet.
-      </p>
-    </Overlay>
+    </div>
   );
 }
 
-/* Skip is keyboard-fast: a digit picks the reason and posts in one press. The
-   wording matters — a skip is recorded, not discarded (§3.3). */
-function SkipDialog({
-  busy,
-  onPick,
-  onClose,
+/* ------------------------------------------------------------------ pieces */
+
+/** One big card per terminal state — same surface, different next action. The
+    house `Card` is painted in the light theme and is deliberately not reused
+    here; restyling it would follow onto every other page (§2.2). */
+function TerminalCard({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div
+      className="w-full max-w-[760px] rounded-xl border box-border p-8 text-center"
+      style={{ background: CARD, borderColor: HAIRLINE }}
+    >
+      <h2 className="font-display text-2xl leading-tight" style={{ color: INK }}>
+        {title}
+      </h2>
+      <div className="mt-3">{children}</div>
+    </div>
+  );
+}
+
+function DarkButton({
+  children,
+  onClick,
+  disabled,
+  className,
 }: {
-  busy: boolean;
-  onPick: (reason: LabelSkipReason) => void;
-  onClose: () => void;
+  children: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  className?: string;
 }) {
   return (
-    <Overlay onClose={onClose} labelledBy="label-skip-title">
-      <h3 id="label-skip-title" className="font-display text-xl text-near-black leading-tight">
-        Skip this one — why?
-      </h3>
-      <p className="text-[12px] text-gray-tertiary mt-1.5">
-        A skip is recorded, not discarded: it tells us the instance was hard to judge, and after a
-        few independent skips it stops being served.
-      </p>
-      <div className="mt-4 flex flex-col gap-2">
-        {SKIP_REASONS.map((r, i) => (
-          <button
-            key={r.reason}
-            type="button"
-            disabled={busy}
-            onClick={() => onPick(r.reason)}
-            className="flex items-baseline gap-2.5 rounded-xl border border-border bg-surface hover:border-accent px-3 py-2 text-left transition-colors duration-150"
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={
+        "inline-flex items-center h-9 px-3.5 rounded-lg border box-border text-[13px] cursor-pointer " +
+        "transition-opacity duration-150 hover:opacity-80 disabled:opacity-40 disabled:cursor-default " +
+        "focus-visible:outline focus-visible:outline-2 " +
+        (className ?? "")
+      }
+      style={{ background: TILE, borderColor: HAIRLINE, color: INK, outlineColor: INK }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Shimmer() {
+  return (
+    <div
+      className="animate-shimmer w-full max-w-[760px] rounded-xl border"
+      style={{ height: 520, background: CARD, borderColor: HAIRLINE }}
+    />
+  );
+}
+
+/** The permanent legend (§2.4). Every entry — including the Space hold — comes
+    from LABEL_ACTIONS and prints its own `short`, so it cannot drift from what
+    the handler actually does. The previous version mapped action -> word with a
+    ternary that fell through to "next", so any binding added to the table would
+    have been advertised under the wrong name. */
+function KeyLegend() {
+  const shown = LABEL_ACTIONS.filter((a) => a.action !== "close");
+  return (
+    <span>
+      {shown.map((a, i) => (
+        <span key={a.action}>
+          {i > 0 ? " · " : ""}
+          <span
+            className="inline-block rounded px-1 font-mono"
+            style={{ border: `1px solid ${HAIRLINE}`, color: INK }}
           >
-            <Kbd>{String(i + 1)}</Kbd>
-            <span className="text-[13px] text-text">{r.label}</span>
-            <span className="text-[11px] text-gray-tertiary">{r.blurb}</span>
-          </button>
-        ))}
-      </div>
-      <p className="text-[11px] text-gray-tertiary mt-4">
-        <Kbd>Esc</Kbd> cancels.
-      </p>
-    </Overlay>
+            {a.label}
+          </span>{" "}
+          {a.short}
+        </span>
+      ))}
+    </span>
   );
 }
 
-/* Flag = a skip that carries a written note (the annotations.flag_note column).
-   The instance_key rides in the payload, so traceability needs no clock time. */
-function FlagDialog({
-  busy,
-  onFlag,
-  onClose,
-}: {
-  busy: boolean;
-  onFlag: (reason: LabelSkipReason, note: string) => void;
-  onClose: () => void;
-}) {
-  const [reason, setReason] = useState<LabelSkipReason>("other");
-  const [note, setNote] = useState("");
+/** §5.5: filled dot = everything flushed, hollow dot + count = n pending,
+    hollow dot + a 1.2s pulse = retrying. Shape and motion, never colour, and
+    never a button — it is a read-out, and it never blocks anything. */
+function SyncDot({ sync }: { sync: AnswerQueueSync }) {
+  const flushed = sync.pending === 0;
+  const title = flushed
+    ? "all answers saved"
+    : sync.retrying
+      ? `${sync.pending} waiting — retrying`
+      : `${sync.pending} saving`;
   return (
-    <Overlay onClose={onClose} labelledBy="label-flag-title">
-      <h3 id="label-flag-title" className="font-display text-xl text-near-black leading-tight">
-        Flag a problem
-      </h3>
-      <p className="text-[12px] text-gray-tertiary mt-1.5">
-        Skips this instance and attaches your note, so whoever reviews the queue can find it again.
-      </p>
-      <div className="mt-4 flex flex-col gap-1.5">
-        {SKIP_REASONS.map((r) => (
-          <label key={r.reason} className="flex items-baseline gap-2.5 cursor-pointer">
-            <input
-              type="radio"
-              name="flag-reason"
-              value={r.reason}
-              checked={reason === r.reason}
-              onChange={() => setReason(r.reason)}
-              className="accent-accent"
-            />
-            <span className="text-[13px] text-text">{r.label}</span>
-            <span className="text-[11px] text-gray-tertiary">{r.blurb}</span>
-          </label>
-        ))}
-      </div>
-      <label className="flex flex-col gap-1.5 mt-4">
-        <span className="text-[12px] text-gray-tertiary">What's wrong? (optional)</span>
-        <textarea
-          value={note}
-          maxLength={MAX_NOTE_CHARS}
-          rows={3}
-          autoFocus
-          onChange={(e) => setNote(e.target.value)}
-          className="bg-bg border border-border rounded-xl px-3 py-2 box-border text-sm text-text focus:outline-none focus:border-accent transition-colors resize-y"
+    <span className="flex items-center gap-1.5 font-mono text-[11px] tabular-nums" title={title}>
+      <span
+        className={sync.retrying ? "lbl-sync-retry" : undefined}
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: 999,
+          border: `1.5px solid ${INK_DIM}`,
+          background: flushed ? INK_DIM : "transparent",
+        }}
+        aria-hidden="true"
+      />
+      <span>{flushed ? "synced" : sync.pending}</span>
+      {sync.dropped > 0 ? <span style={{ color: ALARM }}>· {sync.dropped} unsaved</span> : null}
+    </span>
+  );
+}
+
+/** §5.4: a flagged item carries three channels and NO hue — a flag must never
+    read as a sun class. The dash is drawn as SVG because CSS outlines cannot
+    express a 6/4 dash, and both layers are painted over the crop so neither
+    changes its box. */
+/** Day + camera, and the dataset id ONLY when it adds something.
+ *
+ * A dataset defaults to its capture day as its id, so the obvious
+ * `dataset · camera · day` rendered "2025-07-03 · camera_05 · 2025-07-03" for
+ * every ordinary day — the same string twice, which reads as a bug and costs the
+ * one strip of context the annotator has. The id survives here only when it was
+ * deliberately overridden (a same-day re-shoot), which is exactly when knowing
+ * which package you are labelling matters. Still no clock time, ever: it would
+ * hand over the sun-exposure answer that the crop's masked banner hides. */
+function captionFor(item: LabelItem): string {
+  const day = item.day ?? "unknown day";
+  const parts = [day, item.camera_id];
+  if (item.dataset_id !== null && item.dataset_id !== item.day) parts.push(item.dataset_id);
+  return parts.join(" · ");
+}
+
+/** Four corners pulling apart — "this gets bigger". Drawn rather than typed:
+    a magnifier emoji renders differently per platform and reads as "search". */
+function ZoomGlyph() {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M9 3H3v6M15 3h6v6M9 21H3v-6M15 21h6v-6" />
+    </svg>
+  );
+}
+
+function FlaggedOverlay({ size }: { size: number }) {
+  return (
+    <>
+      {/* Sized in real pixels rather than percentages: a 6/4 dash is a
+          measurement, and a viewBox that scales would turn it into whatever the
+          crop's height happens to make it. */}
+      <svg
+        className="absolute inset-0 pointer-events-none"
+        width={size}
+        height={size}
+        viewBox={`0 0 ${size} ${size}`}
+        aria-hidden="true"
+      >
+        <rect
+          x={1.5}
+          y={1.5}
+          width={Math.max(0, size - 3)}
+          height={Math.max(0, size - 3)}
+          fill="none"
+          stroke={ALARM}
+          strokeWidth="3"
+          strokeDasharray="6 4"
+          rx="10"
         />
-      </label>
-      <div className="mt-4 flex items-center justify-end gap-3">
-        <Button variant="ghost" onClick={onClose} disabled={busy}>
-          Cancel
-        </Button>
-        <Button onClick={() => onFlag(reason, note.trim())} disabled={busy}>
-          Flag &amp; skip
-        </Button>
+      </svg>
+      <div
+        className="absolute left-0 right-0 top-0 pointer-events-none"
+        style={{
+          height: 20,
+          backgroundImage: `repeating-linear-gradient(45deg, ${ALARM} 0 2px, transparent 2px 4px)`,
+          opacity: 0.75,
+        }}
+        aria-hidden="true"
+      />
+    </>
+  );
+}
+
+/* FLAG, §3.9. The five reasons replace the TILE ROW IN PLACE — same rectangle,
+   same badges, same rhythm — rather than opening a modal over the crop: a
+   558-participant AMT study found sequences of distinct task types measurably
+   hurt classification engagement, and a dialog over the animal is exactly such a
+   switch. The reason is asked at the pixels, where `multiple_cows` versus
+   `occluded` is still visible.
+
+   The written explanation is required here rather than deferred to an
+   end-of-session queue, because decision 6 makes it mandatory and the flag route
+   400s a blank one — so a two-keystroke flag would have nothing to post. Enter
+   submits, Esc cancels, and the whole thing stays inside PANEL_H so nothing
+   below it moves. */
+function FlagRow({
+  draft,
+  onPick,
+  onExplain,
+  onSubmit,
+  onCancel,
+}: {
+  draft: FlagDraft;
+  onPick: (reason: LabelSkipReason) => void;
+  onExplain: (text: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const chosen = FLAG_REASONS.find((r) => r.reason === draft.reason) ?? null;
+  const ready = chosen !== null && draft.explanation.trim() !== "";
+  return (
+    <div
+      className="box-border w-full"
+      style={{
+        // The neutral alarm field (§5.4): no hue at all, so a flag can never be
+        // mistaken for a sun answer.
+        background: TILE,
+        borderLeft: `3px solid ${ALARM}`,
+        borderRadius: 10,
+        padding: 10,
+        height: PANEL_H,
+        color: INK,
+      }}
+    >
+      <div className="flex items-center gap-2" style={{ height: 24 }}>
+        <span className="text-[13px] font-semibold uppercase tracking-[0.08em] leading-none">
+          ⚑ Flag — {chosen === null ? "why?" : chosen.label}
+        </span>
+        <span className="ml-auto text-[11px]" style={{ color: INK_DIM }}>
+          {chosen === null ? "1–5 · Esc cancels" : "Enter flags · Esc cancels"}
+        </span>
       </div>
-    </Overlay>
+
+      {chosen === null ? (
+        <div
+          className="grid"
+          style={{
+            marginTop: 8,
+            gridAutoFlow: "column",
+            gridAutoColumns: `${TILE_W}px`,
+            gap: TILE_GAP,
+            justifyContent: "start",
+            height: TILE_H,
+          }}
+        >
+          {FLAG_REASONS.map((r, i) => (
+            <button
+              key={r.reason}
+              type="button"
+              onClick={() => onPick(r.reason)}
+              className="flex flex-col items-center rounded-lg border box-border cursor-pointer
+                         focus-visible:outline-2 focus-visible:outline-offset-2"
+              style={{
+                width: TILE_W,
+                height: TILE_H,
+                padding: 7,
+                background: "var(--lbl-card, #1E2124)",
+                borderColor: HAIRLINE,
+                color: INK,
+                outlineColor: INK,
+              }}
+            >
+              <span className="flex w-full items-center" style={{ height: 20 }}>
+                <span
+                  className="grid place-items-center rounded-md font-mono text-[12px] font-bold leading-none"
+                  style={{ width: 20, height: 20, color: ALARM, background: HAIRLINE }}
+                >
+                  {i + 1}
+                </span>
+              </span>
+              <span className="grid w-full flex-1 place-items-center">
+                <ClassIcon name={r.icon} />
+              </span>
+              <span
+                className="w-full text-center text-[12px] leading-[14px] break-words"
+                style={{ height: 28 }}
+              >
+                {r.label}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="flex items-start gap-2" style={{ marginTop: 8, height: TILE_H }}>
+          <textarea
+            autoFocus
+            rows={3}
+            value={draft.explanation}
+            maxLength={MAX_NOTE_CHARS}
+            placeholder="What is wrong with this one? (required — whoever reviews the queue reads this)"
+            onChange={(e) => onExplain(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter submits; the window handler never sees keys typed in here
+              // (isTypingTarget), and Escape is handled before that guard.
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (ready) onSubmit();
+              }
+            }}
+            className="grow h-full rounded-lg border box-border px-2.5 py-2 text-[13px] resize-none
+                       focus:outline-none"
+            style={{ background: "var(--lbl-card, #1E2124)", borderColor: HAIRLINE, color: INK }}
+          />
+          <div className="flex flex-col gap-2 shrink-0">
+            <DarkButton onClick={onSubmit} disabled={!ready}>
+              Flag &amp; next
+            </DarkButton>
+            <DarkButton onClick={onCancel}>Cancel</DarkButton>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
