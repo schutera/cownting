@@ -30,6 +30,33 @@ DET_COLS = [
 ]
 
 
+def is_transient_lock_error(exc: Exception) -> bool:
+    """True when `exc` is DuckDB's momentary file-handle/lock collision.
+
+    Two short-lived connections to one file coincide for a few milliseconds — a
+    dashboard query overlapping an upload, or several label requests arriving from
+    one page load — and DuckDB refuses the second. It clears on its own, so callers
+    retry rather than fail.
+
+    The predicate lives here, once, because the same collision is worded
+    differently per platform AND surfaces from three different operations (opening
+    a connection, ATTACHing a second database, replaying idempotent DDL). It used
+    to be copy-pasted at each site, so adding the Windows wording to one of them
+    left the other two still returning 500s — which is exactly how the Label page's
+    ATTACH kept failing after `connect` had been fixed.
+
+    Covers: "Unique file handle conflict ... already attached" (both platforms),
+    POSIX's "Conflicting lock is held", Windows' "The process cannot access the
+    file because it is being used by another process", and the catalog
+    "write-write conflict" two writers hit replaying the same CREATE OR REPLACE.
+    """
+    msg = str(exc).lower()
+    return ("already attached" in msg
+            or "unique file handle" in msg
+            or "conflict" in msg                        # POSIX lock + catalog write-write
+            or "being used by another process" in msg)  # Windows sharing violation
+
+
 def connect(db_path: str, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection, retrying past the transient file-handle conflict.
 
@@ -49,8 +76,7 @@ def connect(db_path: str, read_only: bool = False) -> duckdb.DuckDBPyConnection:
         try:
             return duckdb.connect(db_path, read_only=read_only)
         except Exception as e:  # noqa: BLE001 — retry only the file-handle clash
-            msg = str(e).lower()
-            if "already attached" in msg or "unique file handle" in msg or "conflict" in msg:
+            if is_transient_lock_error(e):
                 last = e
                 time.sleep(delay)
                 delay = min(delay * 1.5, 0.2)

@@ -313,6 +313,170 @@ def user_delete(username: str, config: str = CONFIG_OPT):
     typer.secho(f"deleted {username!r}.", fg=typer.colors.GREEN)
 
 
+labels_app = typer.Typer(
+    help="In-app annotation store (Label page): backup, export, status, reconcile. "
+         "Unrelated to the Stage-1b label-select/label-export CVAT loop."
+)
+app.add_typer(labels_app, name="labels")
+
+
+@labels_app.command("backup")
+def labels_backup(
+    config: str = CONFIG_OPT,
+    force: bool = typer.Option(
+        False, "--force",
+        help="Bypass the weekly due-gate (not the claim: a run already in flight still wins).",
+    ),
+    keep: int = typer.Option(None, "--keep", help="Zips to retain (default: backup.keep)."),
+    no_discord: bool = typer.Option(
+        False, "--no-discord", help="Zip + rotate locally without posting to the webhook."
+    ),
+):
+    """Back up the label store now: snapshot -> zip -> data/backups/labels/ -> Discord.
+
+    'skipped' (not due, or the store is busy) exits 0 on purpose — treating
+    contention as failure is how a nightly cron wedges the weekly schedule behind
+    a permanent cooldown. Only a genuine failure exits 1.
+    """
+    from . import labels_backup as backup_mod
+
+    res = backup_mod.run_backup(
+        _load(config),
+        trigger="forced" if force else "cli",
+        force=force,
+        keep=keep,
+        discord=not no_discord,
+    )
+    if res["status"] == "failed":
+        typer.secho(f"backup failed: {res['error']}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    if res["status"] == "skipped":
+        typer.echo(f"skipped: {res['reason']}")
+        return
+    typer.secho(
+        f"done: {res['zip_path']} ({res['zip_bytes']} bytes), "
+        f"{res['new_annotations']} new annotations, discord={res['discord']}",
+        fg=typer.colors.GREEN,
+    )
+
+
+@labels_app.command("export-csv")
+def labels_export_csv(out: str, config: str = CONFIG_OPT):
+    """Write the long-format annotations CSV (one row per annotation x choice)."""
+    from . import db, labels_backup, labels_db
+
+    cfg = _load(config)
+    con = db.connect(cfg.paths.labels_db_path)
+    labels_db.init_labels_db(con)
+    n = labels_backup.export_csv(con, out)
+    con.close()
+    typer.echo(f"wrote {n} rows -> {out}")
+
+
+@labels_app.command("status")
+def labels_status(
+    config: str = CONFIG_OPT,
+    limit: int = typer.Option(5, "--limit", help="Recent backup runs to show."),
+):
+    """Backup health: gate state, watermark, recent runs.
+
+    Prints WHETHER a webhook is configured, never the URL — the value is a bearer
+    credential for posting into the channel.
+    """
+    from . import labels_backup
+
+    st = labels_backup.status(_load(config), limit=limit)
+    webhook = "yes" if st["webhook_configured"] else "no"
+    if st["webhook_configured"] and not st["webhook_valid"]:
+        webhook = "yes (NOT a discord.com/api/webhooks URL — will be refused)"
+    typer.echo(f"    enabled: {st['enabled']} (every {st['every_days']}d, keep {st['keep']})")
+    typer.echo(f"    webhook: {webhook}")
+    typer.echo(f"  scheduler: {st['scheduler']['status']}"
+               + (" (thread alive)" if st["scheduler"]["thread_alive"] else ""))
+    if st["error"]:
+        typer.secho(f"      store: {st['error']}", fg=typer.colors.YELLOW)
+        return
+    typer.echo(f"        due: {st['due']} — {st['due_reason']}")
+    typer.echo(f"  watermark: {st['watermark'] or '(none — first run posts everything)'}")
+    if not st["runs"]:
+        typer.echo("       runs: none yet")
+        return
+    for r in st["runs"]:
+        line = (f"  #{r['run_id']}  {r['status']:>7}  {r['trigger']:>8}  "
+                f"finished={r['finished_at'] or '-'}  new={r['new_annotations']}  "
+                f"discord={r['discord'] or '-'}")
+        if r["error"]:
+            line += f"  error={r['error']}"
+        typer.echo(line)
+
+
+@labels_app.command("reconcile")
+def labels_reconcile(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(None, "--dataset", help="Scope to one dataset (default: all)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report states without writing."),
+):
+    """Re-attach labels to detections after a re-ingest (prints per-state counts)."""
+    from pathlib import Path
+
+    from . import db, labels_db
+
+    cfg = _load(config)
+    if not Path(cfg.paths.db_path).exists():
+        # read_only=True refuses to create a file, and reconciling against a DB
+        # that was never ingested is meaningless anyway.
+        typer.echo(f"no main DB at {cfg.paths.db_path} — nothing to reconcile against.")
+        return
+    lcon = db.connect(cfg.paths.labels_db_path)
+    labels_db.init_labels_db(lcon)
+    mcon = db.connect(cfg.paths.db_path, read_only=True)
+    # Without the archive DB an archived instance is indistinguishable from an
+    # orphan; opening it read-write would CREATE an empty file on a box that
+    # never archived anything, so probe for existence first.
+    acon = None
+    if Path(cfg.paths.archive_db_path).exists():
+        acon = db.connect(cfg.paths.archive_db_path, read_only=True)
+    try:
+        res = labels_db.reconcile_dataset(
+            lcon, mcon, dataset, actor="cli", archive_con=acon, dry_run=dry_run
+        )
+    finally:
+        if acon is not None:
+            acon.close()
+        mcon.close()
+        lcon.close()
+    if dry_run:
+        typer.echo("dry run — nothing written:")
+    for k, v in res.items():
+        typer.echo(f"{k:>20}: {v}")
+
+
+@labels_app.command("reseed")
+def labels_reseed(
+    config: str = CONFIG_OPT,
+    force: bool = typer.Option(
+        False, "--force",
+        help="Refresh seeded names/descriptions/order onto existing keys "
+             "(never un-archives an operator's archive decision).",
+    ),
+):
+    """Re-apply the shipped taxonomy seed.
+
+    Without --force this is the idempotent presence-of-key seed (a no-op on an
+    already-seeded store); with it, the shipped wording is refreshed onto
+    existing keys, audited, and the revision bumped.
+    """
+    from . import db, labels_db
+
+    cfg = _load(config)
+    con = db.connect(cfg.paths.labels_db_path)
+    labels_db.init_labels_db(con)
+    n = labels_db.seed_taxonomy(con, force=force, actor="cli")
+    rev = labels_db.taxonomy_revision(con)
+    con.close()
+    typer.echo(f"seed touched {n} rows; taxonomy revision is now {rev}.")
+
+
 def _run_test_gate() -> bool:
     """Run `python -m tests` before serving. Returns True to proceed, False to
     abort. If the tests/ dir is absent (e.g. an installed build without it), the

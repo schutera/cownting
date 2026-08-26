@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
-import { uploadVideos, getUploadJob, listUploadJobs, CaptureDayRequiredError } from "../lib/api";
+import { uploadVideos, CaptureDayRequiredError } from "../lib/api";
 import type { UploadJob } from "../lib/types";
+import { isJobActive, useUploadJobs } from "../lib/processing";
 import { Button, SectionLabel } from "./ui";
 
 /**
@@ -10,8 +12,13 @@ import { Button, SectionLabel } from "./ui";
  * no nested cards. Drop or click to attach a clip; a frame is grabbed from the
  * video for a thumbnail preview so a filled tile reads at a glance. Upload sends
  * every clip as one day and the backend auto-processes it (ingest -> segment ->
- * localize); the job is polled for a live progress bar (tiles stay on screen with
- * their thumbnails), and on completion the day list refreshes.
+ * localize).
+ *
+ * The upload and the model run are separate milestones for the user, not one long
+ * wait. The moment the server has the files (202) the day is registered, made
+ * active and handed back — detection then runs in the background and its progress
+ * is reported without holding anyone here. Waiting out a multi-minute segmentation
+ * pass on this screen was the single worst part of adding a day.
  */
 const CAMERA_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const DEFAULT_ZONES = 4;
@@ -74,8 +81,19 @@ function videoThumb(file: File): Promise<string | null> {
 
 export function UploadPanel() {
   const { setDataset, refresh } = useDataset();
+  const navigate = useNavigate();
   const [zones, setZones] = useState<Zone[]>(() => makeZones(DEFAULT_ZONES));
-  const [job, setJob] = useState<UploadJob | null>(null);
+  // Every in-flight day, polled process-wide. One source for both the banner and
+  // the queue list, so a day queued from another tab shows up here too.
+  const jobs = useUploadJobs();
+  // The day THIS panel just submitted, seeded from the 202 so the banner appears
+  // before the first poll lands; the polled copy takes over as soon as it does.
+  const [seed, setSeed] = useState<UploadJob | null>(null);
+  const job = seed ? jobs[seed.dataset_id] ?? seed : null;
+  // Oldest first — that is the order the worker will take them in.
+  const queue = Object.values(jobs)
+    .filter(isJobActive)
+    .sort((a, b) => a.created_at - b.created_at);
   // True while the POST is in flight (files streaming up), before the job exists —
   // so the surface shows continuous feedback instead of a dead wait on a big file.
   const [submitting, setSubmitting] = useState(false);
@@ -86,33 +104,16 @@ export function UploadPanel() {
   const [needDay, setNeedDay] = useState(false);
   const [day, setDay] = useState<string>(todayISO());
   const nextKey = useRef(DEFAULT_ZONES);
-  const timer = useRef<number | null>(null);
 
-  useEffect(() => () => {
-    if (timer.current) window.clearTimeout(timer.current);
-  }, []);
-
-  // Reconnect on mount: processing runs server-side and the job store is
-  // process-wide, so if a day is still being detected (after a refresh, in a new
-  // tab, or started by someone else) pick it up and resume the progress bar.
+  // Settled frame/cow counts land on the day list only when a job finishes.
   useEffect(() => {
-    let cancelled = false;
-    listUploadJobs()
-      .then((jobs) => {
-        if (cancelled) return;
-        const active = jobs.find((jb) => jb.status === "queued" || jb.status === "running");
-        if (active) {
-          setJob(active);
-          poll(active.job_id);
-        }
-      })
-      .catch(() => {/* no jobs / transient — just show the empty upload form */});
-    return () => { cancelled = true; };
+    if (job?.status === "done") refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [job?.status]);
 
-  const busy =
-    submitting || (job !== null && job.status !== "done" && job.status !== "failed");
+  // Only the file transfer blocks this form now. Processing does not: another day
+  // can be sent up while the worker is still chewing on the last one.
+  const busy = submitting;
 
   function setName(key: number, camera: string) {
     setZones((zs) => zs.map((z) => (z.key === key ? { ...z, camera } : z)));
@@ -161,8 +162,11 @@ export function UploadPanel() {
     setSubmitting(true);
     try {
       const started = await uploadVideos(form);
-      setJob(started);
-      poll(started.job_id);
+      setSeed(started);
+      // The videos are on the server and the day is already registered, so make
+      // it active and list it NOW. Everything from here is the model catching up.
+      await refresh();
+      setDataset(started.dataset_id);
     } catch (e) {
       if (e instanceof CaptureDayRequiredError) {
         setNeedDay(true);
@@ -175,51 +179,96 @@ export function UploadPanel() {
     }
   }
 
-  function poll(id: string) {
-    const tick = async () => {
-      try {
-        const j = await getUploadJob(id);
-        setJob(j);
-        if (j.status === "done") {
-          await refresh();
-          setDataset(j.dataset_id);
-          return;
-        }
-        if (j.status === "failed") {
-          setError(j.error || j.message);
-          return;
-        }
-      } catch {
-        /* transient — keep polling */
-      }
-      timer.current = window.setTimeout(tick, 1500);
-    };
-    tick();
-  }
-
   function reset() {
-    if (timer.current) window.clearTimeout(timer.current);
-    setJob(null);
+    setSeed(null);
     setError(null);
     setNeedDay(false);
     setZones((zs) => zs.map((z) => ({ ...z, file: null, thumb: null })));
   }
 
-  // ---- completion banner (flat, centred) ---------------------------------
-  if (job && job.status === "done") {
+  // ---- landed banner (flat, centred) -------------------------------------
+  // Shown from the instant the server has the files, NOT from the end of
+  // processing: the upload is the milestone the user waited for, and holding this
+  // screen hostage through segmentation is what made adding a day feel endless.
+  // Detection keeps running behind it, reported here and on the dashboard.
+  if (job) {
+    const failed = job.status === "failed";
+    const done = job.status === "done";
+    const pct = Math.round(job.progress * 100);
     return (
       <section className="flex flex-col items-center text-center py-12">
-        <span className="grid place-items-center w-16 h-16 rounded-full bg-accent-soft text-accent-deep text-2xl">
-          ✓
+        <span
+          className={
+            "grid place-items-center w-16 h-16 rounded-full text-2xl " +
+            (failed
+              ? "bg-[#e76f51]/10 text-[#e76f51]"
+              : "bg-accent-soft text-accent-deep")
+          }
+        >
+          {failed ? "!" : "✓"}
         </span>
-        <h2 className="font-display text-3xl font-light text-near-black mt-5">Upload complete</h2>
-        <p className="text-gray-mid text-sm mt-2">
-          <span className="text-near-black">{job.label}</span> · {job.frames.toLocaleString()} frames ·{" "}
-          {job.detections.toLocaleString()} cows detected — now your active day.
-        </p>
-        <div className="mt-6">
+        <h2 className="font-display text-3xl font-light text-near-black mt-5">
+          {failed ? "Processing failed" : "Footage uploaded"}
+        </h2>
+
+        {failed ? (
+          <p className="text-gray-mid text-sm mt-2 max-w-md">
+            <span className="text-near-black">{job.label}</span> is on the server, but
+            detection stopped — {job.error || job.message}
+          </p>
+        ) : done ? (
+          <p className="text-gray-mid text-sm mt-2">
+            <span className="text-near-black">{job.label}</span> ·{" "}
+            {job.frames.toLocaleString()} frames · {job.detections.toLocaleString()} cows
+            detected — fully processed and ready.
+          </p>
+        ) : (
+          <>
+            <p className="text-gray-mid text-sm mt-2 max-w-md">
+              <span className="text-near-black">{job.label}</span> is saved and is now your
+              active day.
+            </p>
+            {/* The full readout, unchanged from the original in-form progress
+                block: the per-frame message is the part that makes a long
+                segmentation pass feel like it is moving. */}
+            <div className="w-full max-w-xl mt-7 text-left">
+              <div className="flex items-baseline justify-between">
+                <span className="font-display text-5xl text-near-black tabular-nums leading-none">
+                  {pct}%
+                </span>
+                <span className="text-[13px] text-gray-mid">{STAGE_LABEL[job.stage]}</span>
+              </div>
+              <div className="h-2 w-full rounded-full bg-surface-sunk overflow-hidden mt-4">
+                <div
+                  className="h-full bg-accent rounded-full transition-[width] duration-500 ease-out"
+                  style={{ width: `${Math.max(4, pct)}%` }}
+                />
+              </div>
+              <p className="text-[13px] text-gray-mid mt-3">{job.message}</p>
+              <p className="text-[12px] text-gray-tertiary mt-1">
+                Processing runs on the server — you can leave this page; it keeps going.
+              </p>
+            </div>
+          </>
+        )}
+
+        {job.warnings?.length ? (
+          <p className="text-[12px] text-warn mt-4 max-w-md">
+            {job.warnings.length} camera{job.warnings.length > 1 ? "s" : ""} need a look:{" "}
+            {job.warnings.join("; ")}.
+          </p>
+        ) : null}
+
+        {/* Always available: days are queued, not run in parallel, so sending up
+            another one cannot collide with this one. The single unsafe case —
+            the SAME day twice while it is in flight — is refused by the server
+            with a 409 and surfaces in the form's error box. */}
+        <div className="mt-7 flex items-center gap-3">
+          <Button onClick={() => navigate("/")}>Go to the dashboard</Button>
           <Button variant="ghost" onClick={reset}>Upload another day</Button>
         </div>
+
+        {queue.length > 1 ? <UploadQueue queue={queue} highlight={job.dataset_id} /> : null}
       </section>
     );
   }
@@ -237,6 +286,8 @@ export function UploadPanel() {
           placed automatically.
         </p>
       </div>
+
+      {queue.length ? <UploadQueue queue={queue} /> : null}
 
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 mt-7">
         {zones.map((z) => (
@@ -270,9 +321,7 @@ export function UploadPanel() {
         </label>
       ) : null}
 
-      {job && busy ? (
-        <Progress job={job} />
-      ) : submitting ? (
+      {submitting ? (
         <Uploading />
       ) : (
         <div className="flex items-center gap-4 mt-7 flex-wrap">
@@ -292,8 +341,53 @@ export function UploadPanel() {
   );
 }
 
-/** Pre-job feedback: the clips are streaming to the server. Once the server has
- *  them it returns the job and <Progress> takes over (ingest → detect → place). */
+/** In-flight days, oldest first — the order the single worker will take them in.
+ *  Processing is serial (CPU-only inference; see cownting/uploads.py), so this is
+ *  a real queue: everything after the first is waiting its turn, and saying so is
+ *  the difference between "it is working" and "nothing is happening". */
+function UploadQueue({ queue, highlight }: { queue: UploadJob[]; highlight?: string }) {
+  return (
+    <div className="mt-7 border border-border rounded-2xl divide-y divide-border overflow-hidden">
+      <div className="px-4 py-2.5 bg-surface-sunk/60">
+        <SectionLabel>
+          Processing queue · {queue.length} day{queue.length === 1 ? "" : "s"}
+        </SectionLabel>
+      </div>
+      {queue.map((j, i) => {
+        const running = j.status === "running";
+        const pct = Math.round(j.progress * 100);
+        return (
+          <div
+            key={j.job_id}
+            className={
+              "flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 " +
+              (j.dataset_id === highlight ? "bg-accent-soft/40" : "")
+            }
+          >
+            <span
+              className={
+                "w-2 h-2 rounded-full shrink-0 " + (running ? "bg-accent animate-pulse" : "bg-warn")
+              }
+            />
+            <span className="text-[13px] text-near-black truncate">{j.label}</span>
+            <span className="text-[12px] text-gray-mid truncate">
+              {running ? j.message : i === 0 ? "starting…" : `waiting — ${i} day${i === 1 ? "" : "s"} ahead`}
+            </span>
+            {running ? (
+              <span className="ml-auto font-mono text-[11px] text-gray-tertiary tabular-nums shrink-0">
+                {pct}%
+              </span>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Pre-job feedback: the clips are streaming to the server. This is the only
+ *  wait the user actually has to sit through; once the server has them the landed
+ *  banner takes over and detection runs in the background. */
 function Uploading() {
   return (
     <div className="mt-8 max-w-xl">
@@ -307,28 +401,6 @@ function Uploading() {
       <p className="text-[13px] text-gray-mid mt-3">Sending your footage to the server…</p>
       <p className="text-[12px] text-gray-tertiary mt-1">
         Large clips take a moment — detection starts automatically once they land.
-      </p>
-    </div>
-  );
-}
-
-function Progress({ job }: { job: UploadJob }) {
-  const pct = Math.round(job.progress * 100);
-  return (
-    <div className="mt-8 max-w-xl">
-      <div className="flex items-baseline justify-between">
-        <span className="font-display text-5xl text-near-black tabular-nums leading-none">{pct}%</span>
-        <span className="text-[13px] text-gray-mid">{STAGE_LABEL[job.stage]}</span>
-      </div>
-      <div className="h-2 w-full rounded-full bg-surface-sunk overflow-hidden mt-4">
-        <div
-          className="h-full bg-accent rounded-full transition-[width] duration-500 ease-out"
-          style={{ width: `${Math.max(4, job.progress * 100)}%` }}
-        />
-      </div>
-      <p className="text-[13px] text-gray-mid mt-3">{job.message}</p>
-      <p className="text-[12px] text-gray-tertiary mt-1">
-        Processing runs on the server — you can leave this page; it keeps going.
       </p>
     </div>
   );

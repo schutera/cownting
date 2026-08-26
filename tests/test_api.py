@@ -74,7 +74,9 @@ def _client(d: str) -> TestClient:
     config = Config(
         cameras=[CameraCfg(id="camera_01", video="unused.mp4")],
         auth=_NO_AUTH,
-        paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json")),
+        paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json"),
+                       labels_db_path=os.path.join(d, "labels.duckdb"),
+                       backups_dir=os.path.join(d, "backups")),
     )
     return TestClient(create_app(config))
 
@@ -142,6 +144,25 @@ def test_endpoints_answer_and_shape():
               {"frame_idx", "posture", "region_id", "detection_id"}.issubset(set(header)),
               str(header))
 
+        # Label reads: one contract-smoke line each. The seed has detections but no
+        # JPEGs on disk, so the crop genuinely 404s — that IS the expected shape,
+        # not a failure (a missing frame must never surface as a 500).
+        r = client.get("/api/label/taxonomy")
+        check("GET /api/label/taxonomy -> 200 + revision",
+              r.status_code == 200 and "revision" in r.json(), str(r.status_code))
+        r = client.get("/api/label/queue")
+        check("GET /api/label/queue -> 200 + items",
+              r.status_code == 200 and "items" in r.json(), str(r.status_code))
+        r = client.get("/api/label/progress")
+        check("GET /api/label/progress -> 200 + pool_total",
+              r.status_code == 200 and "pool_total" in r.json(), str(r.status_code))
+        r = client.get("/api/label/mine")
+        check("GET /api/label/mine -> 200 + items",
+              r.status_code == 200 and "items" in r.json(), str(r.status_code))
+        r = client.get("/api/img/label-crop/camera_01/00000001.jpg?x1=1&y1=1&x2=50&y2=50")
+        check("GET /api/img/label-crop (no JPEG on disk) -> 404",
+              r.status_code == 404, str(r.status_code))
+
 
 def _client_with_dataset(d: str) -> TestClient:
     """Same seed, but stamped into one data-package + a datasets dim row, so the
@@ -157,7 +178,9 @@ def _client_with_dataset(d: str) -> TestClient:
     config = Config(
         cameras=[CameraCfg(id="camera_01", video="unused.mp4")],
         auth=_NO_AUTH,
-        paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json")),
+        paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json"),
+                       labels_db_path=os.path.join(d, "labels.duckdb"),
+                       backups_dir=os.path.join(d, "backups")),
     )
     return TestClient(create_app(config))
 
@@ -212,7 +235,9 @@ def test_delete_dataset():
             cameras=[CameraCfg(id="camera_01", video="unused.mp4")],
             auth=_NO_AUTH,
             paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json"),
-                           archive_db_path=archive),
+                           archive_db_path=archive,
+                           labels_db_path=os.path.join(d, "labels.duckdb"),
+                           backups_dir=os.path.join(d, "backups")),
         )
         client = TestClient(create_app(config))
 
@@ -307,7 +332,9 @@ def test_panel_null_is_open():
         config = Config(
             cameras=[CameraCfg(id="camera_09", video="unused.mp4")],
             auth=_NO_AUTH,
-            paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json")),
+            paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json"),
+                       labels_db_path=os.path.join(d, "labels.duckdb"),
+                       backups_dir=os.path.join(d, "backups")),
         )
         client = TestClient(create_app(config))
 

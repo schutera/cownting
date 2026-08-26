@@ -3,6 +3,29 @@
 Shipped work, newest first. Keep this current: when a future-work item lands,
 move it here with the date it shipped and a one-line "what it means for the user".
 
+## 2026-08-26 — In-app labeling (M3)
+
+- **Label page (`/label`)** — every signed-in user can now label cows directly in
+  the app: one animal at a time as a ringed crop, keyboard-first so a whole
+  session runs without touching the mouse. The queue is crash-safe by design —
+  nothing is claimed or leased, so a refreshed tab, a dropped connection or a
+  server redeploy loses no work; the next item is simply served again. Several
+  annotators judge the same instances on purpose, so inter-rater agreement is
+  measurable.
+- **Two seeded questions** — *Sun exposure* (Shaded / Direct sun / Not visible /
+  Cannot tell) and *Behaviour* (Feeding / Lying / Standing / Head probing / Not
+  visible / Cannot tell), each class with a full description behind the (i) icon
+  and an explicit "Cannot tell" escape so nobody is ever forced to guess.
+- **Taxonomy editor (`/label/classes`)** — powerusers can add, rename, reorder
+  and archive questions and answers at runtime. Archiving is soft (no deletes
+  anywhere), so answers already collected keep meaning what they meant.
+- **Labels live in their own file** — `data/labels.duckdb`, separate from the
+  main DB, so re-uploading or deleting a day can never destroy annotator hours.
+- **Weekly off-box backup (off by default)** — set `backup.enabled` plus a
+  *dedicated* `COWNTING_DISCORD_WEBHOOK` to get weekly zips posted off the box;
+  read the DEPLOY.md "Label store & backups" section before enabling (the zip
+  contains annotator usernames and timings).
+
 ## 2026-07-18 — Server deployment + resilient upload progress
 
 - **Deploy on a server** — one-command Docker Compose stack (FastAPI app behind a

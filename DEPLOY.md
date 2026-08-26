@@ -115,6 +115,69 @@ docker compose start cownting
 The session secret and admin credentials live in `.env` — back that up too, out
 of band. Neither `.env` nor `data/` is committed to git.
 
+### Label store & backups
+
+The in-app **Label** page writes annotations to their own DuckDB file,
+`data/labels.duckdb` — deliberately outside the main DB, so re-ingesting or
+deleting a day can't destroy them. It is also **the one file on the box that
+cannot be regenerated**: frames, detections and overlays all come back from a
+re-ingest; annotator hours do not. Treat it accordingly.
+
+Because the weekly zips (below) land in `data/backups/`, the full-`data/` tar
+above should skip them — they *are* backups:
+
+```bash
+tar czf cownting-data-$(date +%Y%m%d).tgz --exclude='data/backups' data/
+```
+
+**Weekly off-box backup.** An in-process scheduler zips the label store
+(snapshot + CSV + taxonomy + manifest) into `data/backups/labels/` once a week
+and posts the zip to a Discord webhook. It ships **off by default**:
+
+```bash
+# 1. config/cownting.prod.yaml:  backup.enabled: true
+# 2. .env:                       COWNTING_DISCORD_WEBHOOK=<dedicated webhook URL>
+docker compose up -d --build
+```
+
+Two rules for that webhook:
+
+- **Use a dedicated channel — never the login-alerts webhook.** The zip contains
+  annotator usernames and per-annotator timings; share it like personnel data,
+  not like a database dump. The first run has no watermark, so it posts the
+  *entire* store in one go.
+- **Blank or unset is fine**: the job still zips and rotates locally
+  (`backup.keep` zips, default 8), it just posts nothing. That is a supported
+  state, not a failure.
+
+**Label maintenance from the host** — same `-u cownting` rule as accounts:
+
+```bash
+docker compose exec -u cownting cownting python -m cownting.cli labels status \
+  -c config/cownting.prod.yaml             # webhook configured? watermark? last runs?
+docker compose exec -u cownting cownting python -m cownting.cli labels backup \
+  -c config/cownting.prod.yaml             # manual run (--force skips the due-gate)
+# also: labels export-csv OUT.csv | labels reconcile [--dataset X] | labels reseed --force
+```
+
+A `skipped` result means "not due" or "store busy" — normal, no action needed. A
+`failed` run prints a `[cownting.alert] LABEL-BACKUP` line and holds the
+watermark, so nothing is silently dropped from the next post.
+
+**Keeping labels attached:**
+
+- **After re-uploading an already-labeled day, run `labels reconcile`.** A
+  re-ingest shifts bounding boxes; reconciliation re-attaches the existing labels
+  to the new detections (non-destructively — it never deletes anything).
+- **Never run `cownting migrate` once labeling has started.** It rewrites the
+  identities labels attach to, and the rekey step is not wired — labels on the
+  migrated partition would strand as orphans.
+- **Mixed-vintage restore:** a `labels.duckdb` from a recent zip next to an
+  *older* `data/` tar makes the next reconciliation report a wall of `hijacked`.
+  That is the correct alarm and the labels are fine — restore a matching-vintage
+  `data/` tar (or re-ingest), then reconcile again. Do **not** delete
+  `data/labels.duckdb` over it.
+
 ### File ownership in `data/`
 
 The app runs as uid **10001** inside the container, and `data/` is a host bind

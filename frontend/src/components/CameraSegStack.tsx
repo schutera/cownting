@@ -29,6 +29,17 @@ function placeholderText(
   return "no frames";
 }
 
+// Source frames are 1920x1080, so the tile reserves 16:9 and the overlay fills it
+// exactly — no crop, and no reflow when the image lands.
+//
+// The aspect ratio is load-bearing, not cosmetic. A bare `w-full` <img> whose GET
+// fails collapses to the height of its own alt text, and the caption strip below
+// is absolutely positioned — so a missing overlay used to render as the caption
+// sitting on top of a broken-image glyph, which is what a partially-synced data
+// dir or a camera whose overlays were never generated looks like. Reserving the
+// box makes the failure a tidy placeholder instead of a wrecked panel.
+const TILE_ASPECT = "aspect-video";
+
 /**
  * Left panel: one segmentation overlay per camera. Each tile has a colour bar
  * (matching its heatmap dots) that toggles the camera in/out of the heatmap;
@@ -63,6 +74,10 @@ export default function CameraSegStack({
   onToggleHidden?: (camera: string) => void;
 }) {
   const [state, setState] = useState<Record<string, CamState>>({});
+  // Overlay URLs whose GET failed. Keyed by URL rather than by camera so moving the
+  // slider to an instant that DOES have an overlay retries instead of leaving the
+  // tile permanently dead, and so a stale failure cannot blank a good frame.
+  const [badImg, setBadImg] = useState<Set<string>>(new Set());
   const navigate = useNavigate();
   const { dataset } = useDataset();
   const { user } = useAuth();
@@ -136,6 +151,7 @@ export default function CameraSegStack({
           const off = hidden?.has(cam) ?? false;
           const color = cameraColor(cameras, cam);
           const shownIdx = shownIdxFor(cam);
+          const overlayUrl = shownIdx != null ? frameImg(cam, shownIdx, "overlay") : null;
           return (
             <div key={cam} className="flex flex-col gap-1.5">
               <div className="flex items-stretch">
@@ -163,16 +179,27 @@ export default function CameraSegStack({
                     (off ? " opacity-50" : "")
                   }
                 >
-                  {shownIdx != null ? (
+                  {overlayUrl && !badImg.has(overlayUrl) ? (
                     <img
-                      src={frameImg(cam, shownIdx, "overlay")}
-                      className="w-full block"
+                      src={overlayUrl}
+                      className={`w-full block ${TILE_ASPECT} object-cover`}
                       alt={`${cam} segmentation`}
                       loading="lazy"
+                      // Record the URL we ASKED for, not e.currentTarget.src: the
+                      // browser reports the resolved absolute URL, which never
+                      // matches the relative one frameImg() builds, so the tile
+                      // would keep rendering the broken <img> forever.
+                      onError={() =>
+                        setBadImg((prev) =>
+                          prev.has(overlayUrl) ? prev : new Set(prev).add(overlayUrl),
+                        )
+                      }
                     />
                   ) : (
-                    <div className="aspect-video grid place-items-center bg-surface-sunk text-[11px] font-mono text-gray-tertiary">
-                      {placeholderText(cs, frame, shownIdx)}
+                    <div
+                      className={`${TILE_ASPECT} grid place-items-center bg-surface-sunk text-[11px] font-mono text-gray-tertiary`}
+                    >
+                      {shownIdx != null ? "no overlay" : placeholderText(cs, frame, shownIdx)}
                     </div>
                   )}
                   {/* gear — opens the count-area editor for this camera. Editing

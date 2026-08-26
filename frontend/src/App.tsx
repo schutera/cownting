@@ -13,6 +13,8 @@ import DataOverview from "./pages/DataOverview";
 import CameraManage from "./pages/CameraManage";
 import Manual from "./pages/Manual";
 import Admin from "./pages/Admin";
+import Label from "./pages/Label";
+import LabelClasses from "./pages/LabelClasses";
 import { TimelineProvider, useTimeline } from "./lib/timeline";
 import { DatasetProvider, useDataset } from "./lib/dataset";
 import { AuthProvider, useAuth, canManageData } from "./lib/auth";
@@ -63,7 +65,10 @@ function BugReportButton() {
       className="font-mono text-[11px] uppercase tracking-[0.16em] px-2 text-gray-tertiary hover:text-accent"
       title="Report a bug via email"
     >
-      Report bug
+      {/* The nav is a fixed non-collapsing row; the Label link makes it six items
+          wide, so this label sheds its text first when space runs short. */}
+      <span className="hidden sm:inline">Report bug</span>
+      <span className="sm:hidden">Bug</span>
     </a>
   );
 }
@@ -159,6 +164,9 @@ function AppInner() {
             <NavLink to="/data" className={navClass}>
               Data
             </NavLink>
+            <NavLink to="/label" className={navClass}>
+              Label
+            </NavLink>
             <NavLink to="/manual" className={navClass}>
               Manual
             </NavLink>
@@ -182,6 +190,21 @@ function AppInner() {
             element={
               <PowerUserOnly>
                 <CameraManage />
+              </PowerUserOnly>
+            }
+          />
+          {/* Labeling is open to every signed-in role — AuthProvider only mounts
+              the routed tree once a session exists, so a bare Route already means
+              "any logged-in user". The taxonomy editor behind it is poweruser-only,
+              and lives on its own route rather than as an in-page toggle because the
+              Label page owns every keystroke: a text input mounted in the same tree
+              would steal 1/Q/S/Enter from the hotkey layer. */}
+          <Route path="/label" element={<Label />} />
+          <Route
+            path="/label/classes"
+            element={
+              <PowerUserOnly>
+                <LabelClasses />
               </PowerUserOnly>
             }
           />

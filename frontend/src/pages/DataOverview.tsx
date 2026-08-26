@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
 import { useAuth, canManageData } from "../lib/auth";
-import type { DatasetRow } from "../lib/types";
+import type { DatasetRow, UploadJob } from "../lib/types";
+import { isJobActive, isReady, statusExplainer, statusLabel, useUploadJobs } from "../lib/processing";
 import { Button, SectionLabel } from "../components/ui";
 import { UploadPanel } from "../components/UploadPanel";
 import { deleteDataset, exportCsvUrl } from "../lib/api";
@@ -24,6 +25,17 @@ function confirmPhrase(row: DatasetRow): string {
  */
 export default function DataOverview() {
   const { datasets, dataset, setDataset, refresh, loaded } = useDataset();
+  // Live processing state per day: the card shows a day as soon as its footage
+  // has landed, so it needs to say how far the model has got on it.
+  const jobs = useUploadJobs();
+  // Days are processed one at a time, so with several queued this list goes stale
+  // repeatedly. Re-read it each time the in-flight count changes — that is when a
+  // day's settled frame/cow counts and final status become available.
+  const inFlight = Object.values(jobs).filter(isJobActive).length;
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inFlight]);
   const { user } = useAuth();
   const canManage = canManageData(user);
   const navigate = useNavigate();
@@ -92,6 +104,7 @@ export default function DataOverview() {
               <DayCard
                 key={d.dataset_id}
                 row={d}
+                job={jobs[d.dataset_id]}
                 active={dataset === d.dataset_id}
                 canManage={canManage}
                 onClick={() => pick(d.dataset_id)}
@@ -229,6 +242,7 @@ function DeleteModal({
 
 function DayCard({
   row,
+  job,
   active,
   canManage,
   onClick,
@@ -236,6 +250,7 @@ function DayCard({
   onDelete,
 }: {
   row: DatasetRow;
+  job?: UploadJob;
   active: boolean;
   canManage: boolean;
   onClick: () => void;
@@ -262,7 +277,7 @@ function DayCard({
             {row.day && row.label ? (
               <span className="font-mono text-[11px] text-gray-tertiary">{row.day.slice(0, 10)}</span>
             ) : null}
-            <StatusDot status={row.status} />
+            <StatusDot status={row.status} job={job} />
           </div>
         </div>
 
@@ -336,13 +351,27 @@ function Dot() {
   return <span className="text-border">·</span>;
 }
 
-function StatusDot({ status }: { status: string }) {
-  // 'localized' = fully processed (sage); anything mid-pipeline is amber.
-  const done = status === "localized";
+function StatusDot({ status, job }: { status: string; job?: UploadJob }) {
+  // Data maturity drives the dot: 'localized' = fully processed (sage), anything
+  // below it is amber because the counts on the card are still climbing. A failed
+  // job overrides — a day stuck at 'uploaded' with no worker behind it is not
+  // "in progress", it needs the user to do something.
+  const failed = job?.status === "failed";
+  const done = isReady(status);
+  const pct = job && !failed ? Math.round(job.progress * 100) : null;
   return (
-    <span className="flex items-center gap-1.5 text-[11px] font-mono text-gray-tertiary shrink-0">
-      <span className={"inline-block w-2 h-2 rounded-full " + (done ? "bg-accent" : "bg-warn")} />
-      {status}
+    <span
+      className="flex items-center gap-1.5 text-[11px] font-mono text-gray-tertiary shrink-0"
+      title={failed ? job?.error || job?.message : done ? undefined : statusExplainer(status)}
+    >
+      <span
+        className={
+          "inline-block w-2 h-2 rounded-full " +
+          (failed ? "bg-[#e76f51]" : done ? "bg-accent" : "bg-warn")
+        }
+      />
+      {failed ? "processing failed" : statusLabel(status)}
+      {pct !== null && !done ? <span className="tabular-nums">· {pct}%</span> : null}
     </span>
   );
 }

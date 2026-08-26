@@ -1,5 +1,13 @@
 import type { ReactNode, CSSProperties } from "react";
 
+/* The shared text-input skin. Lifted verbatim from Admin.tsx's local `inputCls`
+   so the taxonomy editor's fields match the account forms rather than drifting
+   into a third variant. Width is deliberately NOT baked in — callers append
+   `w-full` where the field should fill its column. */
+export const INPUT_CLS =
+  "bg-bg border border-border rounded-xl px-3 h-10 box-border text-sm text-text " +
+  "focus:outline-none focus:border-accent transition-colors";
+
 /* Soft, rounded card on white. Used for the heatmap, spot-check, etc. */
 export function Card({
   children,
@@ -141,6 +149,26 @@ export function SectionLabel({
   );
 }
 
+/* A keycap badge. The Label page is keyboard-first, so the same binding has to
+   appear on the option row, in the permanent legend, in the `?` sheet and in the
+   manual — all fed from lib/labelKeys.ts, all rendered through this, so they
+   cannot drift apart. `min-w-6` keeps `1`, `Q` and `?` the same width, which is
+   what stops a column of badges looking ragged. */
+export function Kbd({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <kbd
+      className={
+        "inline-grid place-items-center min-w-6 h-6 px-1.5 align-middle rounded-md " +
+        "border border-border border-b-2 bg-surface-sunk " +
+        "font-mono text-[11px] leading-none text-near-black" +
+        (className ? " " + className : "")
+      }
+    >
+      {children}
+    </kbd>
+  );
+}
+
 /* Pill toggle (camera picker, hourly/daily). */
 export function Chip({
   children,
@@ -264,6 +292,29 @@ export function CogIcon({ className = "w-4 h-4" }: { className?: string }) {
     >
       <circle cx="12" cy="12" r="3" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  );
+}
+
+/* The (i) disclosure that reveals a class definition on the Label page. Shared
+   with the manual for the same reason as CogIcon: the annotator is told to press
+   the icon that looks like THIS one. Sized by the caller — it sits inline with
+   13px option text on the label rows and with body copy in the manual. */
+export function InfoIcon({ className = "w-4 h-4" }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 16.5v-5" />
+      <path d="M12 7.75h.01" />
     </svg>
   );
 }

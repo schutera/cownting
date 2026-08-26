@@ -110,6 +110,38 @@ class LabelCfg(BaseModel):
     label_field: str = "cows"                # instance field annotators edit in CVAT
 
 
+class AnnotationCfg(BaseModel):
+    """The in-app Label page (docs/roadmap/M3_labeling.md).
+
+    DISTINCT from LabelCfg above, which is the Stage-1b CVAT round-trip. One word
+    apart, two unrelated features — everything here is `annotation`, never `label`.
+    """
+    targets_per_instance: int = 2   # NOT 1: at 1 the first submission removes the
+                                    # instance from every other annotator's queue,
+                                    # which defeats measuring annotator variability.
+    overlap_fraction: float = 0.20  # share of instances given a deeper target
+    overlap_targets: int = 3        # ...so Fleiss' kappa has a real rater count
+    skip_retire: int = 3            # distinct skips before an instance stops being served
+    batch_size: int = 8
+    max_batch_size: int = 50
+    crop_pad: float = 0.35          # context padding, fraction of the LONGER bbox side
+    crop_max_width: int = 768
+    mask_timestamp_banner: bool = True   # the Brinno clock strip leaks time-of-day
+    max_banner_fraction: float = 0.6     # above this the crop is refused, not blanked
+    max_note_chars: int = 500
+
+
+class BackupCfg(BaseModel):
+    """Weekly zip of the label store, posted to a Discord webhook.
+
+    Off by default: it is opt-in per deployment, and the webhook URL comes from
+    COWNTING_DISCORD_WEBHOOK in the environment, never from this YAML."""
+    enabled: bool = False
+    every_days: int = 7
+    keep: int = 8
+    max_upload_bytes: int = 9_500_000   # Discord's unboosted cap, with headroom
+
+
 class FinetuneCfg(BaseModel):
     """Stage 1b: YOLO11-seg fine-tune on the corrected masks."""
     dataset_dir: str = "data/finetune/dataset"    # generated YOLO-seg dataset root
@@ -149,6 +181,12 @@ class PathsCfg(BaseModel):
     count_areas: str = "data/count_areas.json"   # LEGACY flat fallback: used only when dataset_id is None; per-dataset areas live under data/areas/<dataset_id>/
     panel_areas: str = "data/panel_areas.json"   # LEGACY flat fallback: used only when dataset_id is None; per-dataset areas live under data/areas/<dataset_id>/
     orthophoto: Optional[str] = None
+    # Annotations live in their OWN DuckDB file: purge_dataset() deletes detections
+    # on re-ingest and archive_dataset() moves them out, so labels stored in the main
+    # DB would be destroyed by routine data management. Nothing in the ingest path
+    # ever opens this file.
+    labels_db_path: str = "data/labels.duckdb"
+    backups_dir: str = "data/backups"            # weekly label zips in <backups_dir>/labels/
 
 
 class Config(BaseModel):
@@ -160,6 +198,8 @@ class Config(BaseModel):
     posture: PostureCfg = Field(default_factory=PostureCfg)
     pose: PoseCfg = Field(default_factory=PoseCfg)
     label: LabelCfg = Field(default_factory=LabelCfg)
+    annotation: AnnotationCfg = Field(default_factory=AnnotationCfg)
+    backup: BackupCfg = Field(default_factory=BackupCfg)
     finetune: FinetuneCfg = Field(default_factory=FinetuneCfg)
     flags: FlagsCfg = Field(default_factory=FlagsCfg)
     paths: PathsCfg = Field(default_factory=PathsCfg)

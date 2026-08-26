@@ -1,8 +1,24 @@
 """In-app multi-camera upload -> auto-process (ingest -> segment -> localize).
 
 Single-box MVP of the roadmap's upload epic (DU2/DU3): a POST lands one video per
-camera, a background thread runs the offline batch scoped to the new day, and a
+camera, a background worker runs the offline batch scoped to the new day, and a
 job record exposes stage/progress so the frontend can show a progress bar.
+
+Days are processed by ONE worker thread draining a FIFO queue, not a thread per
+job. Uploading is the part the user waits on, so several days can be sent up
+back-to-back; the model work behind them is deliberately serial:
+
+  * Inference is CPU-only here (yolo11x-seg). Two segmentation passes on the same
+    cores finish no sooner than one after the other, they just both crawl.
+  * pipeline.segment picks up work by scanning for NOT-processed frames and
+    snapshots that list at the start. Two passes overlapping would each run the
+    model over the shared frames and each write detections for them - silently
+    doubling a day's cow count.
+  * ingest purges a dataset's rows and rmtree's its artifact subtree, so two runs
+    touching one day race destructively.
+
+A queued job reports status 'queued' until the worker reaches it, which is what
+the frontend shows as its place in line.
 
 The job registry is an in-memory dict in the single serve process, so it's shared
 across every request/client — any browser (a refresh, a second tab, another user)
@@ -16,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -24,6 +41,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import db
 from .config import CameraCfg, Config, DatasetCfg
 from .pipeline import ingest as run_ingest
 from .pipeline import ingest_one_camera as run_ingest_one
@@ -67,6 +85,58 @@ _JOBS: dict[str, Job] = {}
 _LOCK = threading.Lock()
 
 ACTIVE = {"queued", "running"}
+
+# datasets.status — DATA MATURITY, deliberately distinct from a Job's lifecycle
+# status (see docs/roadmap/ROADMAP.md: the two must not be conflated). A day climbs
+# this ladder as the pipeline fills it in; 'uploaded' is the new bottom rung, set
+# the instant the videos are on disk and before any model has run.
+UPLOADED = "uploaded"
+
+# Work queue + the single thread draining it. The thread starts lazily on the first
+# job and lives for the process; it is a daemon so it never blocks shutdown. Queued
+# work is in-memory only - recover_jobs() fails anything still pending after a
+# restart rather than pretending it will resume.
+_QUEUE: "queue.Queue[tuple]" = queue.Queue()
+_WORKER: Optional[threading.Thread] = None
+_WORKER_LOCK = threading.Lock()
+
+
+def _worker_loop() -> None:
+    while True:
+        fn, args = _QUEUE.get()
+        try:
+            fn(*args)
+        except BaseException:  # noqa: BLE001 - _run/_run_add_camera already record
+            pass               # failure on the job; one bad day must not kill the worker
+        finally:
+            _QUEUE.task_done()
+
+
+def _enqueue(fn: Callable, *args) -> None:
+    """Hand work to the serial worker, starting it on first use."""
+    global _WORKER
+    with _WORKER_LOCK:
+        if _WORKER is None or not _WORKER.is_alive():
+            _WORKER = threading.Thread(target=_worker_loop, daemon=True, name="cownting-uploads")
+            _WORKER.start()
+    _QUEUE.put((fn, args))
+
+
+def active_job_for(dataset_id: str) -> Optional[Job]:
+    """The queued/running job for `dataset_id`, if any.
+
+    Guards the one case a queue cannot make safe: re-uploading a day that is
+    already in flight. The endpoint rmtree's `_uploads/<day>` before landing the
+    replacement, which would pull the videos out from under a running ingest, and
+    ingest itself purges the dataset. Different days queue up fine; the same day
+    twice at once does not.
+    """
+    with _LOCK:
+        for j in _JOBS.values():
+            if j.dataset_id == dataset_id and j.status in ACTIVE:
+                return j
+    return None
+
 
 # JSON snapshot of _JOBS for restart-recovery. Set once via recover_jobs(config)
 # at app boot; None means "not persisting" (e.g. tests) and every write is a no-op.
@@ -147,6 +217,31 @@ def _update(job: Job, **fields) -> None:
         _persist(force=job.status in ("done", "failed") or "stage" in fields)
 
 
+def register_dataset(base: Config, dataset_id: str, day: str | None, label: str) -> None:
+    """Create the datasets row the moment the videos have landed, as 'uploaded'.
+
+    Without this the row only appears once the worker thread reaches ingest, so a
+    day the user just spent minutes uploading was invisible everywhere — no card,
+    no entry in the day picker — and the dashboard, asked for a dataset with no
+    frames, sat on its loading skeleton forever. Registering up front makes the
+    upload itself the visible milestone: the day shows up immediately, flagged as
+    not-yet-processed, and matures through ingested -> segmented -> localized as
+    the model works through it.
+
+    Best-effort: a day that is safely on disk must not fail its upload over a
+    bookkeeping write. The worker re-upserts the row at ingest anyway.
+    """
+    try:
+        con = db.connect(base.paths.db_path)
+        try:
+            db.init_db(con)
+            db.upsert_dataset(con, dataset_id, day, label, status=UPLOADED)
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — the videos are landed; never fail on bookkeeping
+        pass
+
+
 def start_upload_job(
     base: Config,
     saved: list[tuple[str, str, str]],  # (camera_id, video_path, start_iso) per camera
@@ -160,9 +255,10 @@ def start_upload_job(
     with _LOCK:
         _JOBS[job.job_id] = job
         _persist(force=True)
-    threading.Thread(
-        target=_run, args=(job, base, saved, dataset_id, day, label), daemon=True
-    ).start()
+    # Row first, work second: by the time the 202 reaches the browser the day is
+    # already listable, so the frontend can send the user straight to it.
+    register_dataset(base, dataset_id, day, label)
+    _enqueue(_run, job, base, saved, dataset_id, day, label)
     return job
 
 
@@ -192,11 +288,9 @@ def start_add_camera_job(
     with _LOCK:
         _JOBS[job.job_id] = job
         _persist(force=True)
-    threading.Thread(
-        target=_run_add_camera,
-        args=(job, base, dataset_id, camera_id, video_path, start_iso),
-        daemon=True,
-    ).start()
+    # Same queue as whole-day uploads: an added camera runs the same segmenter over
+    # the same database, so it must not overlap one.
+    _enqueue(_run_add_camera, job, base, dataset_id, camera_id, video_path, start_iso)
     return job
 
 

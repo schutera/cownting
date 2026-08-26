@@ -50,7 +50,13 @@ def _app(d: str):
     os.environ["COWNTING_ADMIN_PASSWORD"] = "s3cret"
     config = Config(
         cameras=[CameraCfg(id="camera_01", video="unused.mp4")],
-        paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json")),
+        # labels_db_path/backups_dir MUST be redirected into the temp dir:
+        # create_app boots the label store unconditionally, so a default PathsCfg
+        # would have every test in this file write the real repo's
+        # data/labels.duckdb and leave annotation rows behind.
+        paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json"),
+                       labels_db_path=os.path.join(d, "labels.duckdb"),
+                       backups_dir=os.path.join(d, "backups")),
         auth=AuthCfg(enabled=True),
     )
     return create_app(config), dbp
@@ -158,7 +164,76 @@ POWERUSER_SURFACE = [
     ("POST",   "/api/areas", {"areas": {}}),                           # save count areas
     ("POST",   "/api/panel-areas", {"areas": {}}),                     # save panel areas
     ("POST",   "/api/localize", None),                                 # recount placements
+    # The six label-taxonomy mutations (M3 §4.1, frozen paths). Powerusers curate
+    # the questions and answers; plain annotators may only answer them.
+    ("POST",   "/api/label/groups", None),                             # add a question
+    ("PATCH",  "/api/label/groups/nope", {"name": "x"}),               # edit/archive one
+    ("POST",   "/api/label/groups/nope/move", {"dir": "up"}),          # reorder questions
+    ("POST",   "/api/label/groups/nope/classes", None),                # add an answer option
+    ("PATCH",  "/api/label/classes/nope.x", {"name": "x"}),            # edit/archive an option
+    ("POST",   "/api/label/classes/nope.x/move", {"dir": "up"}),       # reorder options
+    ("GET",    "/api/labels/backup/status", None),                     # weekly-zip status
+    ("POST",   "/api/labels/backup/run", {"force": False}),            # run it by hand
 ]
+
+
+# The label WRITE surface. Distinct from POWERUSER_SURFACE because labeling is the
+# one mutation a plain `user` is meant to perform — require_labeler admits every
+# known role. The instance_key is forged, so submit/skip fail the anchor check with
+# a 400 and undo no-ops: passing the gate never stores an annotation.
+_ANCHOR = {"dataset_id": None, "camera_id": "camera_01", "frame_file": "00000001.jpg",
+           "bbox": [1.0, 2.0, 3.0, 4.0], "ordinal": 0}
+LABELER_SURFACE = [
+    ("POST", "/api/label/submit", {"instance_key": "0" * 32, "anchor": _ANCHOR,
+                                   "answers": {}, "taxonomy_revision": 0}),
+    ("POST", "/api/label/skip",   {"instance_key": "0" * 32, "anchor": _ANCHOR,
+                                   "reason": "occluded"}),
+    ("POST", "/api/label/undo",   {"instance_key": "0" * 32}),
+    ("POST", "/api/label/events", {"session_id": "s", "kind": "session_start"}),
+]
+
+
+def test_labeler_gate():
+    """A plain `user` may label but may not curate the taxonomy.
+
+    That split is the whole point of the Label page's permission model, and it is
+    the one place in the app where a viewer writes rows — so it gets its own
+    matrix rather than riding on POWERUSER_SURFACE."""
+    with tempfile.TemporaryDirectory() as d:
+        app, _dbp = _app(d)
+        admin = TestClient(app)
+        admin.post("/api/login", json={"username": "admin", "password": "s3cret"})
+        admin.post("/api/admin/users", json={"username": "viewer", "password": "pw", "role": "user"})
+
+        viewer = TestClient(app)
+        viewer.post("/api/login", json={"username": "viewer", "password": "pw"})
+
+        for method, url, body in LABELER_SURFACE:
+            r = viewer.request(method, url, json=body)
+            check(f"user {method} {url} passes require_labeler (not 403)",
+                  r.status_code != 403, str(r.status_code))
+        # Specifically 400 (bad anchor), not 403 — proving the gate let it through
+        # and the handler, not the gate, is what rejected the forged key.
+        r = viewer.post("/api/label/submit", json=LABELER_SURFACE[0][2])
+        check("user submit with a forged anchor -> 400", r.status_code == 400, str(r.status_code))
+
+        r = viewer.get("/api/label/taxonomy")
+        check("user can read the taxonomy -> 200", r.status_code == 200, str(r.status_code))
+        r = viewer.patch("/api/label/classes/sun_exposure.shaded", json={"name": "x"})
+        check("user cannot edit the taxonomy -> 403", r.status_code == 403, str(r.status_code))
+
+        # An admin previewing `user` keeps the same split: can label, cannot curate.
+        admin.post("/api/act-as", json={"role": "user"})
+        r = admin.post("/api/label/submit", json=LABELER_SURFACE[0][2])
+        check("acting user can label (400 not 403)", r.status_code == 400, str(r.status_code))
+        r = admin.patch("/api/label/classes/sun_exposure.shaded", json={"name": "x"})
+        check("acting user cannot edit the taxonomy -> 403", r.status_code == 403, str(r.status_code))
+        admin.post("/api/act-as", json={"role": "admin"})
+
+        # And the app-wide login gate still answers first for a stranger.
+        anon = TestClient(app)
+        r = anon.post("/api/label/submit", json=LABELER_SURFACE[0][2])
+        check("anonymous label submit -> 401", r.status_code == 401, str(r.status_code))
 
 
 def test_poweruser_data_gate():
@@ -232,7 +307,12 @@ def test_every_mutating_route_is_gated():
             if not (route.methods & MUTATING) or route.path in SELF_GATING:
                 continue
             gates = {dep.call.__name__ for dep in route.dependant.dependencies if dep.call}
-            if not gates & {"require_poweruser", "require_admin"}:
+            # require_labeler joined the accepted set with the Label page: labeling
+            # is the one mutation a plain `user` may perform, and the gate still
+            # re-derives the effective role exactly like the other two — a real
+            # gate, not a bypass. Listing the label routes in SELF_GATING instead
+            # would permanently exempt every FUTURE label mutation from this scan.
+            if not gates & {"require_poweruser", "require_admin", "require_labeler"}:
                 missing.append(f"{'/'.join(sorted(route.methods & MUTATING))} {route.path}")
         check("every mutating /api route carries a role gate", not missing, "; ".join(missing))
 
@@ -292,7 +372,9 @@ def test_auth_disabled_is_open():
         con.close()
         config = Config(
             cameras=[CameraCfg(id="camera_01", video="unused.mp4")],
-            paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json")),
+            paths=PathsCfg(db_path=dbp, count_areas=os.path.join(d, "areas.json"),
+                           labels_db_path=os.path.join(d, "labels.duckdb"),
+                           backups_dir=os.path.join(d, "backups")),
             auth=AuthCfg(enabled=False),
         )
         client = TestClient(create_app(config))
@@ -308,6 +390,7 @@ def main():
     test_password_hash_roundtrip()
     test_gate_and_admin_flow()
     test_poweruser_data_gate()
+    test_labeler_gate()
     test_every_mutating_route_is_gated()
     test_act_as_role_preview()
     test_auth_disabled_is_open()

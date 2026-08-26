@@ -1,0 +1,706 @@
+"""Serving side of the in-app Label page: the queue, the ATTACH, and the crop.
+
+`labels_db` owns the store — its DDL, the instance key, the writes, the agreement
+SQL. This module owns everything that has to touch the *main* DB or the frame
+JPEGs in order to serve an instance: the derived queue scan and its sampling
+policy, the context manager that ATTACHes the label store onto a main-DB
+connection, the pure crop geometry each queue item carries, and the renderer
+behind `/api/img/label-crop`. The import direction is one-way
+(`labeling` -> `labels_db`) and must stay that way: `labels_db` is opened by the
+CLI and the weekly backup job in processes that never build a queue and must not
+drag pandas/PIL/the main DB in behind it.
+
+Nothing here writes to the main DB. The queue does write one `served` row per
+item, but into `labels.duckdb` through the attached alias — see attached_labels()
+for why the direction of the ATTACH is not a free choice.
+
+Every non-obvious decision below is argued in docs/roadmap/M3_labeling.md
+§2.2 (the key), §4.2 (sampling), §4.3 (the write path) and §4.5 (the crop).
+"""
+from __future__ import annotations
+
+import math
+import os
+import threading
+import time
+from contextlib import contextmanager
+from io import BytesIO
+from pathlib import Path
+from typing import Iterator, Protocol, Sequence
+from urllib.parse import quote, urlencode
+
+import duckdb
+
+from . import db
+from . import labels_db
+from . import quality
+from .config import AnnotationCfg, Config
+
+# Bump when the rendered pixels change (fill colour, resampling, JPEG quality,
+# banner geometry). It is ETag material, so a render change invalidates every
+# cached crop; without it an annotator keeps being served last week's rendering
+# from their browser cache and a masking fix never reaches the people it protects.
+RENDER_VERSION = "1"
+
+# The alias the label store is ATTACHed under. Module-level because the queue SQL
+# is written against it and a mismatch is a "table not found" at runtime only.
+LABELS_ALIAS = "labels"
+
+# The Brinno timestamp bar occupies the bottom ~4% of every frame. Borrowed from
+# quality._BANNER_CROP rather than re-declared: if the two ever drift apart one of
+# them starts showing the annotator the wall-clock time, and time of day IS the
+# answer to "Sun exposure" (§4.5) — a leak that inflates agreement instead of
+# breaking anything visibly.
+_BANNER_TOP = quality._BANNER_CROP
+
+# Neutral fill for out-of-frame padding and for the masked banner. Mid grey on
+# purpose: cow shade is dark and sunlit grass is bright, so a mid grey reads as
+# "no information here" against both, where black would pass for shadow.
+_FILL = (96, 96, 96)
+
+_JPEG_QUALITY = 88
+
+# The client sends back the keys already in its buffer instead of an offset (§4.2).
+# Capped because it arrives in a query string from a session that `require_labeler`
+# lets any role hold, and it becomes N bound parameters in the hot scan.
+_MAX_EXCLUDE = 200
+
+
+class AnchorLike(Protocol):
+    """The shape `verify_anchor` reads off `api.InstanceAnchor`.
+
+    Structural, not an import: `api` imports this module, so naming its pydantic
+    model here would close the cycle. The field names are frozen in §4.1.
+    """
+
+    dataset_id: str | None
+    camera_id: str
+    frame_file: str
+    bbox: list[float]
+    ordinal: int
+
+
+# --------------------------------------------------------------------------- connections
+def labels_connect(config: Config) -> duckdb.DuckDBPyConnection:
+    """A read-write connection to the label store, with `db.connect`'s retry.
+
+    Read-write even for readers and for the backup job: DuckDB refuses a second
+    connection to one file with a different mode in one process, and that error
+    text matches none of `db.connect`'s retry substrings, so a `read_only=True`
+    open surfaces as an un-retried 500 the moment a submit is in flight (§3, and
+    `api.py:189-196` documents the same trap for the main DB).
+    """
+    return db.connect(config.paths.labels_db_path)
+
+
+_INIT_LOCK = threading.Lock()
+_INITIALISED: set[str] = set()   # store paths whose schema THIS process has built
+
+
+def ensure_labels_db(config: Config) -> None:
+    """Create/upgrade the label store's schema on its own short-lived connection.
+
+    Guaranteed before every ATTACH rather than once at boot, because ATTACH on a
+    path that does not exist yet happily creates an *empty* database — the queue
+    would then fail on `labels.v_instance_coverage` with a bare "table does not
+    exist", which is what a CLI process, a fresh box or a `data/` restored without
+    `labels.duckdb` all look like.
+
+    Actually *running* the DDL every time, though, is both wasteful and unsafe. The
+    DDL ends in `CREATE OR REPLACE VIEW`, which is a catalog write: two requests
+    arriving together — the browser opens the Label page and fires taxonomy, queue
+    and progress at once — raced and one died with "Catalog write-write conflict on
+    alter with ... v_current_annotations", a 500 on a completely healthy store.
+    Tests never saw it because they call sequentially.
+
+    So the schema is built once per process under a lock, and the memo is keyed on
+    the path AND re-checked against the file still existing, which keeps the
+    property the eager call was there for: delete `labels.duckdb` under a running
+    server and the next request rebuilds it rather than serving off a stale memo.
+    A cross-process race (the CLI initialising while the server does) is still
+    possible, so the conflict itself is retried — the DDL is idempotent, so the
+    other writer finishing the job is success, not failure.
+    """
+    path = os.path.abspath(str(config.paths.labels_db_path))
+    if path in _INITIALISED and os.path.exists(path):
+        return
+    with _INIT_LOCK:
+        # Re-check inside the lock: several threads queue up on a cold start and
+        # only the first should pay for the DDL.
+        if path in _INITIALISED and os.path.exists(path):
+            return
+        delay = 0.02
+        last: Exception | None = None
+        for _ in range(50):
+            lcon = labels_connect(config)
+            try:
+                labels_db.init_labels_db(lcon)
+                _INITIALISED.add(path)
+                return
+            except Exception as e:  # noqa: BLE001 — retry only the catalog race
+                if db.is_transient_lock_error(e):
+                    last = e
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 0.2)
+                    continue
+                raise
+            finally:
+                lcon.close()
+        assert last is not None
+        raise last  # exhausted retries — surface the real DuckDB error
+
+
+@contextmanager
+def attached_labels(con: duckdb.DuckDBPyConnection, config: Config) -> Iterator[str]:
+    """ATTACH the label store onto an open MAIN-DB connection; DETACH on the way out.
+
+    The direction is fixed and it is the whole point (§4.2). `localize_worker`
+    holds a writer on the main DB for an entire localize pass, fired by clip,
+    restore, delete-camera and every areas save. Attaching main into a *labels*
+    connection would put every label read and every label write behind that lock;
+    attaching labels into main confines the exposure to the queue's reads, and
+    leaves `submit_annotation` on a plain labels connection that never sees the
+    main DB at all.
+
+    The bare ATTACH is retried with `db.connect`'s backoff (~9 s) on the shared
+    `db.is_transient_lock_error` predicate. The loop is separate from
+    `db.connect`'s because that retries an *open* and this retries a statement,
+    but the predicate must NOT be: it was copy-pasted here once, and a fix applied
+    only to `db.connect` left this ATTACH still 500ing on Windows. The clash is
+    routine, not exotic: the store is held read-write by every concurrent submit
+    and by the schema-init above, which released its handle microseconds ago.
+
+    DETACH runs only if the ATTACH landed. A leaked alias does not fail here — it
+    fails the *next* ATTACH on the same pooled connection, surfacing as a random
+    500 on an unrelated request with nothing in the traceback pointing back here.
+
+    Yields the alias name so callers never hardcode it.
+    """
+    ensure_labels_db(config)
+    # ATTACH takes a literal path, not a bind parameter. The path is trusted
+    # config; escape quotes defensively, exactly as db.archive_dataset does.
+    safe = str(config.paths.labels_db_path).replace("'", "''")
+    attached = False
+    delay = 0.02
+    last: Exception | None = None
+    for _ in range(50):
+        try:
+            con.execute(f"ATTACH '{safe}' AS {LABELS_ALIAS}")
+            attached = True
+            break
+        except Exception as e:  # noqa: BLE001 — retry only the file-handle clash
+            if db.is_transient_lock_error(e):
+                last = e
+                time.sleep(delay)
+                delay = min(delay * 1.5, 0.2)
+                continue
+            raise
+    if not attached:
+        assert last is not None
+        raise last  # exhausted retries — surface the real DuckDB error
+    try:
+        yield LABELS_ALIAS
+    finally:
+        con.execute(f"DETACH {LABELS_ALIAS}")
+
+
+# --------------------------------------------------------------------------- keys
+def verify_anchor(instance_key: str, anchor: AnchorLike) -> bool:
+    """True when `instance_key` is the hash of `anchor` — the submit path's whole guard.
+
+    `POST /api/label/submit` never opens the main DB (§4.3): the client echoes the
+    anchor the queue served and this re-derives the key from it in Python. Because
+    the key *is* the hash of the anchor, a stored row whose key and provenance
+    disagree is unrepresentable, and the write needs no detection row to still
+    exist — it may have been purged, clipped or archived since the crop was drawn.
+
+    Returns a bool rather than raising: `labels_db` raises `ValueError` for the
+    lost UNIQUE race that `api.py` maps to 409, and a forged anchor is a 400.
+    """
+    try:
+        bbox = [float(v) for v in (anchor.bbox or [])]
+        if len(bbox) != 4:
+            return False
+        recomputed = labels_db.instance_key(
+            anchor.dataset_id,
+            anchor.camera_id,
+            anchor.frame_file,
+            bbox,
+            int(anchor.ordinal or 0),
+        )
+    except Exception:  # noqa: BLE001 — an unhashable anchor is a bad request, not a 500
+        return False
+    return bool(instance_key) and recomputed == instance_key
+
+
+def hex_threshold(fraction: float) -> str:
+    """The cut point for the deep-overlap subset: `substr(instance_key,1,4) < this`.
+
+    Membership is derived from the key itself, so every annotator independently
+    agrees on the same subset with zero coordination and no table to keep in sync.
+    Lexicographic comparison over equal-length lowercase hex is numeric
+    comparison, because '0'..'9' sort before 'a'..'f' in ASCII.
+
+    The two edges are strings rather than numbers on purpose: `''` is smaller than
+    every key (so fraction 0 selects nothing) and `'g'` is larger than every hex
+    digit (so fraction 1 selects everything). Returning `'10000'` for 1.0 would
+    silently select *nothing*, since '1' sorts before 'f'.
+    """
+    if fraction <= 0:
+        return ""
+    if fraction >= 1:
+        return "g"
+    return f"{int(fraction * 0x10000):04x}"
+
+
+# --------------------------------------------------------------------------- the queue
+def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
+              dataset: str | None, camera: str | None, day: str | None) -> tuple[str, list]:
+    """The CTE chain every queue/progress read starts from, plus its parameters.
+
+    Ends at a relation named `scoped` carrying one row per live detection with its
+    key, its coverage counts, its target and whether the caller has already
+    answered it. The queue is derived per request rather than materialised because
+    detections are written from three places (`pipeline.segment`, `db.restore_clip`'s
+    raw SQL, the CLI) and `purge_dataset` deletes them from under any table we
+    could have kept (§1).
+
+    The scope filters live in the innermost CTE so the hash is computed over the
+    filtered rows, not the whole table. That is only safe because `dataset_id`,
+    `camera_id` and `frame_path` are all *partition* columns of the ordinal window
+    (and `day` is a function of `dataset_id`), so a filter drops whole partitions
+    and can never renumber the survivors. Adding a filter on anything else here —
+    a score floor, a time window — would silently change ordinals, hence keys,
+    hence orphan every label already written for those rows.
+    """
+    # An empty frame_path means the ingest ran with `save_frames: false`, so there
+    # is no JPEG to crop and `labels_db.instance_key` refuses the row outright. Left
+    # in the queue it would serve an instance whose crop 404s and whose submit 400s.
+    # It is also a partition column, so filtering on it cannot renumber anything.
+    clauses = ["d.frame_path IS NOT NULL", "d.frame_path <> ''"]
+    # A NULL bbox is the same class of unlabelable row, and `detections` permits it:
+    # DET_COLS fills every absent column with NULL, so any insert path that omits the
+    # box (an early-stage row, a hand-built import) lands here. Such a row has no
+    # crop to render and no key to hash — before this guard it reached _item() and
+    # raised TypeError on float(None), turning one malformed row into a 500 for the
+    # whole queue. All four are partition columns of the ordinal window, so
+    # filtering on them cannot renumber the survivors.
+    clauses += [f"d.bbox_{c} IS NOT NULL" for c in ("x1", "y1", "x2", "y2")]
+    params: list = []
+    if dataset is not None:
+        clauses.append("d.dataset_id = ?")
+        params.append(dataset)
+    if camera is not None:
+        clauses.append("d.camera_id = ?")
+        params.append(camera)
+    if day is not None:
+        clauses.append("d.dataset_id IN (SELECT dataset_id FROM datasets WHERE day = CAST(? AS DATE))")
+        params.append(day)
+
+    threshold = hex_threshold(cfg.overlap_fraction)
+    params += [threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance, annotator]
+
+    return (
+        f"""
+        WITH ranked AS (
+            -- d.* because instance_key_sql folds the ordinal window in and needs
+            -- every column it hashes AND every column that window orders by.
+            -- `ordinal` is projected separately from the same producer because the
+            -- item payload carries it back: the client cannot derive the ordinal
+            -- from its anchor, so it echoes the one it was served and
+            -- `verify_anchor` re-hashes it. Restating this window by hand instead
+            -- would serve keys no submit could reproduce.
+            SELECT d.*, {labels_db.instance_ordinal_sql('d')} AS ordinal
+            FROM detections d
+            WHERE {' AND '.join(clauses)}
+        ),
+        keyed AS (
+            SELECT r.*, {labels_db.instance_key_sql('r')} AS instance_key FROM ranked r
+        ),
+        scoped AS (
+            SELECT k.instance_key, k.dataset_id, k.camera_id, k.frame_path, k.ordinal,
+                   k.score, k.bbox_x1, k.bbox_y1, k.bbox_x2, k.bbox_y2,
+                   ds.day AS day,
+                   coalesce(cov.n_annotators_labeled, 0) AS n_labeled,
+                   coalesce(cov.n_annotators_skipped, 0) AS n_skipped,
+                   (substr(k.instance_key, 1, 4) < ?) AS overlap,
+                   CASE WHEN substr(k.instance_key, 1, 4) < ? THEN ? ELSE ? END AS target,
+                   (mine.effective_key IS NOT NULL) AS mine_done
+            FROM keyed k
+            LEFT JOIN datasets ds ON ds.dataset_id = k.dataset_id
+            -- Every join is on effective_key, never instance_key (§2.4): after a
+            -- reconciliation moved a label onto a re-ingested detection, joining
+            -- the audit column would re-serve an entire already-labelled day as
+            -- fresh work and stop pairing the annotators who answered it.
+            LEFT JOIN {alias}.v_instance_coverage cov ON cov.effective_key = k.instance_key
+            -- Anti-join, not a correlated EXISTS: DuckDB will not take a
+            -- correlated subquery inside the FILTER clauses `progress` needs.
+            LEFT JOIN (SELECT DISTINCT effective_key FROM {alias}.v_current_annotations
+                       WHERE annotator = ?) mine ON mine.effective_key = k.instance_key
+        )""",
+        params,
+    )
+
+
+def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
+          limit: int | None = None, exclude: Sequence[str] = (),
+          camera: str | None = None, day: str | None = None,
+          dataset: str | None = None, mine: str = "todo", order: str = "fresh",
+          session_id: str | None = None) -> dict:
+    """One batch of instances to label, plus the policy and scope that produced it.
+
+    Returns `{"items": [...], "matching": int, "policy": {...}, "filters": {...}}`;
+    the item shape is frozen in §5.3 and mirrored by `LabelItem` in `types.ts`.
+
+    **No leasing, no reservation, no claiming.** Two annotators may be served the
+    same instance at the same moment; the cost is one extra independent annotation,
+    which is the data this feature exists to collect. A lease table would make this
+    GET a *writer* on the main DB — DuckDB's single-writer lock on the hottest read
+    path — and would be unrecoverable across the restart every
+    `docker compose up -d --build` performs. It also makes this GET idempotent, so
+    React 19 StrictMode's double-invoked effect is harmless by construction.
+
+    **Coverage counts labels only.** Skips feed the separate `skip_retire` counter,
+    so an instance one annotator found unjudgeable is still offered to the next and
+    only retires once `skip_retire` distinct annotators have declined it. Counting a
+    skip as coverage would retire exactly the ambiguous instances where inter-rater
+    variability is most informative.
+
+    **Pagination is `limit` + `exclude`, never an offset or a cursor.** Other
+    annotators retire items out from under you — whatever reaches `target` leaves
+    the pool mid-session — so any positional cursor would skip or repeat items.
+    The queue is self-consuming instead: whatever you label or skip drops out of
+    the anti-join, so re-fetching always advances.
+
+    `dataset` defaults to the whole DB and deliberately does not go through
+    `resolve_ds` — labeling is cross-day by design. Every response echoes the
+    applied scope in `filters`, which is the defence against `lib/api.ts`'s
+    `withDs()` stamping the currently-selected day onto a cross-day queue.
+    """
+    cfg = config.annotation
+    n = max(1, min(int(limit or cfg.batch_size), cfg.max_batch_size))
+    excl = list(dict.fromkeys(k for k in exclude if k))[:_MAX_EXCLUDE]
+    mine = "all" if mine == "all" else "todo"
+    order = "spread" if order == "spread" else "fresh"
+
+    with attached_labels(con, config) as alias:
+        cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
+                                camera=camera, day=day)
+        where = ["s.n_labeled < s.target", "s.n_skipped < ?"]
+        params.append(cfg.skip_retire)
+        if excl:
+            where.append(f"s.instance_key NOT IN ({', '.join('?' * len(excl))})")
+            params += excl
+        if mine == "todo":
+            where.append("NOT s.mine_done")
+        # `order=fresh` drains the newest day first so a new upload observably
+        # appears at the head of the queue; `order=spread` drops the day term for a
+        # stratified sample across the whole season. The md5 tail is a stable
+        # per-annotator permutation: two annotators walk the same pool in different
+        # orders, so they meet in the middle rather than racing down one list.
+        #
+        # Deliberately NOT ordered by `n_labeled ASC` (M3 UX §6.7): sorting
+        # zero-coverage items ahead of once-labeled ones means no instance gets its
+        # second label until the whole pool has been swept once, so every pair
+        # feeding the kappa queries would come from the fatigued back half of each
+        # session. The WHERE clause already caps coverage at target.
+        day_term = "s.day DESC NULLS LAST, " if order == "fresh" else ""
+        params.append(annotator)
+        params.append(n)
+        rows = _rows(con, f"""{cte}
+            SELECT s.*, count(*) OVER () AS matching
+            FROM scoped s
+            WHERE {' AND '.join(where)}
+            ORDER BY {day_term}md5(? || s.instance_key)
+            LIMIT ?
+            """, params)
+
+        # A 'served' row per item, written into labels.duckdb through the alias —
+        # a write, but not to the main DB, so the read path the no-leasing decision
+        # protects is untouched. It buys a non-forgeable server-side
+        # time_on_task_ms, measurable abandonment (served with no matching
+        # annotation), and the server/client delta that detects tab-away (§4.2).
+        event_ids: list[int | None] = []
+        for r in rows:
+            ev = con.execute(
+                f"INSERT INTO {alias}.label_events (session_id, annotator, kind, instance_key) "
+                "VALUES (?, ?, 'served', ?) RETURNING event_id",
+                [session_id, annotator, r["instance_key"]],
+            ).fetchone()
+            event_ids.append(int(ev[0]) if ev else None)
+
+    items = [_item(r, cfg, event_ids[i]) for i, r in enumerate(rows)]
+    return {
+        "items": items,
+        "matching": int(rows[0]["matching"]) if rows else 0,
+        "policy": {
+            "targets_per_instance": cfg.targets_per_instance,
+            "overlap_fraction": cfg.overlap_fraction,
+            "overlap_targets": cfg.overlap_targets,
+            "skip_retire": cfg.skip_retire,
+            "batch_size": cfg.batch_size,
+            "max_batch_size": cfg.max_batch_size,
+        },
+        "filters": {"dataset": dataset, "camera": camera, "day": day,
+                    "mine": mine, "order": order, "limit": n, "excluded": len(excl)},
+    }
+
+
+def progress(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str = "",
+             dataset: str | None = None, camera: str | None = None) -> dict:
+    """Pool-level counts for the Label page's progress panel, over the same scan.
+
+    Only the numbers that need the main DB live here — how big the labelable pool
+    is and how much of it is still servable. Per-annotator effort (items/hour,
+    time on task) is `labels_db`'s `SQL_EFFORT_BY_ANNOTATOR`, and agreement is its
+    `agreement()`; the route merges the two rather than either module growing the
+    other's SQL.
+
+    `pool_total` is the terminal-state discriminator the frontend needs: zero means
+    "no footage processed at all" (link to /data), while zero `remaining` against a
+    non-zero pool means "caught up" (§5.6).
+    """
+    cfg = config.annotation
+    with attached_labels(con, config) as alias:
+        cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
+                                camera=camera, day=None)
+        params += [cfg.skip_retire, cfg.skip_retire, cfg.skip_retire]
+        rows = _rows(con, f"""{cte}
+            SELECT count(*)                                              AS pool_total,
+                   count(*) FILTER (WHERE n_labeled > 0)                 AS labeled,
+                   count(*) FILTER (WHERE n_labeled >= target)           AS at_target,
+                   count(*) FILTER (WHERE n_labeled < target
+                                      AND n_skipped >= ?)                AS retired,
+                   count(*) FILTER (WHERE n_labeled < target
+                                      AND n_skipped < ?)                 AS remaining,
+                   count(*) FILTER (WHERE n_labeled < target
+                                      AND n_skipped < ? AND NOT mine_done) AS mine_remaining,
+                   -- The two halves of an honest progress bar: annotations that
+                   -- exist against annotations the policy is asking for. Summing
+                   -- `target` rather than multiplying by targets_per_instance is
+                   -- what makes the 20% deep-overlap slice show up in the total.
+                   coalesce(sum(n_labeled), 0)                           AS annotations_labeled,
+                   coalesce(sum(target), 0)                              AS targets_total
+            FROM scoped
+            """, params)
+    out = {k: int(v or 0) for k, v in rows[0].items()} if rows else {}
+    out["filters"] = {"dataset": dataset, "camera": camera, "annotator": annotator}
+    out["policy"] = {"targets_per_instance": cfg.targets_per_instance,
+                     "overlap_targets": cfg.overlap_targets,
+                     "skip_retire": cfg.skip_retire}
+    return out
+
+
+def _rows(con: duckdb.DuckDBPyConnection, sql: str, params: list) -> list[dict]:
+    """Fetch as dicts, not via `.df()`: pandas would coerce the NULL `dataset_id`
+    and `score` columns to NaN, which is not JSON and does not compare equal to
+    None anywhere downstream."""
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
+    """One queue item in the frozen §5.3 shape.
+
+    Deliberately absent: the frame's clock time. The caption shows day + camera and
+    nothing finer, for the same reason the banner is masked — time of day predicts
+    the "Sun exposure" answer, and shipping it in the payload would hand it to the
+    annotator through devtools even if the UI never drew it. Traceability is served
+    by `instance_key`, which the flag payload carries.
+    """
+    frame_file = labels_db.frame_basename(row["frame_path"])
+    bbox = [float(row["bbox_x1"]), float(row["bbox_y1"]),
+            float(row["bbox_x2"]), float(row["bbox_y2"])]
+    _src, out, ring = crop_geometry(bbox, cfg.crop_pad, cfg.crop_max_width)
+    day = row["day"]
+    return {
+        "instance_key": row["instance_key"],
+        "dataset_id": row["dataset_id"],
+        "day": day.isoformat() if day is not None else None,
+        "camera_id": row["camera_id"],
+        "frame_file": frame_file,
+        "bbox": bbox,
+        "ordinal": int(row["ordinal"]),
+        "score": float(row["score"]) if row["score"] is not None else None,
+        # Threaded onto the item so the submit body carries it without a second
+        # read: a stat plus 64 KiB per item, against a crop the annotator is about
+        # to wait on a full JPEG decode for.
+        "frame_sig": labels_db.frame_sig(row["frame_path"]),
+        "crop_url": crop_url(camera_id=row["camera_id"], frame_file=frame_file,
+                             bbox=bbox, dataset_id=row["dataset_id"],
+                             pad=cfg.crop_pad, max_width=cfg.crop_max_width),
+        "crop_w": out,
+        "crop_h": out,
+        "ring": [round(v, 2) for v in ring],
+        # How many annotators already answered it — never WHAT they answered.
+        # Showing the distribution would anchor the next annotator and destroy the
+        # independence the agreement statistic assumes.
+        "n_annotators": int(row["n_labeled"]),
+        "target": int(row["target"]),
+        "overlap": bool(row["overlap"]),
+        "serve_event_id": serve_event_id,
+    }
+
+
+# --------------------------------------------------------------------------- the crop
+def crop_url(*, camera_id: str, frame_file: str, bbox: Sequence[float],
+             dataset_id: str | None = None, pad: float, max_width: int) -> str:
+    """The `/api/img/label-crop/...` URL for one instance, built SERVER-side.
+
+    The frontend never constructs this. Every other image URL it builds goes
+    through `lib/api.ts`'s `withDs()`, which stamps the currently-selected day onto
+    any `/api/` URL — and the queue is cross-day by design, so a client-built URL
+    would 404 every item that came from another day.
+
+    Coordinates are formatted with `repr`, not `%g`: the endpoint re-derives the
+    crop geometry from these numbers and must land on the same `out_size` and the
+    same source box the queue already told the client about, so six significant
+    digits is not enough.
+    """
+    x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+    params: list[tuple[str, str]] = []
+    if dataset_id:
+        params.append(("dataset", dataset_id))
+    params += [("x1", repr(x1)), ("y1", repr(y1)), ("x2", repr(x2)), ("y2", repr(y2)),
+               ("pad", repr(float(pad))), ("w", str(int(max_width)))]
+    return (f"/api/img/label-crop/{quote(camera_id, safe='')}/{quote(frame_file, safe='')}"
+            f"?{urlencode(params)}")
+
+
+def crop_geometry(bbox: Sequence[float], pad: float, max_width: int
+                  ) -> tuple[tuple[int, int, int, int], int, tuple[float, float, float, float]]:
+    """Pure geometry for one crop: `(src_box, out_size, ring)`.
+
+    `src_box` is a SQUARE in full-frame pixels, `(x0, y0, x1, y1)`, and may extend
+    past the frame edge — the renderer neutral-fills what falls outside instead of
+    clamping. That is what makes this computable without knowing the frame's
+    dimensions, so the queue can emit `crop_w`, `crop_h` and `ring` per item from
+    the bbox alone, with no PIL header-open and no filesystem touch on what is
+    otherwise a pure-DB endpoint. It also fixes the tile-shape jitter per-axis
+    clamping would cause at frame borders, which is visually exhausting over
+    hundreds of items.
+
+    `out_size` is one number because the canvas is always square: `crop_w == crop_h`.
+    `ring` is the bbox in crop-local pixels, `(x0, y0, x1, y1)` — the client draws
+    it as SVG over the returned image, so the stroke stays a hairline at any
+    rendered size, hold-to-hide costs no network, and a style change does not
+    invalidate every cached crop.
+
+    Rounding is `floor(v + 0.5)`, never `round()`: Python's `round` is banker's and
+    DuckDB's is half-away-from-zero, and `src_box` is snapped to whole source pixels
+    so `ring` and the pixels the renderer actually cuts share one origin rather than
+    drifting by a sub-pixel.
+    """
+    x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+    # Ultralytics emits boxes unclamped and, rarely, inverted (yolo_seg.py:53);
+    # a negative side would make `side` collapse and the crop come back 1x1.
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    bw = max(x2 - x1, 1.0)
+    bh = max(y2 - y1, 1.0)
+    # Padding is a fraction of the LONGER side, so a long thin cow and a square one
+    # get the same *relative* context rather than a sliver for the thin one.
+    side = max(bw, bh) * (1.0 + 2.0 * max(float(pad), 0.0))
+    n = max(1, int(math.floor(side + 0.5)))
+    x0 = int(math.floor((x1 + x2) / 2.0 - n / 2.0))
+    y0 = int(math.floor((y1 + y2) / 2.0 - n / 2.0))
+    scale = min(1.0, float(max_width) / n) if max_width > 0 else 1.0
+    out = max(1, int(math.floor(n * scale + 0.5)))
+    ring = ((x1 - x0) * scale, (y1 - y0) * scale, (x2 - x0) * scale, (y2 - y0) * scale)
+    return (x0, y0, x0 + n, y0 + n), out, ring
+
+
+def frame_path_for(config: Config, dataset_id: str | None, camera_id: str,
+                   frame_file: str) -> Path:
+    """The on-disk JPEG for one frame, rebuilt from config plus validated ids.
+
+    Mirrors `ingest/video.py:60-62,84` including the legacy flat layout kept for
+    pre-dataset ingests. This is a deliberate departure from the house rule "the
+    path always comes from the DB": a DB lookup here is a full `frames` scan for
+    every image an annotator sees, and the frame filename is one of the very few
+    places in this codebase where a *total* whitelist is available.
+
+    It only joins. The caller applies §4.5's three whitelists — `_safe_path_id` on
+    the dataset, `uploads.valid_camera_id` on the camera, `_safe_frame_file` on the
+    filename — and the resolve-under-`artifacts_dir` assertion, BEFORE calling it.
+    """
+    base = Path(config.paths.artifacts_dir)
+    if dataset_id:
+        base = base / dataset_id
+    return base / "frames" / camera_id / frame_file
+
+
+def render_crop(frame_path: str | Path, bbox: Sequence[float], *, pad: float,
+                max_width: int, cfg: AnnotationCfg) -> tuple[bytes, str | None]:
+    """Cut the padded square out of one frame, mask the Brinno banner, encode JPEG.
+
+    Returns `(jpeg_bytes, frame_sig)`. **Empty bytes is the only failure channel
+    and always means 404** — a missing or unreadable JPEG is a routine condition
+    here (a re-ingest rmtrees the frames out from under a queue the client is still
+    holding), never a 500, and never a blank tile.
+
+    The ring is NOT baked in; the client draws it over these pixels from the
+    crop-local `ring` the queue supplied. There is one rendering and no `?ring=`
+    parameter.
+
+    Banner masking is a methodological requirement, not polish. Brinno burns
+    wall-clock time into the bottom ~4% of every frame, and time of day correlates
+    directly with the "Sun exposure" answer — a visible banner hands the annotator
+    the answer and inflates agreement artificially.
+    """
+    from PIL import Image
+
+    p = Path(frame_path)
+    # Fingerprint from the bytes we are opening anyway (§2.3), rather than a second
+    # pass over the file. Missing or unreadable is routine, not exceptional:
+    # pipeline.ingest rmtrees artifacts/<dataset_id> while a client may still be
+    # holding a queue full of URLs into it.
+    try:
+        with open(p, "rb") as f:
+            head = f.read(labels_db.FRAME_SIG_BYTES)
+            size = f.seek(0, 2)
+    except OSError:
+        return b"", None
+    sig = labels_db.frame_sig_of(size, head)
+    src, out, _ring = crop_geometry(bbox, pad, max_width)
+    x0, y0, x1, y1 = src
+    n = x1 - x0
+    try:
+        with Image.open(p) as opened:
+            im = opened.convert("RGB")
+            w, h = im.size
+            canvas = Image.new("RGB", (n, n), _FILL)
+            # Paste only the part of the square that actually exists; everything
+            # outside stays neutral, which is what keeps the tile square at the
+            # frame edges instead of clamping to a different aspect per item.
+            ix0, iy0 = max(0, x0), max(0, y0)
+            ix1, iy1 = min(w, x1), min(h, y1)
+            if ix1 > ix0 and iy1 > iy0:
+                canvas.paste(im.crop((ix0, iy0, ix1, iy1)), (ix0 - x0, iy0 - y0))
+    except Exception:  # noqa: BLE001 — a torn/half-written JPEG is a 404, not a 500
+        return b"", sig
+
+    if cfg.mask_timestamp_banner:
+        # In full-frame coordinates: every row at or below H * 0.96 that falls
+        # inside the source square. `start` may be NEGATIVE — these cameras look
+        # down and the herd crosses the bottom of the field of view, so a padded
+        # crop of a low cow can begin BELOW the band line. The max(0, ...) guard
+        # alone then paints the entire tile grey and the annotator's honest
+        # "Not visible" is recorded as genuine ambiguity about a real animal:
+        # fabricated ambiguity contaminating exactly the statistic this feature
+        # exists to produce. So measure the covered fraction and refuse outright.
+        start = int(h * _BANNER_TOP) - y0
+        if start < n:
+            top = max(0, start)
+            canvas.paste(_FILL, (0, top, n, n))
+            if (n - top) / n > cfg.max_banner_fraction:
+                return b"", sig
+
+    if out != n:
+        canvas = canvas.resize((out, out), Image.LANCZOS)
+    buf = BytesIO()
+    canvas.save(buf, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
+    return buf.getvalue(), sig
