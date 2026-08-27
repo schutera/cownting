@@ -137,6 +137,7 @@ export type LabelIconName =
   | "lying"
   | "standing"
   | "probe"
+  | "pixels"
   | "dot";
 
 // One answer option. `description` is required server-side and is what the (i)
@@ -280,7 +281,13 @@ export interface LabelStats {
 // "skip" because this mirrors the backend's unchanged `labels_db.SKIP_REASONS`
 // and the unchanged stored `skip_reason` column — only the word the annotator
 // sees changed, and stored rows are deliberately not migrated.
-export type LabelSkipReason = "bad_crop" | "no_cow" | "multiple_cows" | "occluded" | "other";
+export type LabelSkipReason =
+  | "bad_crop"
+  | "no_cow"
+  | "multiple_cows"
+  | "occluded"
+  | "low_resolution"
+  | "other";
 // Storage terms, not user-facing ones. 'skipped' is the stored outcome of a FLAG
 // — it means "not answered" and predates the rename, and stored rows are not
 // migrated. 'undone' only ever appears on rows written before ArrowLeft replaced

@@ -304,6 +304,44 @@ def test_queue_policy():
               any(it["instance_key"] == skipped["instance_key"] for it in pool),
               str([it["instance_key"][:8] for it in pool]))
 
+        # Every reason in the vocabulary must actually be accepted by the route.
+        # `low_resolution` was added after the first annotations existed, so this
+        # also pins that widening the tuple did not disturb the older codes: the
+        # column is a plain VARCHAR with no CHECK, and validation is Python-side,
+        # so a stale value can only ever come back as a 400 here.
+        remaining = [it for it in pool
+                     if it["instance_key"] != skipped["instance_key"]]
+        # low_resolution FIRST, deliberately: the seeded pool is small, and in
+        # tuple order this loop ran out of instances before reaching it — so the
+        # newest reason was the one code never actually exercised.
+        ordered = ("low_resolution",) + tuple(
+            r for r in labels_db.SKIP_REASONS if r != "low_resolution")
+        exercised = []
+        for i, reason in enumerate(ordered):
+            if i >= len(remaining):
+                break
+            target = remaining[i]
+            r = client.post("/api/label/skip", json={
+                "instance_key": target["instance_key"],
+                "anchor": _anchor(target),
+                "reason": reason,
+                "note": f"exercising the {reason} code",
+            })
+            check(f"flag reason {reason!r} accepted", r.status_code == 200,
+                  f"{r.status_code} {r.text[:100]}")
+            if r.status_code == 200:
+                exercised.append(reason)
+        check("low_resolution was actually exercised through the route, not just "
+              "asserted in the tuple", "low_resolution" in exercised, str(exercised))
+        check("low_resolution is in the vocabulary",
+              "low_resolution" in labels_db.SKIP_REASONS,
+              str(labels_db.SKIP_REASONS))
+        r = client.post("/api/label/skip", json={
+            "instance_key": skipped["instance_key"], "anchor": _anchor(skipped),
+            "reason": "not_a_real_reason", "note": "should be refused"})
+        check("an unknown reason is still refused -> 400", r.status_code == 400,
+              str(r.status_code))
+
         # limit honoured, and matching still reports the whole pool.
         r = client.get("/api/label/queue?mine=all&limit=2").json()
         check("limit=2 serves exactly 2 items", len(r["items"]) == 2, str(len(r["items"])))

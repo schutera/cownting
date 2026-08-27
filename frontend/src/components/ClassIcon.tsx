@@ -83,6 +83,7 @@ export const CLASS_ICON_NAMES: readonly LabelIconName[] = [
   "lying",
   "standing",
   "probe",
+  "pixels",
   "dot",
 ];
 
@@ -189,6 +190,19 @@ const GLYPHS: Record<LabelIconName, ReactNode> = {
       <path d="M4.8 13.4V20M10 13.4V20" />
       <path d="M12 10.4h6.2" />
       <path d="M17.2 6.2h4.4v8h-4.4" />
+    </>
+  ),
+  // Low resolution: a coarse block grid, deliberately uneven so it reads as
+  // "not enough pixels" rather than as a table or a window. Filled squares,
+  // because an outline grid at 26px turns into noise at 1.75px strokes.
+  pixels: (
+    <>
+      <rect x="3" y="3" width="8" height="8" rx="1" fill="currentColor" stroke="none" />
+      <rect x="13" y="3" width="8" height="8" rx="1" fill="currentColor" stroke="none"
+            opacity="0.45" />
+      <rect x="3" y="13" width="8" height="8" rx="1" fill="currentColor" stroke="none"
+            opacity="0.45" />
+      <rect x="13" y="13" width="8" height="8" rx="1" fill="currentColor" stroke="none" />
     </>
   ),
   // The fallback. Filled, so it reads as a deliberate bullet rather than as an

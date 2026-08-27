@@ -144,8 +144,10 @@ const ON_IMAGE_ACCENT = "#F0B460";
 const ON_IMAGE_SCRIM = "rgba(12,14,16,0.72)";
 const ON_IMAGE_LINE = "rgba(255,255,255,0.28)";
 
-/* The five frozen flag reasons (types.ts LabelSkipReason), as a tile row bound
-   to 1..5. `multiple_cows` in particular is a direct detector-quality signal, so
+/* The frozen flag reasons (types.ts LabelSkipReason), as a tile row bound to the
+   same answer letters the questions use — the row is modal, so there is no
+   collision, and reusing the letters keeps one set of keys to learn.
+   `multiple_cows` in particular is a direct detector-quality signal, so
    the reason is asked AT THE PIXELS — three hundred items later it cannot be
    reconstructed from a thumbnail. The glyphs come from the same ClassIcon
    vocabulary the answers use; there is no flag-specific icon set to keep in
@@ -155,6 +157,7 @@ const FLAG_REASONS: { reason: LabelSkipReason; label: string; icon: string }[] =
   { reason: "no_cow", label: "No cow", icon: "question" },
   { reason: "multiple_cows", label: "Multiple cows", icon: "dot" },
   { reason: "occluded", label: "Occluded", icon: "shade" },
+  { reason: "low_resolution", label: "Resolution too low", icon: "pixels" },
   { reason: "other", label: "Other", icon: "question" },
 ];
 
