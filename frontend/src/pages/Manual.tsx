@@ -4,9 +4,10 @@ import { Button, CogIcon, SectionLabel } from "../components/ui";
 import { ModeToggle } from "./CountArea";
 
 /**
- * User manual: plain, click-level how-tos for the two things a non-technical user
- * does — upload a day of footage, and draw count / panel areas. Kept deliberately
- * concrete ("click the gear", "drag a corner").
+ * User manual: plain, click-level how-tos for the things a non-technical user
+ * does — upload a day of footage, draw count / panel areas, and label animals
+ * (answer the questions, fix a wrong outline). Kept deliberately concrete
+ * ("click the gear", "drag a corner").
  *
  * Code-as-documentation: every control shown inline is the REAL component from the
  * app (the shared CogIcon, the real <Button>, the real <ModeToggle>), not a
@@ -24,15 +25,18 @@ export default function Manual() {
           How to use Cownting
         </h1>
         <p className="text-gray-mid text-sm mt-2">
-          Two things to learn: uploading a day of footage, and drawing the areas that
-          turn cow positions into counts. Each is a short click-by-click below — the
-          buttons shown inline are the real ones you’ll click.
+          Three things to learn: uploading a day of footage, drawing the areas that
+          turn cow positions into counts, and labeling animals one by one. Each is a
+          short click-by-click below — the buttons shown inline are the real ones
+          you’ll click.
         </p>
         <nav className="mt-5 flex flex-wrap gap-x-5 gap-y-1.5 text-[13px]">
           <a href="#upload" className="text-accent hover:text-accent-deep">1 · Upload footage</a>
           <a href="#manage-cameras" className="text-accent hover:text-accent-deep">2 · Manage cameras</a>
           <a href="#count-areas" className="text-accent hover:text-accent-deep">3 · Count areas</a>
           <a href="#panel-areas" className="text-accent hover:text-accent-deep">4 · Panel areas</a>
+          <a href="#label-classify" className="text-accent hover:text-accent-deep">5 · Label animals</a>
+          <a href="#label-outline" className="text-accent hover:text-accent-deep">6 · Fix an outline</a>
         </nav>
       </header>
 
@@ -240,6 +244,73 @@ export default function Manual() {
         </Callout>
       </Section>
 
+      {/* 5 — LABEL: CLASSIFICATION -------------------------------------------- */}
+      <Section id="label-classify" n="5" title="Label animals (classification)">
+        <p>
+          You’re shown one animal at a time — a photo crop with a <B>white ring</B>{" "}
+          around the one to judge — and answer the questions beneath it. Anyone who
+          is signed in can label.
+        </p>
+        <Steps>
+          <li>
+            Click <NavPill>Label</NavPill> in the top navigation. The next animal
+            appears by itself.
+          </li>
+          <li>
+            <B>Answer</B> by clicking a tile or pressing its letter (<Kbd>Y</Kbd>{" "}
+            <Kbd>X</Kbd> <Kbd>C</Kbd> <Kbd>V</Kbd> <Kbd>B</Kbd> <Kbd>N</Kbd>). The
+            last answer <B>saves automatically</B> and brings the next animal.
+          </li>
+          <li>
+            <B>Correct</B>: the same letter again clears an answer; <Kbd>←</Kbd>{" "}
+            revisits earlier animals, <Kbd>→</Kbd> returns.
+          </li>
+          <li>
+            <B>Look closer</B>: hold <Kbd>Space</Kbd> for the whole frame, hold{" "}
+            <Kbd>H</Kbd> to hide the ring.
+          </li>
+          <li>
+            <B>Something’s wrong?</B> Press <Kbd>F</Kbd>. The outline Cownting found
+            appears on the photo — then either <B>fix the outline</B> (section 6),
+            mark it <B>Not a cow</B> to remove a false detection, or pick a reason
+            (<Kbd>1</Kbd>–<Kbd>5</Kbd>), type one line why, and <Kbd>Enter</Kbd>.
+          </li>
+        </Steps>
+      </Section>
+
+      {/* 6 — LABEL: SEGMENTATION ---------------------------------------------- */}
+      <Section id="label-outline" n="6" title="Fix a cow’s outline (segmentation)">
+        <p>
+          When the shape Cownting found is off — it clips a leg, swallows a
+          neighbour, hugs a shadow — correct it right on the animal.
+        </p>
+        <Steps>
+          <li>
+            Switch the toggle above the photo <OutlineToggle /> from <B>Classify</B>{" "}
+            to <B>Outline</B> (flagging offers the same jump). The animal’s outline
+            appears with draggable corner points.
+          </li>
+          <li>
+            <B>Drag</B> a point to move it, <B>click an edge</B> to add one,{" "}
+            <B>double-click</B> a point to delete it — same gestures as the
+            count-area editor. <Kbd>R</Kbd> reverts to Cownting’s outline.
+          </li>
+          <li>
+            Not a cow at all? Click <B>Not a cow — remove</B> to mark it a false
+            detection instead of sculpting a shape around nothing.
+          </li>
+          <li>
+            <B>Save outline</B> (<Kbd>Enter</Kbd>) stores your correction and returns
+            to the questions — fixing the outline doesn’t skip them. <Kbd>Esc</Kbd>{" "}
+            leaves without saving.
+          </li>
+        </Steps>
+        <Callout>
+          A greyed-out toggle means no outline is stored for this animal yet —
+          ask a poweruser to run the outline backfill.
+        </Callout>
+      </Section>
+
       <footer className="border-t border-border pt-6">
         <p className="text-[13px] text-gray-mid">
           Still stuck? Use <B>Report bug</B> in the header to send us what happened
@@ -299,6 +370,25 @@ function Code({ children }: { children: ReactNode }) {
 
 function Glyph({ children }: { children: ReactNode }) {
   return <span className="font-mono text-near-black">{children}</span>;
+}
+
+/* A keycap, as the Label page prints its bindings. */
+function Kbd({ children }: { children: ReactNode }) {
+  return (
+    <kbd className="inline-block rounded border border-border bg-surface-sunk px-1 font-mono text-[11px] text-near-black align-middle">
+      {children}
+    </kbd>
+  );
+}
+
+/* The Classify | Outline toggle above the Label crop (replica, like the chips). */
+function OutlineToggle() {
+  return (
+    <span className="inline-flex items-center rounded-full border border-border text-[11px] font-mono align-middle mx-0.5 overflow-hidden">
+      <span className="px-2 py-0.5 text-gray-mid">Classify</span>
+      <span className="px-2 py-0.5 bg-accent-soft text-accent-deep">Outline</span>
+    </span>
+  );
 }
 
 /* A nav item as it looks in the header (mono, tracked, uppercased). */
