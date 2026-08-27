@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { CSSProperties } from "react";
 import type { LabelGroup } from "../lib/types";
-import { numberKeysFor, visibleClasses } from "../lib/labelKeys";
+import { optionKeysFor, visibleClasses } from "../lib/labelKeys";
 import { ClassIcon } from "./ClassIcon";
 import { OptionTile, TILE_GAP, TILE_H, TILE_W } from "./OptionTile";
 
@@ -224,10 +224,12 @@ export interface QuestionPanelProps {
       Not local state: Escape clears the slot from the page, and the slot
       outlives this panel across the handoff. */
   openDefinitionKey: string | null;
-  /** id of the side panel's definition slot, for the info dots' `aria-controls`.
-      Omitted when the panel is not mounted (below 1100px it drops, §2.4). */
-  definitionSlotId?: string;
-  /** A tile was activated by pointer or keyboard focus. Digit presses do NOT
+  /** Closes whichever definition popover is open. The popover is anchored to a
+      tile and portalled out of this subtree, but the OPEN KEY lives on the page
+      (Escape clears it, and it must not survive a handoff), so closing is a
+      callback rather than local state. */
+  onCloseDefinition: () => void;
+  /** A tile was activated by pointer or keyboard focus. Letter presses do NOT
       come through here — the page resolves those itself — so the page may tag
       these as `input_mode: "mouse"` telemetry. Both keys are passed because the
       `answered` event carries `{group_key, class_key}` and splitting a class_key
@@ -258,7 +260,7 @@ export function QuestionPanel({
   selectedClassKey,
   reviewing,
   openDefinitionKey,
-  definitionSlotId,
+  onCloseDefinition,
   onSelect,
   onOpenDefinition,
   shakeNonce,
@@ -268,9 +270,9 @@ export function QuestionPanel({
   // Both derive from visibleClasses(), so index i is the same option in both and
   // the badge can never show a digit the page's handler resolves to a different
   // class. This is the single-source rule labelKeys.ts states: render from
-  // numberKeysFor(), never from `group.classes`.
+  // optionKeysFor(), never from `group.classes`.
   const classes = visibleClasses(group);
-  const keys = numberKeysFor(group);
+  const keys = optionKeysFor(group);
 
   const tone = QUESTION_TONES[stepIndex % QUESTION_TONES.length];
   const titleId = `lbl-question-${group.group_key}`;
@@ -416,8 +418,9 @@ export function QuestionPanel({
             // first, so a Tab into the panel lands where the eye already is and
             // Shift+Tab out of it is one keystroke.
             focusable={selectedClassKey === null ? i === 0 : cls.class_key === selectedClassKey}
+            definition={cls.description}
             definitionOpen={cls.class_key === openDefinitionKey}
-            definitionSlotId={definitionSlotId}
+            onCloseDefinition={onCloseDefinition}
             onSelect={(classKey) => onSelect(group.group_key, classKey)}
             onOpenDefinition={onOpenDefinition}
           />

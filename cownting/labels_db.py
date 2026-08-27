@@ -650,17 +650,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "shade",
                 "sort_order": 10,
                 "is_escape": False,
-                "description": (
-                    "Roughly two thirds or more of the visible body sits inside a "
-                    "shadow — a panel row, a building, a tree, or the herd itself. A "
-                    "cow standing in panel shade with only its head out in the sun is "
-                    "still Shaded: the body decides. Panel shadows have a hard, "
-                    "straight edge; tree shadows are soft and ragged; both count. A "
-                    "cow fully under a panel, visible only as an outline against dark "
-                    "ground, is Shaded. Do NOT use this when the whole scene is "
-                    "overcast and nothing casts a shadow — \"everything is dull\" is "
-                    "not the same as \"this animal chose shade\"; that is Cannot tell."
-                ),
+                "description": "Most of the body sits in panel shade, not just overcast dullness.",
             },
             {
                 "class_key": "sun_exposure.direct_sun",
@@ -668,17 +658,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "sun",
                 "sort_order": 20,
                 "is_escape": False,
-                "description": (
-                    "Most of the visible body is in unobstructed sunlight: the ground "
-                    "around it is bright and the animal casts its own visible shadow. "
-                    "A cow half under a panel with its hindquarters out counts as "
-                    "Direct sun only if the sunlit share is clearly the larger one "
-                    "— at a near 50/50 split choose Cannot tell instead of guessing, "
-                    "because those are exactly the frames where annotators disagree "
-                    "and we would rather measure that honestly. Thin dappled light "
-                    "through a gap between panels is still Direct sun if the animal's "
-                    "own shadow is sharp."
-                ),
+                "description": "Most of the body is in open sun, casting its own sharp shadow.",
             },
             {
                 "class_key": "sun_exposure.not_visible",
@@ -686,15 +666,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "eye-off",
                 "sort_order": 30,
                 "is_escape": False,
-                "description": (
-                    "The animal is in the frame — that is why it was detected — but "
-                    "you cannot see enough BODY to place it: it is cut off by the "
-                    "frame edge, hidden behind a panel leg or another animal, or the "
-                    "crop is so dark or so blown out that ground brightness carries "
-                    "no information. This is for a physical or optical obstruction. "
-                    "If you can see the body fine but still cannot decide sun vs "
-                    "shade, that is Cannot tell, not this."
-                ),
+                "description": "Too little of the body is visible to judge: cut off, blocked, or blown out.",
             },
             {
                 "class_key": "sun_exposure.cannot_tell",
@@ -702,16 +674,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "question",
                 "sort_order": 40,
                 "is_escape": True,
-                "description": (
-                    "You can see the animal, but the sun/shade call is not decidable: "
-                    "overcast light with no shadows anywhere, a near-even split "
-                    "between lit and shaded body, dusk or dawn where the whole scene "
-                    "is uniformly dim, or a dark patch you cannot attribute (panel "
-                    "shadow, or wet ground?). This is a CORRECT answer, not a failure "
-                    "— never guess to avoid it. A high Cannot tell rate on one camera "
-                    "or one hour is itself a finding, and it is the only way to tell a "
-                    "genuinely ambiguous scene apart from an unsure annotator."
-                ),
+                "description": "The body is visible, but sun versus shade will not resolve.",
             },
         ),
     },
@@ -734,17 +697,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "grass",
                 "sort_order": 10,
                 "is_escape": False,
-                "description": (
-                    "The muzzle is at or in the sward and the posture reads as intake: "
-                    "head clearly below shoulder height, neck extended forward and "
-                    "low, nose at ground level, body normally standing. You cannot see "
-                    "chewing in one frame, so judge geometry. The trap: head down is "
-                    "NOT automatically feeding. A cow nosing a panel leg, licking a "
-                    "post or drinking is Head probing. A cow lying with its head at "
-                    "grass level while ruminating is Lying. Grass immediately beside a "
-                    "panel leg is still Feeding — what matters is what the muzzle is "
-                    "ON, not what is nearby."
-                ),
+                "description": "Muzzle down at grass or feed while standing, not at hardware.",
             },
             {
                 "class_key": "behaviour.lying",
@@ -752,16 +705,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "lying",
                 "sort_order": 20,
                 "is_escape": False,
-                "description": (
-                    "The body is on the ground: the belly line meets the ground and "
-                    "the legs are folded under or stretched to the side. From these "
-                    "camera angles the reliable cue is the gap under the barrel — a "
-                    "standing cow shows daylight beneath it, a lying cow reads as a "
-                    "compact blob with no leg gap. Head position is irrelevant: head "
-                    "up and head flat are both Lying. A cow mid-transition (front "
-                    "knees down, hindquarters still up) is Standing — commit only to "
-                    "a completed posture."
-                ),
+                "description": "Belly on the ground, with no daylight under the barrel.",
             },
             {
                 "class_key": "behaviour.standing",
@@ -769,14 +713,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "standing",
                 "sort_order": 30,
                 "is_escape": False,
-                "description": (
-                    "On all four feet, head at or above shoulder height, not eating: "
-                    "idling, ruminating upright, watching, or walking. This is the "
-                    "default for an upright animal that is not clearly doing one of "
-                    "the other things. Walking belongs here on purpose — a timelapse "
-                    "frame gives no reliable motion cue, so we do not ask you to "
-                    "invent one. Getting up and lying down also belong here."
-                ),
+                "description": "On all four feet, head at or above the shoulder, not eating.",
             },
             {
                 "class_key": "behaviour.head_probing",
@@ -784,17 +721,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "probe",
                 "sort_order": 40,
                 "is_escape": False,
-                "description": (
-                    "Head down or extended, but INVESTIGATING rather than taking in "
-                    "feed: nosing panel legs, mounting rails, cabling or fence line; "
-                    "licking or rubbing on infrastructure; sniffing bare ground; "
-                    "drinking. This class exists because head-down-near-hardware is "
-                    "the behaviour that damages a solar field, and it is visually easy "
-                    "to confuse with Feeding. The single discriminator is what the "
-                    "muzzle is at: grass or feed means Feeding; hardware, bare ground "
-                    "or water means Head probing. If you cannot resolve which, use "
-                    "Cannot tell."
-                ),
+                "description": "Head down at hardware, ground, or water, investigating rather than eating.",
             },
             {
                 "class_key": "behaviour.not_visible",
@@ -802,15 +729,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "eye-off",
                 "sort_order": 45,
                 "is_escape": False,
-                "description": (
-                    "The animal is in the frame — that is why it was detected — but "
-                    "you cannot see enough BODY to read its posture: it is cut off by "
-                    "the frame edge, hidden behind a panel leg or another animal, or "
-                    "the crop is too dark, too small or too motion-blurred to resolve "
-                    "a leg line. This is for a physical or optical obstruction. If you "
-                    "can see the animal fine but Feeding vs Head probing is a coin "
-                    "flip, that is Cannot tell, not this."
-                ),
+                "description": "Too little of the body is visible to read the posture.",
             },
             {
                 "class_key": "behaviour.cannot_tell",
@@ -818,17 +737,7 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "question",
                 "sort_order": 50,
                 "is_escape": True,
-                "description": (
-                    "You can see the animal, but the pose is not decidable: it faces "
-                    "the camera head-on so the head/body geometry is foreshortened "
-                    "away, the leg line is visible but reads equally as folded or "
-                    "standing, or Feeding vs Head probing is a coin flip because you "
-                    "cannot resolve what the muzzle is at. This is a CORRECT answer, "
-                    "not a failure — never guess to avoid it. If the body is obscured "
-                    "rather than ambiguous, that is Not visible. Choose this rather "
-                    "than guessing — the Cannot tell rate per camera is one of the "
-                    "numbers we report."
-                ),
+                "description": "The body is visible, but the pose will not resolve.",
             },
         ),
     },

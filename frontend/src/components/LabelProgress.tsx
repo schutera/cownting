@@ -1,10 +1,6 @@
 import type { ReactNode } from "react";
-import type { LabelClass, LabelGroup } from "../lib/types";
-import { LABEL_ACTIONS, numberKeysFor, visibleClasses, visibleGroups } from "../lib/labelKeys";
-import { ClassIcon } from "./ClassIcon";
-import { DefinitionSlot } from "./DefinitionSlot";
-import { RecentStrip } from "./RecentStrip";
-import type { RecentItem } from "./RecentStrip";
+import type { LabelGroup } from "../lib/types";
+import { LABEL_ACTIONS, optionKeysFor, visibleGroups } from "../lib/labelKeys";
 import { SplitBar } from "./ui";
 
 /* The Label route's side panel (UX §2.5).
@@ -32,13 +28,6 @@ import { SplitBar } from "./ui";
  *     derived from lib/labelKeys — the same module the page's key handler and
  *     the tile badges read — so it cannot drift when a poweruser edits the
  *     taxonomy and a question gains a fifth answer.
- *
- * Why the answer mix is here and not on the tile faces (§6.1): a live share
- * printed on the option you are about to press is a nudge that operates on the
- * decision in front of you, and annotators balance toward the published band.
- * That manufactures a distribution instead of measuring one. In the side panel
- * the same number stays visible without sitting in the fixation region at the
- * moment of choice.
  */
 
 // The rolling window for the throughput read-out. Exported because the label
@@ -49,19 +38,6 @@ export const ROLLING_WINDOW = 50;
 // says it is still measuring instead of printing 3.2 items/min off two items.
 const MIN_RATE_SAMPLE = 5;
 
-// The published expected escape-rate band (§2.5, §6.4). `Cannot tell` is the
-// cheapest key on the screen now that Skip is abolished, and two raters both
-// taking the cheap key AGREE — escape inflation raises kappa while quality
-// falls. Drift is invisible to the person causing it unless it is rendered.
-export const EXPECTED_ESCAPE_BAND = { low: 0.03, high: 0.09 } as const;
-
-// A verdict on two answers would be superstition, so the band is printed with
-// no verdict until the annotator has enough of a day behind them to have one.
-const MIN_BAND_SAMPLE = 20;
-
-// Nine cells, per the §2.5 wireframe's `▮▮▮▮▮▮▯▯▯`.
-const MIX_SEGMENTS = 9;
-
 // The route's dark surface tokens (§2.2). Declared by the `data-surface="label"`
 // wrapper; the literal fallbacks keep the panel readable if it is ever rendered
 // outside it. ui.tsx's Panel/Kbd/Divider are hardcoded to the light app theme
@@ -71,9 +47,7 @@ const CARD = "var(--lbl-card, #1E2124)";
 const TILE = "var(--lbl-tile, #262A2E)";
 const INK = "var(--lbl-ink, #E8EAEC)";
 const INK_DIM = "var(--lbl-ink-dim, #9AA1A7)";
-const Q1 = "var(--lbl-q1, #E0A03C)";
-const Q2 = "var(--lbl-q2, #3FB8AE)";
-const HAIRLINE = "rgba(255, 255, 255, 0.09)";
+const HAIRLINE = "var(--lbl-line, rgba(255, 255, 255, 0.09))";
 
 /** Today's numbers for the annotator's own stream. Deliberately not LabelStats:
     that is a corpus-wide, all-time shape, and every figure here is per-session
@@ -99,25 +73,14 @@ export interface LabelStream {
 
 export interface LabelProgressProps {
   /** The live taxonomy's groups. Ordering and visibility are resolved here
-      through lib/labelKeys, exactly as the tile row does it, so the digits in
-      the legend are the digits on the tiles. Empty while the first fetch is in
-      flight — the mix and keys blocks say so rather than rendering nothing. */
+      through lib/labelKeys, exactly as the tile row does it, so the letters in
+      the legend are the letters on the tiles. Empty while the first fetch is in
+      flight — the keys block says so rather than rendering nothing. */
   groups: LabelGroup[];
   stream: LabelStream;
-  /** class_key -> how many times this annotator chose it today. Classes absent
-      from the map count as zero, so the page can send a sparse tally. */
-  mix: Readonly<Record<string, number>>;
   /** Opens the pending-notes queue (§3.9.3). Omitted -> the count is plain
       text, so the panel still renders before that page exists. */
   onOpenPendingNotes?: () => void;
-  /** The class whose info dot was clicked last, for the reserved slot. */
-  definition: LabelClass | null;
-  onClearDefinition: () => void;
-  /** The last items answered, newest first (§2.5.4). */
-  recent: readonly RecentItem[];
-  /** The instance on screen, so a revisited one is marked in the strip. */
-  currentKey: string | null;
-  onJumpToRecent: (instanceKey: string) => void;
   className?: string;
 }
 
@@ -133,15 +96,6 @@ function itemsPerMinute(recentMs: readonly number[]): number | null {
 
 function pct(fraction: number): string {
   return `${Math.round(fraction * 100)}%`;
-}
-
-/* The two question hues (§2.2), by answering position. Any third group falls
-   back to neutral — §2.2 allows two hues plus neutral and no more, so a
-   poweruser adding a question must not invent a colour. */
-function accentFor(index: number): string {
-  if (index === 0) return Q1;
-  if (index === 1) return Q2;
-  return INK_DIM;
 }
 
 function BlockHeading({ children }: { children: ReactNode }) {
@@ -198,82 +152,10 @@ function LegendRow({ label, badges }: { label: string; badges: readonly string[]
   );
 }
 
-/* The share bar. Segmented rather than continuous so it reads at a glance in
-   greyscale (§5) and so a 6 % share is still one visible cell instead of a
-   three-pixel sliver. */
-function MixBar({ share, color }: { share: number; color: string }) {
-  const filled = share <= 0 ? 0 : Math.max(1, Math.min(MIX_SEGMENTS, Math.round(share * MIX_SEGMENTS)));
-  return (
-    <span className="flex items-center gap-[2px]" aria-hidden="true">
-      {Array.from({ length: MIX_SEGMENTS }, (_, i) => (
-        <span
-          key={i}
-          className="w-[6px] h-2 rounded-[1px]"
-          style={{ background: i < filled ? color : TILE }}
-        />
-      ))}
-    </span>
-  );
-}
-
-function MixRow({
-  cls,
-  share,
-  count,
-  color,
-}: {
-  cls: LabelClass;
-  share: number;
-  count: number;
-  color: string;
-}) {
-  return (
-    <div className="flex items-center gap-2">
-      <span className="flex items-center gap-1.5 min-w-0 grow" style={{ color: INK_DIM }}>
-        <ClassIcon name={cls.icon} className="w-3.5 h-3.5" />
-        <span className="text-[11.5px] leading-snug truncate">{cls.name}</span>
-      </span>
-      <MixBar share={share} color={color} />
-      <span
-        className="font-mono text-[10.5px] tabular-nums w-9 text-right shrink-0"
-        style={{ color: INK }}
-        title={`${count} today`}
-      >
-        {pct(share)}
-      </span>
-    </div>
-  );
-}
-
-/* `expected 3–9 % ✓` under each escape class. The verdict is a glyph AND a word
-   (§5: never colour alone), and it is withheld entirely until MIN_BAND_SAMPLE
-   answers exist for that question. */
-function BandNote({ share, total }: { share: number; total: number }) {
-  const band = `expected ${pct(EXPECTED_ESCAPE_BAND.low)}–${pct(EXPECTED_ESCAPE_BAND.high)}`;
-  let verdict = "";
-  if (total >= MIN_BAND_SAMPLE) {
-    if (share < EXPECTED_ESCAPE_BAND.low) verdict = " ▼ below band";
-    else if (share > EXPECTED_ESCAPE_BAND.high) verdict = " ▲ above band";
-    else verdict = " ✓ in band";
-  }
-  return (
-    <p className="text-[10.5px] leading-snug text-right mt-0.5" style={{ color: INK_DIM }}>
-      {band}
-      {verdict}
-    </p>
-  );
-}
-
 export function LabelProgress({
   groups,
   stream,
-  mix,
   onOpenPendingNotes,
-  definition,
-  onClearDefinition,
-  recent,
-  currentKey,
-  onJumpToRecent,
   className,
 }: LabelProgressProps) {
   const shown = visibleGroups(groups);
@@ -355,57 +237,7 @@ export function LabelProgress({
         </p>
       </Block>
 
-      <Block title="My answer mix (today)">
-        {shown.length === 0 ? (
-          <p className="text-[11.5px]" style={{ color: INK_DIM }}>
-            waiting for the taxonomy…
-          </p>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {shown.map((g, gi) => {
-              const classes = visibleClasses(g);
-              const total = classes.reduce((n, c) => n + (mix[c.class_key] ?? 0), 0);
-              const color = accentFor(gi);
-              return (
-                <div key={g.group_key}>
-                  <p
-                    className="text-[10px] uppercase tracking-[0.1em] leading-none mb-1.5"
-                    style={{ color: INK_DIM }}
-                  >
-                    {g.name}
-                  </p>
-                  {total === 0 ? (
-                    <p className="text-[11.5px]" style={{ color: INK_DIM }}>
-                      no answers yet today
-                    </p>
-                  ) : (
-                    <div className="flex flex-col gap-1">
-                      {classes.map((c) => {
-                        const count = mix[c.class_key] ?? 0;
-                        const share = count / total;
-                        return (
-                          <div key={c.class_key}>
-                            <MixRow cls={c} share={share} count={count} color={color} />
-                            {c.is_escape ? <BandNote share={share} total={total} /> : null}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </Block>
 
-      <Block title="Definition">
-        <DefinitionSlot cls={definition} onClear={onClearDefinition} />
-      </Block>
-
-      <Block title="Recent">
-        <RecentStrip items={recent} currentKey={currentKey} onJump={onJumpToRecent} />
-      </Block>
 
       <Block title="Keys">
         <div className="flex flex-col gap-1.5">
@@ -419,18 +251,18 @@ export function LabelProgress({
                 <LegendRow
                   key={g.group_key}
                   label={g.name}
-                  badges={numberKeysFor(g)
+                  badges={optionKeysFor(g)
                     .map((o) => o.label)
                     .filter((l) => l !== "")}
                 />
               ))}
-              {/* The one thing the digits cannot say for themselves: they are
+              {/* The one thing the letters cannot say for themselves: they are
                   rebound on every handoff. Key 2 is Direct sun in one state and
                   Lying in the next — a varied mapping, which Schneider &
                   Shiffrin show never becomes automatic, so the display has to
                   carry the cue the annotator's memory will not. */}
               <p className="text-[10.5px] leading-snug mt-0.5 mb-1" style={{ color: INK_DIM }}>
-                Only the question on screen listens — the digits rebind when it hands off.
+                Only the question on screen listens — the letters rebind when it hands off.
               </p>
             </>
           )}
@@ -438,7 +270,7 @@ export function LabelProgress({
             <LegendRow key={a.action} label={a.hint} badges={[a.label]} />
           ))}
           {spaceIsBound ? null : (
-            <LegendRow label="hold — lift the scrim and enlarge the crop" badges={["Space"]} />
+            <LegendRow label="hold — show the whole frame" badges={["Space"]} />
           )}
         </div>
       </Block>

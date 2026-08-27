@@ -1,5 +1,8 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ClassIcon } from "./ClassIcon";
 import { InfoIcon } from "./ui";
+import { DefinitionCard, DEFINITION_CARD_MAX_H, DEFINITION_CARD_W } from "./DefinitionSlot";
 
 /* One answer tile: [digit badge][glyph][word], with an info dot in the corner.
  *
@@ -30,8 +33,20 @@ import { InfoIcon } from "./ui";
  *
  * THE INFO DOT IS A SIBLING, NOT A CHILD (§3.6). A click inside the tile button
  * would also activate it, so nesting would make "read the definition" silently
- * answer the question. It opens the class definition in the side panel's
- * reserved slot; it never answers, never reflows, and never covers the crop.
+ * answer the question. It opens the class definition in a POPOVER anchored to
+ * this tile (round 2 — the side panel and its reserved slot are gone); the dot
+ * itself never answers, never reflows the tile, and never grows the tile's box.
+ *
+ * THE POPOVER IS PORTALED, NOT AN IN-FLOW ABSOLUTE CHILD (§3.6 round 2). The
+ * label route's root (`data-surface="label"` in Label.tsx) pins itself to the
+ * viewport with `overflow: hidden` on purpose — that is what keeps the per-item
+ * loop from ever growing a page scrollbar. Anything positioned relative to a
+ * normal ancestor inside that subtree is at the mercy of that clip the moment
+ * it needs to extend past the root's box (a short viewport, a tile near an
+ * edge). Portaling straight to `document.body` and positioning with `fixed`
+ * coordinates taken from the tile's own `getBoundingClientRect()` sidesteps
+ * every ancestor's overflow and every ancestor's stacking context in one move,
+ * which a merely-absolute element inside this tree cannot promise.
  */
 
 // The tile box, exported because the panel's grid has to lay out exactly these
@@ -48,6 +63,19 @@ export const TILE_GAP = 10;
 const BADGE_INSET = 7;
 const INFO_INSET = 5;
 
+// Clear space kept between the tile and the popover, and the minimum margin
+// kept from the viewport's own edge so the card never sits flush against the
+// browser chrome. Not part of DefinitionSlot's card sizing (see that file's
+// header) — this is purely the anchoring geometry, which only this component
+// computes.
+const POPOVER_GAP = 8;
+const VIEWPORT_MARGIN = 8;
+// A stacking value comfortably above anything else this route paints (the
+// inspect-zoom crop only reaches z-index 5), so the popover is never buried by
+// a later sibling's own stacking context even though it is portaled to the
+// end of <body> and would normally win on paint order alone.
+const POPOVER_Z = 1000;
+
 export interface OptionTileProps {
   /** The immutable class key, echoed back on activation so the caller never has
       to match on the display name (which a poweruser can rename). */
@@ -56,9 +84,12 @@ export interface OptionTileProps {
   name: string;
   /** LabelClass.icon, a ClassIcon vocabulary name; unknown renders the dot. */
   icon: string;
-  /** The digit from numberKeysFor(), or "" for an option past the ninth, which
-      is mouse-only. The badge box is reserved either way so a keyless tile does
-      not shorten the row's top line. */
+  /** The display key from optionKeysFor() — a short string (a letter, or a
+      letter once the taxonomy rebinds), or "" for an option past the ninth,
+      which is mouse-only. Rendered verbatim: this component makes no
+      assumption about its charset or length, only that it fits the 20x20
+      badge. The badge box is reserved either way so a keyless tile does not
+      shorten the row's top line. */
   keyLabel: string;
   /** This class is the group's current answer: filled, inverted, ringed, ticked
       (§5.2) — four channels, so it survives the greyscale check. */
@@ -70,16 +101,37 @@ export interface OptionTileProps {
   /** The single tab stop of the group (§3.8's roving tabindex). Exactly one tile
       in a panel may be true. */
   focusable: boolean;
-  /** This class's definition is the one currently in the side panel slot. */
+  /** This class's definition is the one currently open. At most one tile across
+      the whole page may be true at a time — the page owns that as a single
+      `class_key | null`, never per-tile local state, so opening a second
+      definition closes the first by construction. */
   definitionOpen: boolean;
-  /** id of the side panel's definition slot, for `aria-controls`. Omitted when
-      the slot is not mounted (narrow viewports drop the side panel). */
-  definitionSlotId?: string;
+  /** LabelClass.description for this tile's class, shown in the popover body
+      when `definitionOpen` is true. Rendered even when `definitionOpen` is
+      false is harmless (nothing reads it), but the caller only has to pass it
+      once it is known — an empty/missing value renders the same "not written
+      yet" copy DefinitionSlot's card always has. */
+  definition?: string;
   /** Activation. Only pointer/focus activation reaches this component — the
       digit keys are resolved by the page's own capture-phase handler — so the
       caller can safely tag these as `input_mode: "mouse"` telemetry. */
   onSelect: (classKey: string) => void;
   onOpenDefinition: (classKey: string) => void;
+  /** Dismiss an OPEN definition without opening a different one — click
+      outside the popover, and choosing this tile's own answer, both funnel
+      through here. Deliberately a separate callback from `onOpenDefinition`:
+      routing a close through that one would re-fire the `info_opened`
+      telemetry event (SQL_INFO_ICON_PRESSURE) on every dismissal, which is a
+      single-open signal, not a some-open signal. Optional so a caller that has
+      not wired it yet still renders; without it the popover can still be
+      dismissed by Escape (the page already clears `openDefinitionKey` on it)
+      but not by clicking away. The page must ALSO clear the open definition
+      when the active item changes (ArrowRight, auto-advance, jumping to a
+      recent item) — this component has no way to observe that on its own,
+      since advancing does not necessarily unmount it (the next item's first
+      question is frequently the same group, so the same class_key can still
+      be "open" for a tile that now belongs to a different animal). */
+  onCloseDefinition?: () => void;
 }
 
 /* The tick that appears in the badge row on the chosen tile. Drawn rather than
@@ -112,9 +164,10 @@ export function OptionTile({
   reviewing,
   focusable,
   definitionOpen,
-  definitionSlotId,
+  definition,
   onSelect,
   onOpenDefinition,
+  onCloseDefinition,
 }: OptionTileProps) {
   // The latch is same-frame by construction: there is deliberately NO transition
   // on the tile's fill or text colour. A keypress whose visible state change is
@@ -123,7 +176,7 @@ export function OptionTile({
   const face = selected
     ? {
         background: "var(--lbl-accent)",
-        color: "var(--lbl-bg)",
+        color: "var(--lbl-on-accent)",
         borderColor: "transparent",
         // inset ring per §5.2; the outer pair is the review double-rule (§2.8),
         // both drawn as shadows so neither state changes the tile's box.
@@ -137,13 +190,102 @@ export function OptionTile({
         borderColor: "color-mix(in srgb, var(--lbl-ink) 14%, transparent)",
       };
 
+  // id the popover mounts under, so aria-controls keeps pointing at a real
+  // element whenever the popover is actually open; dots are legal in an HTML
+  // id, and class_key is globally unique, so this cannot collide across tiles.
+  const popoverId = `lbl-definition-${classKey}`;
+
+  const tileRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+
+  // Anchoring math (§3.6 round 2). Runs before paint so the two-pass
+  // measure-then-place below never flashes at the wrong spot: the first pass
+  // renders the card off-screen and `visibility: hidden` (still fully laid
+  // out and measurable, unlike `display: none`), this effect reads its REAL
+  // size, and the resulting `setPos` is flushed by React before the browser
+  // paints — `useLayoutEffect`'s whole contract.
+  useLayoutEffect(() => {
+    if (!definitionOpen) {
+      setPos(null);
+      return;
+    }
+    const reposition = () => {
+      const tile = tileRef.current;
+      if (tile === null) return;
+      const tileRect = tile.getBoundingClientRect();
+      // Falls back to the card's own reserved maximum only if the portal has
+      // not mounted yet, which should not happen by the time this runs — kept
+      // as a defensive floor rather than a real code path.
+      const cardH = cardRef.current?.offsetHeight || DEFINITION_CARD_MAX_H;
+      const cardW = cardRef.current?.offsetWidth || DEFINITION_CARD_W;
+      // Prefer ABOVE the tile row (§3.6 round 2: cover as little of the crop
+      // above it as the content needs, never the footer legend below), and
+      // fall back to below only when there truly is not room above.
+      const fitsAbove = tileRect.top - POPOVER_GAP - cardH >= VIEWPORT_MARGIN;
+      const top = fitsAbove
+        ? tileRect.top - POPOVER_GAP - cardH
+        : Math.min(
+            tileRect.bottom + POPOVER_GAP,
+            window.innerHeight - cardH - VIEWPORT_MARGIN,
+          );
+      // Left-align with the tile, like the tile row itself (§2.7's left
+      // alignment), clamped so a tile near the right edge does not push the
+      // card off-screen.
+      const left = Math.min(
+        Math.max(tileRect.left, VIEWPORT_MARGIN),
+        window.innerWidth - cardW - VIEWPORT_MARGIN,
+      );
+      setPos({ top, left });
+    };
+    reposition();
+    // The route's own root is pinned with `overflow: hidden` specifically so
+    // the page never scrolls (see Label.tsx), so a `scroll` here almost never
+    // fires from within it — this only guards a future ancestor that does
+    // scroll (a test harness, a story). Resize is the real, common case: the
+    // window changing size while a definition is open must not leave the card
+    // floating over empty space or clipped at the new edge.
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [definitionOpen, definition]);
+
+  // Click-outside dismissal. A click on THIS tile (either button) is
+  // deliberately excluded so re-clicking the info dot is left to
+  // `onOpenDefinition`'s own existing semantics rather than being pre-empted
+  // here, and so clicking this tile's own answer button is handled once, by
+  // that button's own onClick, rather than twice.
+  useEffect(() => {
+    if (!definitionOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target;
+      if (!(target instanceof Node)) return;
+      if (tileRef.current?.contains(target)) return;
+      if (cardRef.current?.contains(target)) return;
+      onCloseDefinition?.();
+    };
+    document.addEventListener("mousedown", onPointerDown, true);
+    return () => document.removeEventListener("mousedown", onPointerDown, true);
+  }, [definitionOpen, onCloseDefinition]);
+
   return (
-    <div className="relative" style={{ width: TILE_W, height: TILE_H }}>
+    <div ref={tileRef} className="relative" style={{ width: TILE_W, height: TILE_H }}>
       <button
         type="button"
         aria-pressed={selected}
         tabIndex={focusable ? 0 : -1}
-        onClick={() => onSelect(classKey)}
+        onClick={() => {
+          onSelect(classKey);
+          // Choosing an answer dismisses any open definition outright (§3.6
+          // round 2's dismissal list) — called unconditionally rather than
+          // only when THIS tile's own definition is open, which costs nothing
+          // when nothing is open (the page's `openDefinitionKey` is already
+          // null) and needs no per-tile bookkeeping to get right.
+          onCloseDefinition?.();
+        }}
         style={{ ...face, padding: BADGE_INSET }}
         className={
           "absolute inset-0 flex flex-col items-center rounded-lg border box-border cursor-pointer " +
@@ -159,9 +301,9 @@ export function OptionTile({
             style={{
               width: 20,
               height: 20,
-              color: selected ? "var(--lbl-bg)" : "var(--lbl-accent)",
+              color: selected ? "var(--lbl-on-accent)" : "var(--lbl-accent)",
               background: selected
-                ? "color-mix(in srgb, var(--lbl-bg) 22%, transparent)"
+                ? "color-mix(in srgb, var(--lbl-on-accent) 22%, transparent)"
                 : "color-mix(in srgb, var(--lbl-accent) 16%, transparent)",
             }}
           >
@@ -190,7 +332,8 @@ export function OptionTile({
       <button
         type="button"
         aria-expanded={definitionOpen}
-        aria-controls={definitionSlotId}
+        aria-haspopup="dialog"
+        aria-controls={popoverId}
         aria-label={`definition of “${name}”`}
         onClick={() => onOpenDefinition(classKey)}
         style={{
@@ -200,7 +343,7 @@ export function OptionTile({
           right: INFO_INSET,
           // Selection wins over the open state: on a filled tile the accent is
           // the background, so an accent info dot would vanish into it.
-          color: selected ? "var(--lbl-bg)" : definitionOpen ? "var(--lbl-accent)" : "var(--lbl-ink-dim)",
+          color: selected ? "var(--lbl-on-accent)" : definitionOpen ? "var(--lbl-accent)" : "var(--lbl-ink-dim)",
           opacity: definitionOpen ? 1 : 0.65,
         }}
         className={
@@ -211,6 +354,31 @@ export function OptionTile({
       >
         <InfoIcon className="w-[14px] h-[14px]" />
       </button>
+
+      {definitionOpen
+        ? createPortal(
+            <DefinitionCard
+              ref={cardRef}
+              id={popoverId}
+              name={name}
+              icon={icon}
+              definition={definition ?? ""}
+              onClose={() => onCloseDefinition?.()}
+              style={{
+                position: "fixed",
+                top: pos?.top ?? -9999,
+                left: pos?.left ?? -9999,
+                // Hidden rather than unmounted for the first, pre-measurement
+                // frame: unmounted would mean no `cardRef` to measure and no
+                // way out of the chicken-and-egg (see the layout effect
+                // above).
+                visibility: pos === null ? "hidden" : "visible",
+                zIndex: POPOVER_Z,
+              }}
+            />,
+            document.body,
+          )
+        : null}
     </div>
   );
 }

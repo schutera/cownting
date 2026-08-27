@@ -189,7 +189,9 @@ export interface Taxonomy {
 // shows day + camera and never the clock time — the burnt-in timestamp banner is
 // masked server-side for the same reason, since time of day hands the annotator
 // the sun/shade answer. `n_annotators` is how many already labeled this instance,
-// never WHAT they said. There is no frame_w/frame_h and no full-frame view in v1.
+// never WHAT they said. `frame_url` is the whole banner-masked frame behind this
+// crop, shown on hold-Space; there is still no frame_w/frame_h, because nothing
+// measures it.
 export interface LabelItem {
   instance_key: string;
   dataset_id: string | null;
@@ -201,6 +203,7 @@ export interface LabelItem {
   score: number | null;
   frame_sig: string | null;
   crop_url: string;
+  frame_url: string;
   crop_w: number;
   crop_h: number;
   ring: [number, number, number, number];   // crop-local px

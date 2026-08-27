@@ -235,6 +235,24 @@ def test_labeler_gate():
         r = anon.post("/api/label/submit", json=LABELER_SURFACE[0][2])
         check("anonymous label submit -> 401", r.status_code == 401, str(r.status_code))
 
+        # The two label IMAGE routes carry no per-route dependency: they ride the
+        # app-wide require_login on the FastAPI() instance, like every other
+        # /api/img/*. Asserted rather than assumed, because an unauthenticated
+        # 200 on either hands a stranger the farm's footage — and label-frame
+        # hands over the WHOLE field of view, not a 100px square. The gate runs
+        # before the handler, so these 401 on a path with no frame behind it.
+        IMG = "camera_01/00000001.jpg"
+        r = anon.get(f"/api/img/label-crop/{IMG}?x1=0&y1=0&x2=10&y2=10")
+        check("anonymous label-crop -> 401", r.status_code == 401, str(r.status_code))
+        r = anon.get(f"/api/img/label-frame/{IMG}")
+        check("anonymous label-frame -> 401", r.status_code == 401, str(r.status_code))
+        # Positive control: a logged-in plain `user` gets past the gate and only
+        # then hits the missing frame, so the 401s above are the gate and not a
+        # 404 wearing the wrong number.
+        r = viewer.get(f"/api/img/label-frame/{IMG}")
+        check("user label-frame passes the login gate (404, not 401/403)",
+              r.status_code == 404, str(r.status_code))
+
 
 def test_poweruser_data_gate():
     """Role x route matrix over the full poweruser surface: every entry is 403

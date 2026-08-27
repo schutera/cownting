@@ -4,7 +4,8 @@ shape: AuthCfg(enabled=False), temp DuckDB files, no network).
 Covers the frozen M3 route table: the queue's item shape and sampling policy,
 the queue-key -> submit round trip (the end-to-end version of the SQL/Python key
 pin), anchor forgery, the taxonomy-stale 409, served-event telemetry, undo
-scoping, and the crop endpoint's path safety, caching and banner masking.
+scoping, and both label image endpoints' path safety, caching and banner
+masking — the crop, and the full uncropped frame behind hold-to-peek.
 
 No pytest. Run either way:
     .venv/bin/python -m tests.test_labels_api
@@ -54,8 +55,8 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 # every served item — the frontend types against exactly this.
 _ITEM_FIELDS = (
     "instance_key", "dataset_id", "day", "camera_id", "frame_file", "bbox",
-    "ordinal", "score", "frame_sig", "crop_url", "crop_w", "crop_h", "ring",
-    "n_annotators", "target", "overlap", "serve_event_id",
+    "ordinal", "score", "frame_sig", "crop_url", "frame_url", "crop_w", "crop_h",
+    "ring", "n_annotators", "target", "overlap", "serve_event_id",
 )
 
 
@@ -151,6 +152,14 @@ def test_queue_shape():
             check(f"item {i} carries every frozen field", not missing, str(missing))
         check("crop_url is server-built under /api/img/label-crop/",
               all(str(it["crop_url"]).startswith("/api/img/label-crop/") for it in items))
+        check("frame_url is server-built under /api/img/label-frame/",
+              all(str(it["frame_url"]).startswith("/api/img/label-frame/") for it in items),
+              str(items[0]["frame_url"]) if items else "")
+        # The cross-day guard in URL form: each item names its OWN dataset, so
+        # nothing downstream has to (and withDs() would name the wrong one).
+        check("frame_url carries the item's own dataset, not the selected day",
+              all(f"dataset={it['dataset_id']}" in it["frame_url"] for it in items),
+              str(items[0]["frame_url"]) if items else "")
         check("crop canvas is square (crop_w == crop_h)",
               all(it["crop_w"] == it["crop_h"] for it in items))
         check("serve_event_id is a number on every item",
@@ -509,6 +518,156 @@ def test_banner_mask_does_not_blank_the_tile():
         probe(0, 145, 200, 149, "wide below-band bbox")
 
 
+def test_frame_endpoint_safety_and_caching():
+    """/api/img/label-frame mirrors label-crop's path safety and cache contract.
+
+    Same three whitelists (valid_camera_id, _safe_frame_file, _safe_path_id) and
+    the same resolve-under-artifacts_dir check, because this route rebuilds an
+    on-disk path out of URL segments exactly the way the crop route does."""
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        _noise_frame(config.paths.artifacts_dir, "2026-07-03", "00000001.jpg")  # 200x150
+
+        r = client.get("/api/img/label-frame/..%5C..%5Cwindows/00000001.jpg")
+        check("frame: traversal in camera -> 400", r.status_code == 400, str(r.status_code))
+        r = client.get("/api/img/label-frame/camera_01/00000001.jpg?dataset=..%2F..%2Fetc")
+        check("frame: traversal in dataset -> 400", r.status_code == 400, str(r.status_code))
+        r = client.get("/api/img/label-frame/camera_01/..%5C..%5Cwin.ini")
+        check("frame: traversal in frame_file -> 400", r.status_code == 400, str(r.status_code))
+        r = client.get("/api/img/label-frame/camera_01/notaframe.txt")
+        check("frame: a non-frame filename -> 400", r.status_code == 400, str(r.status_code))
+        r = client.get("/api/img/label-frame/camera_01/00000001.jpg.exe")
+        check("frame: a double extension -> 400", r.status_code == 400, str(r.status_code))
+        # An encoded separator either fails to match the route or fails the
+        # whitelist; what matters is that it never comes back as an image.
+        r = client.get("/api/img/label-frame/camera_01/..%2F..%2Fwin.ini")
+        check("frame: an encoded separator in frame_file never returns an image",
+              r.status_code in (400, 404), str(r.status_code))
+
+        # A missing JPEG is routine (a re-ingest rmtrees frames out from under a
+        # queue the client is still holding): 404, never a 500.
+        r = client.get("/api/img/label-frame/camera_01/00000002.jpg?dataset=2026-07-03")
+        check("frame: missing JPEG -> 404, never 500", r.status_code == 404, str(r.status_code))
+
+        url = "/api/img/label-frame/camera_01/00000001.jpg?dataset=2026-07-03"
+        r = client.get(url)
+        check("frame: real JPEG -> 200", r.status_code == 200, str(r.status_code))
+        check("frame: content-type is image/jpeg",
+              r.headers.get("content-type", "").startswith("image/jpeg"),
+              r.headers.get("content-type", ""))
+        check("frame: Cache-Control is private (session-gated; no shared proxy may store it)",
+              "private" in r.headers.get("cache-control", ""),
+              r.headers.get("cache-control", ""))
+        check("frame: Cache-Control keeps the one-hour max-age",
+              "max-age=3600" in r.headers.get("cache-control", ""),
+              r.headers.get("cache-control", ""))
+        etag = r.headers.get("etag", "")
+        check("frame: a strong ETag is set", bool(etag), etag)
+        r304 = client.get(url, headers={"If-None-Match": etag})
+        check("frame: the ETag round-trips to 304 (a held key re-decodes nothing)",
+              r304.status_code == 304, str(r304.status_code))
+
+        # The two routes render different pixels out of one file; a shared ETag
+        # would let a cache hand back the crop where the frame was asked for.
+        crop = client.get("/api/img/label-crop/camera_01/00000001.jpg"
+                          "?dataset=2026-07-03&x1=20&y1=30&x2=80&y2=90")
+        check("frame: the ETag differs from the crop's over the same file",
+              bool(etag) and etag != crop.headers.get("etag", ""), etag)
+
+        # `w` is a CEILING, never a target: a small frame is not upscaled into blur.
+        r = client.get(url + "&w=4096")
+        check("frame: w above the native width does not upscale",
+              r.status_code == 200 and Image.open(BytesIO(r.content)).size == (200, 150),
+              str(r.status_code))
+
+
+def test_frame_banner_is_masked():
+    """THE point of the route: a full frame shows MORE of the burned-in Brinno
+    clock than any crop of it does, so serving the JPEG off disk would hand the
+    annotator the wall-clock time — which IS the sun-exposure answer (M3 §4.5) —
+    on every hold-to-peek.
+
+    The source file is the negative control: the same band is full-contrast noise
+    on disk and flat fill in the response, so this cannot pass by accident on a
+    frame that never had anything down there."""
+    from PIL import Image, ImageStat
+
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        _noise_frame(config.paths.artifacts_dir, "2026-07-03", "00000001.jpg")  # 200x150
+        src = (Path(config.paths.artifacts_dir) / "2026-07-03" / "frames"
+               / "camera_01" / "00000001.jpg")
+
+        # Control: the band is NOT already flat on disk.
+        raw = Image.open(src).convert("L")
+        rw, rh = raw.size
+        raw_band = ImageStat.Stat(raw.crop((0, int(rh * 0.96), rw, rh))).stddev[0]
+        check("control: the source frame's banner band is full-contrast noise",
+              raw_band > 5.0, f"stddev={raw_band:.2f}")
+
+        url = "/api/img/label-frame/camera_01/00000001.jpg?dataset=2026-07-03"
+        r = client.get(url)
+        check("frame: real JPEG -> 200", r.status_code == 200, str(r.status_code))
+        check("frame: the body is re-rendered, NOT the file on disk",
+              r.content != src.read_bytes(),
+              f"{len(r.content)} served vs {src.stat().st_size} on disk")
+
+        im = Image.open(BytesIO(r.content)).convert("L")
+        w, h = im.size
+        check("frame: served at native size (200x150 is under the 1600 ceiling)",
+              (w, h) == (200, 150), str(im.size))
+        band = ImageStat.Stat(im.crop((0, int(h * 0.96), w, h)))
+        check("frame: the banner band comes back FLAT — masked, not passed through",
+              band.stddev[0] < 3.0, f"stddev={band.stddev[0]:.2f}")
+        check("frame: ...flat at the neutral fill, not at black or white",
+              abs(band.mean[0] - 96.0) < 6.0, f"mean={band.mean[0]:.2f}")
+        # The other half of the requirement: masking must not blank the frame.
+        above = ImageStat.Stat(im.crop((0, 0, w, int(h * 0.96)))).stddev[0]
+        check("frame: everything ABOVE the band is untouched real pixels",
+              above > 5.0, f"stddev={above:.2f}")
+
+        # Masking runs BEFORE the downscale. Reverse the order and the band's
+        # first row is measured against the wrong height, so the clock survives
+        # the resize — the failure that looks like nothing at all on screen.
+        r = client.get(url + "&w=100")
+        check("frame: w=100 downscales and preserves aspect",
+              r.status_code == 200 and Image.open(BytesIO(r.content)).size == (100, 75),
+              str(r.status_code))
+        small = Image.open(BytesIO(r.content)).convert("L")
+        sw, sh = small.size
+        # One row in from the seam: LANCZOS bleeds about a pixel across it.
+        sband = ImageStat.Stat(small.crop((0, int(sh * 0.96) + 1, sw, sh)))
+        check("frame: the band is still flat at the same height fraction after the downscale",
+              sband.stddev[0] < 4.0, f"stddev={sband.stddev[0]:.2f}")
+        check("frame: ...and still at the neutral fill after resampling",
+              abs(sband.mean[0] - 96.0) < 8.0, f"mean={sband.mean[0]:.2f}")
+
+
+def test_every_queue_item_frame_url_resolves():
+    """Fetch each item's `frame_url` verbatim, the way <img src> would.
+
+    The cross-day proof for hold-to-peek: items from BOTH seeded days resolve,
+    which a client-built URL could not manage — lib/api.ts's withDs() would stamp
+    the selected day onto every one of them and 404 half the queue."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        for ds in ("2026-07-03", "2026-07-04"):
+            for name in ("00000001.jpg", "00000002.jpg"):
+                _noise_frame(config.paths.artifacts_dir, ds, name)
+        items = client.get("/api/label/queue").json()["items"]
+        days = {it["dataset_id"] for it in items}
+        check("the queue spans both days, so this really is a cross-day test",
+              days == {"2026-07-03", "2026-07-04"}, str(days))
+        for it in items:
+            r = client.get(it["frame_url"])
+            check(f"frame_url resolves for {it['dataset_id']}/{it['frame_file']}",
+                  r.status_code == 200
+                  and r.headers.get("content-type", "").startswith("image/jpeg"),
+                  f"{r.status_code} {r.headers.get('content-type', '')}")
+
+
 def main():
     print("=== test_labels_api ===")
     test_queue_shape()
@@ -522,6 +681,9 @@ def main():
     test_undo_is_scoped_to_me()
     test_crop_endpoint_safety_and_caching()
     test_banner_mask_does_not_blank_the_tile()
+    test_frame_endpoint_safety_and_caching()
+    test_frame_banner_is_masked()
+    test_every_queue_item_frame_url_resolves()
     print("=======================")
     if _FAILED:
         print(f"{_FAILED} check(s) FAILED")
