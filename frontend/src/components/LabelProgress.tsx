@@ -54,17 +54,21 @@ const HAIRLINE = "var(--lbl-line, rgba(255, 255, 255, 0.09))";
     and owned by the page (the queue, the flag queue and the per-item clock all
     live there). */
 export interface LabelStream {
-  /** Instances answered today. */
-  doneToday: number;
-  /** What today can still yield — done plus what the queue can still serve.
-      0 renders the bar empty rather than dividing by zero. */
-  targetToday: number;
+  /** Instances this annotator has answered, ALL TIME. Read from the server's
+      persisted effort stats, never from the in-memory tape: the tape resets on
+      every reload, so a session counter showed a returning annotator 0 next to
+      work they had actually done and could still see in the store. */
+  done: number;
+  /** done plus what the queue can still serve to this annotator. 0 renders the
+      bar empty rather than dividing by zero. */
+  target: number;
   /** Per-instance ACTIVE durations in ms, newest first (Label.tsx's
       activeElapsedMs, which banks tab-away time). Only the first
       ROLLING_WINDOW are read; the panel owns the arithmetic so the printed
       window and the computed window are the same number. */
   recentMs: readonly number[];
-  /** Items flagged today (§3.9). */
+  /** Items this annotator has flagged, ALL TIME, from the same persisted
+      stats as `done` and for the same reason (§3.9). */
   flags: number;
   /** Flagged items still owing their written explanation. The session cannot
       be marked complete while this is non-zero. */
@@ -160,7 +164,7 @@ export function LabelProgress({
 }: LabelProgressProps) {
   const shown = visibleGroups(groups);
   const rate = itemsPerMinute(stream.recentMs);
-  const fraction = stream.targetToday > 0 ? stream.doneToday / stream.targetToday : 0;
+  const fraction = stream.target > 0 ? stream.done / stream.target : 0;
   // Space is a HOLD, not an action with a class binding, so LABEL_ACTIONS does
   // not carry it (§3.7). Print it here anyway — this legend is the only place
   // the bindings are written down — but check first, so that if the key map
@@ -198,10 +202,10 @@ export function LabelProgress({
       <Block title="My stream">
         <div className="flex items-baseline gap-1.5">
           <span className="font-mono text-[20px] tabular-nums leading-none" style={{ color: INK }}>
-            {stream.doneToday.toLocaleString()}
+            {stream.done.toLocaleString()}
           </span>
           <span className="text-[12px]" style={{ color: INK_DIM }}>
-            / {stream.targetToday.toLocaleString()} today
+            / {stream.target.toLocaleString()} labeled
           </span>
           <span className="ml-auto font-mono text-[11px] tabular-nums" style={{ color: INK_DIM }}>
             {pct(fraction)}

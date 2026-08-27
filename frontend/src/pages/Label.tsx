@@ -1114,7 +1114,7 @@ export default function Label() {
                   ? "release Space"
                   : clean
                     ? "release H"
-                    : "hold Space full frame · H clean"}
+                    : "hold Space full frame · H clean · F flag"}
               </div>
             ) : null}
           </div>
@@ -1327,14 +1327,18 @@ export default function Label() {
           <LabelProgress
             groups={groups}
             stream={{
-              doneToday: tape.frontier,
-              // What today can still yield: what this session has answered plus
-              // what the queue says is still servable to ME. A corpus-coverage
-              // bar was removed on purpose (§7) — it is a number the annotator
+              // The SERVER's count, not the tape's. `tape.frontier` is how many
+              // items this MOUNT has answered, so it is 0 after every reload —
+              // which showed an annotator who had genuinely labeled work a flat
+              // 0, next to a store that still held it. The tape is the right
+              // thing for navigation and the wrong thing for a scoreboard.
+              done: stats?.my_labeled ?? 0,
+              // ...plus what the queue can still serve ME. A corpus-coverage bar
+              // was removed on purpose (§7) — it is a number the annotator
               // cannot move.
-              targetToday: tape.frontier + (stats?.remaining ?? 0),
+              target: (stats?.my_labeled ?? 0) + (stats?.remaining ?? 0),
               recentMs,
-              flags: flagCount,
+              flags: stats?.my_skipped ?? flagCount,
               // Always zero: decision 6 makes the written explanation mandatory
               // at flag time, so there is no deferred-notes queue to owe.
               pendingNotes: 0,
@@ -1410,11 +1414,12 @@ function Shimmer() {
     have been advertised under the wrong name. */
 function KeyLegend() {
   // "close" has never been listed: Escape is discoverable from the thing it
-  // closes. "inspect" and "clean" are not listed EITHER, because the crop
-  // already carries them — the chip sits on the photograph, which is where the
-  // eye is when either hold is worth reaching for, and printing them again two
-  // rows down was the same sentence twice on one card.
-  const HELD_ON_CROP = new Set(["inspect", "clean"]);
+  // closes. "inspect", "clean" and "flag" are not listed EITHER, because the
+  // crop already carries them — the chip sits on the photograph, which is where
+  // the eye is when any of the three is worth reaching for, and printing them
+  // again two rows down was the same sentence twice on one card. What is left
+  // here is exactly the tape: back and next.
+  const HELD_ON_CROP = new Set(["inspect", "clean", "flag"]);
   const shown = LABEL_ACTIONS.filter(
     (a) => a.action !== "close" && !HELD_ON_CROP.has(a.action),
   );
