@@ -228,7 +228,8 @@ OUTCOMES: tuple[str, ...] = ("labeled", "skipped", "undone")
 # A skip is a judgement about the instance, not a failure to answer: `multiple_cows`
 # in particular is a direct signal that the crop padding or the detector merged two
 # animals, which is why skips are annotations and not a 400.
-SKIP_REASONS: tuple[str, ...] = ("bad_crop", "no_cow", "multiple_cows", "occluded", "other")
+SKIP_REASONS: tuple[str, ...] = ("bad_crop", "no_cow", "multiple_cows", "occluded",
+                                 "low_resolution", "other")
 
 # The class-icon vocabulary. `label_classes.icon` stores a NAME from this tuple and
 # nothing else. Powerusers add classes at runtime, so the icon cannot be hardcoded
@@ -240,7 +241,8 @@ SKIP_REASONS: tuple[str, ...] = ("bad_crop", "no_cow", "multiple_cows", "occlude
 # the frontend also falls back to it for NULL and for any name it does not know, so
 # a value this list once contained can never break the renderer.
 CLASS_ICONS: tuple[str, ...] = (
-    "shade", "sun", "eye-off", "question", "grass", "lying", "standing", "probe", "dot",
+    "shade", "sun", "eye-off", "question", "grass", "lying", "standing", "probe", "pixels",
+    "dot",
 )
 
 EVENT_KINDS: tuple[str, ...] = (
