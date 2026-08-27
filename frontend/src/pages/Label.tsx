@@ -3,7 +3,6 @@ import { Link } from "react-router-dom";
 import { canManageData, useAuth } from "../lib/auth";
 import type {
   InstanceAnchor,
-  LabelClass,
   LabelFlagReq,
   LabelGroup,
   LabelInputMode,
@@ -28,8 +27,6 @@ import { InstanceCrop } from "../components/InstanceCrop";
 import { PANEL_H, QuestionPanel } from "../components/QuestionPanel";
 import { TILE_GAP, TILE_H, TILE_W } from "../components/OptionTile";
 import { LabelProgress } from "../components/LabelProgress";
-import { MAX_RECENT } from "../components/RecentStrip";
-import type { RecentItem } from "../components/RecentStrip";
 
 /* The labeling screen (docs/roadmap/M3_labeling_ux.md; data model in
  * docs/roadmap/M3_labeling.md §5).
@@ -98,11 +95,9 @@ const FOOTER_H = 32;
 const CARD_PAD = 16;
 const CROP_GAP = 8;
 const PANEL_GAP = 10;
-// Space-hold (§2.4) blows the crop up to the full column height. It is a
-// transform, never a resize: reflowing the panel under the annotator's hand is
-// the mis-click this whole redesign is about.
-const INSPECT_CHROME = 150;
-const INSPECT_MAX_SCALE = 1.75;
+// Space-hold (§2.4, revised) no longer scales the crop: it overlays the WHOLE
+// frame, which is a different image at a different aspect ratio, so there is no
+// scale factor to compute. The crop column keeps its geometry untouched.
 
 // Refetch when this few items remain AHEAD of the cursor — early enough that the
 // next batch lands before the annotator drains what is left.
@@ -114,6 +109,13 @@ const PREFETCH_AHEAD = 3;
 // visible to the queue scan yet, and being served an item we answered seconds
 // ago reads as a bug even when it is only a race.
 const RECENT_CAP = 100;
+
+// How many answered items stay on the tape behind the cursor, WITH their
+// answers, so ArrowLeft re-shows and re-edits them with no round trip
+// (Prodigy ships history_length: 10). This used to live in RecentStrip, but it
+// was never really about the strip: it is the retention depth that decides how
+// far back the undo reaches, and it outlived the thumbnails.
+const MAX_RECENT = 10;
 // Mirrors AnnotationCfg.max_note_chars (config §3.6): the server truncates
 // anyway; matching it here just keeps the annotator from typing past the cap.
 const MAX_NOTE_CHARS = 500;
@@ -127,15 +129,20 @@ const HINT_MS = 2_400;
 // chip is the only thing that says the correction landed.
 const SAVED_CHIP_MS = 800;
 
-const HAIRLINE = "rgba(255, 255, 255, 0.09)";
+const HAIRLINE = "var(--lbl-line, rgba(255, 255, 255, 0.09))";
 const INK = "var(--lbl-ink, #E8EAEC)";
 const INK_DIM = "var(--lbl-ink-dim, #9AA1A7)";
 const CARD = "var(--lbl-card, #1E2124)";
 const TILE = "var(--lbl-tile, #262A2E)";
 const ALARM = "var(--lbl-alarm, #C8CDD2)";
-// The Q1 accent, reused to light the zoom chip while Space is held. Not a third
-// hue (§2.2 forbids one) — it is the warm tone already on screen.
-const ACCENT_WARM = "var(--lbl-q1, #E0A03C)";
+// Chrome drawn ON TOP OF the crop. Deliberately NOT the --lbl-* tokens: those
+// follow the page, and the page is now paper, but the photograph underneath is
+// whatever the camera saw — usually dark. Themed ink here is how the caption
+// went black-on-black the moment the route stopped being dark.
+const ON_IMAGE_INK = "#F2F0EC";
+const ON_IMAGE_ACCENT = "#F0B460";
+const ON_IMAGE_SCRIM = "rgba(12,14,16,0.72)";
+const ON_IMAGE_LINE = "rgba(255,255,255,0.28)";
 
 /* The five frozen flag reasons (types.ts LabelSkipReason), as a tile row bound
    to 1..5. `multiple_cows` in particular is a direct detector-quality signal, so
@@ -251,6 +258,14 @@ export default function Label() {
   const [hint, setHint] = useState<string | null>(null);
   const [shakeNonce, setShakeNonce] = useState(0);
   const [savedChip, setSavedChip] = useState(false);
+  // TWO independent hold-states, deliberately not one mode with a flag.
+  // `clean` (hold H) strips the ring and the scrim at UNCHANGED size, so
+  // occlusion is judged on unobstructed pixels. `inspect` (hold Space) swaps in
+  // the whole uncropped frame and enlarges it, so the animal is judged in its
+  // scene. They answer different questions and compose: holding both is the
+  // clean full frame, which is a legitimate thing to want and costs nothing to
+  // allow.
+  const [clean, setClean] = useState(false);
   const [inspect, setInspect] = useState(false);
   const [failedKey, setFailedKey] = useState<string | null>(null);
 
@@ -264,7 +279,14 @@ export default function Label() {
 
   // Side-panel feedback (§2.5). All of it is per-session and owned here: the
   // corpus-wide LabelStats cannot say how TODAY is going.
-  const [mix, setMix] = useState<Record<string, number>>({});
+  //
+  // The per-class answer MIX that used to live here is gone with the side
+  // panel's mix block. It was never only a display: §6.1 argued the running
+  // share belonged in the panel rather than on the tile faces precisely because
+  // a live percentage at the moment of choice nudges the choice. Removing the
+  // readout removes the nudge outright, which is strictly safer for the
+  // statistic; drift is still recoverable after the fact from the stored
+  // answers, which is where the escape-rate monitor (§6.4) reads it from.
   const [recentMs, setRecentMs] = useState<number[]>([]);
   const [flagCount, setFlagCount] = useState(0);
 
@@ -333,24 +355,8 @@ export default function Label() {
     [activeGroup],
   );
 
-  const definitionClass: LabelClass | null = useMemo(() => {
-    if (openDefinitionKey === null) return null;
-    for (const g of groups) {
-      for (const c of g.classes) if (c.class_key === openDefinitionKey) return c;
-    }
-    return null;
-  }, [groups, openDefinitionKey]);
-
-  const recentItems: RecentItem[] = useMemo(() => {
-    const done = tape.items.slice(0, tape.frontier);
-    return done
-      .slice(-MAX_RECENT)
-      .reverse()
-      .map((it) => ({ instance_key: it.instance_key, crop_url: it.crop_url }));
-  }, [tape]);
 
   const cropPx = clamp(CROP_MIN, viewportH - CROP_CHROME, CROP_MAX);
-  const inspectScale = clamp(1, (viewportH - INSPECT_CHROME) / cropPx, INSPECT_MAX_SCALE);
 
   useEffect(() => {
     const onResize = () => setViewportH(window.innerHeight);
@@ -358,19 +364,10 @@ export default function Label() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // The Label route is the app's ONE dark surface (§2.2), and the argument is
-  // correctness rather than taste: Q1 asks how brightly lit an animal is, and a
-  // near-white page around the photograph biases the judgement. `main` is shared
-  // chrome, so the wrapper cancels its padding with negative margins and the
-  // body colour is set for the mount and restored on the way out — no other
-  // route sees either.
-  useEffect(() => {
-    const previous = document.body.style.backgroundColor;
-    document.body.style.backgroundColor = "#16181A";
-    return () => {
-      document.body.style.backgroundColor = previous;
-    };
-  }, []);
+// The Label route used to repaint the body near-black and cancel `main`'s
+// padding to go full-bleed. Both are gone: the route now uses the app's own
+// paper surface and its normal page rhythm, so there is nothing to override
+// and nothing to restore on the way out.
 
   // ------------------------------------------------------------ nudges & shake
 
@@ -645,7 +642,6 @@ export default function Label() {
           delete forItem[groupKey];
           return { ...prev, [key]: forItem };
         });
-        setMix((m) => ({ ...m, [classKey]: Math.max(0, (m[classKey] ?? 0) - 1) }));
         // class_key null, replaced_class_key set: a clear is still a within-item
         // correction and A8 has to be able to count it.
         emitDecisionEvent({
@@ -675,19 +671,12 @@ export default function Label() {
         // Q1 skipped past Q2 and moved on. Here the correction is saved in place
         // and the annotator leaves with ArrowRight, deliberately.
         if (previous !== undefined) {
-          setMix((m) => ({
-            ...m,
-            [previous]: Math.max(0, (m[previous] ?? 0) - 1),
-            [classKey]: (m[classKey] ?? 0) + 1,
-          }));
           postLabelEvent({
             session_id: sessionId,
             kind: "relabel",
             instance_key: key,
             class_key: classKey,
           }).catch(() => {});
-        } else {
-          setMix((m) => ({ ...m, [classKey]: (m[classKey] ?? 0) + 1 }));
         }
         if (isComplete(next)) {
           commitAnswers(item, next, mode);
@@ -700,10 +689,9 @@ export default function Label() {
         return;
       }
 
-      setMix((m) => ({ ...m, [classKey]: (m[classKey] ?? 0) + 1 }));
       const nextStep = firstUnansweredIndex(next);
       if (nextStep !== null) {
-        setStep(nextStep); // the handoff — same rectangle, digits rebound (§3.4)
+        setStep(nextStep); // the handoff — same rectangle, letters rebound (§3.4)
         return;
       }
       commitAnswers(item, next, mode);
@@ -830,7 +818,14 @@ export default function Label() {
     const mark = activeNow();
     itemMarkRef.current = mark;
     groupMarkRef.current = mark;
+    // Both holds reset on a new item (§3.2): a hold that survived the advance
+    // would apply to a cow the annotator has not looked at yet.
     setInspect(false);
+    setClean(false);
+    // A popover must not survive the advance: the same class_key exists in the
+    // next item, so it would silently reappear anchored to a cow nobody opened
+    // it for.
+    setOpenDefinitionKey(null);
     const t = tapeRef.current;
     emitDecisionEvent({
       session_id: sessionId,
@@ -896,6 +891,17 @@ export default function Label() {
       return;
     }
 
+    // H is the same shape of affordance as Space and is handled in the same
+    // place, BEFORE resolveLabelKey, for the same reason: this is a keydown/keyup
+    // pair the page owns, not a one-shot action the table can dispatch. It is
+    // listed in LABEL_ACTIONS purely so every legend advertises it.
+    if (e.key === "h" || e.key === "H") {
+      if (!plain) return;
+      e.preventDefault();
+      if (!e.repeat) setClean(true);
+      return;
+    }
+
     // How many digits are live right now. In the flag row it is the five
     // reasons; on the explanation step it is none (and the textarea has focus
     // anyway); otherwise it is the ACTIVE question's options, and only that
@@ -930,6 +936,7 @@ export default function Label() {
           return;
         case "close":
           return; // Escape is handled above, before the typing guard
+        case "clean":
         case "inspect":
           // Unreachable: the Space keydown/keyup pair is handled further up, so
           // this table is never consulted for it. The case exists because the
@@ -954,6 +961,7 @@ export default function Label() {
 
   const onKeyUp = (e: KeyboardEvent) => {
     if (e.key === " ") setInspect(false);
+    if (e.key === "h" || e.key === "H") setClean(false);
   };
 
   useEffect(() => {
@@ -964,9 +972,14 @@ export default function Label() {
   useEffect(() => {
     const down = (e: KeyboardEvent) => keydownRef.current(e);
     const up = (e: KeyboardEvent) => keyupRef.current(e);
-    // Alt-tabbing away with Space held would otherwise leave the crop enlarged
-    // and the scrim lifted for good.
-    const onBlur = () => setInspect(false);
+    // Alt-tabbing away with a hold key down would otherwise leave the crop
+    // enlarged, or the scrim lifted, for good. BOTH holds are released: with two
+    // of them a stuck one is twice as likely, and no key the annotator can press
+    // would clear it.
+    const onBlur = () => {
+      setInspect(false);
+      setClean(false);
+    };
     window.addEventListener("keydown", down, { capture: true });
     window.addEventListener("keyup", up, { capture: true });
     window.addEventListener("blur", onBlur);
@@ -1060,15 +1073,12 @@ export default function Label() {
             style={{
               width: cropPx,
               height: cropPx,
-              transform: inspect ? `scale(${inspectScale})` : undefined,
-              transformOrigin: "top center",
-              transition: "transform 120ms ease-out",
               zIndex: inspect ? 5 : undefined,
             }}
           >
             <InstanceCrop
               item={current}
-              hideRing={inspect}
+              hideRing={clean || inspect}
               onError={(k) => {
                 // A late error from an item already advanced past must not blank
                 // the item now on screen — that is why the key rides along.
@@ -1090,19 +1100,67 @@ export default function Label() {
               <div
                 className="absolute left-2 bottom-2 flex items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px] pointer-events-none select-none"
                 style={{
-                  background: "rgba(12,14,16,0.72)",
-                  color: inspect ? ACCENT_WARM : INK,
-                  border: `1px solid ${inspect ? ACCENT_WARM : "rgba(255,255,255,0.18)"}`,
+                  background: ON_IMAGE_SCRIM,
+                  color: inspect ? ON_IMAGE_ACCENT : ON_IMAGE_INK,
+                  border: `1px solid ${inspect ? ON_IMAGE_ACCENT : ON_IMAGE_LINE}`,
                   transition: "color 120ms ease-out, border-color 120ms ease-out",
                 }}
               >
                 <ZoomGlyph />
-                {inspect ? "release Space" : "hold Space to zoom"}
+                {inspect
+                  ? "release Space"
+                  : clean
+                    ? "release H"
+                    : "hold Space full frame · H clean"}
               </div>
             ) : null}
           </div>
         </div>
 
+        {/* HOLD SPACE = the WHOLE frame (§2.4, revised). The square crop answers
+            "what is this animal doing"; sun exposure is judged from the SURROUNDINGS,
+            and a padded square is not the surroundings. The frame is a fixed overlay
+            rather than a bigger crop because the two have different aspect ratios --
+            letterboxing a 16:9 frame into the square box would waste most of the
+            height the affordance exists to buy. Nothing under it reflows: the crop
+            column keeps its geometry and simply sits beneath.
+        
+            The image is banner-masked SERVER-side (/api/img/label-frame), exactly
+            like the crop. That is not incidental: a full frame shows MORE of the
+            burned-in Brinno clock than any crop of it, and the clock time predicts
+            the sun answer outright. */}
+        {inspect && !cropFailed ? (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none"
+            style={{ background: "rgba(12,14,16,0.92)" }}
+          >
+            <img
+              src={current.frame_url}
+              alt=""
+              className="max-w-[94vw] max-h-[88vh] object-contain"
+              style={{ boxShadow: "0 0 0 1px rgba(255,255,255,0.22)" }}
+            />
+            <div
+              className="absolute left-4 bottom-4 flex items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px]"
+              style={{
+                background: ON_IMAGE_SCRIM,
+                color: ON_IMAGE_ACCENT,
+                border: `1px solid ${ON_IMAGE_ACCENT}`,
+              }}
+            >
+              <ZoomGlyph />
+              release Space
+            </div>
+          </div>
+        ) : null}
+        
+        {/* Decoded while the annotator is still answering, so the hold is instant
+            rather than a grey flash on a full-resolution JPEG. Same trick the crop
+            prefetch already uses; the ETag makes the overlay's own load a cache hit. */}
+        {!cropFailed ? (
+          <img src={current.frame_url} alt="" aria-hidden="true" className="hidden" />
+        ) : null}
+        
         {cropFailed ? (
           // Terminal state 3: the image is missing or the server refused it
           // (e.g. a mostly-banner crop, §4.5). F records that and moves on.
@@ -1131,6 +1189,7 @@ export default function Label() {
               openDefinitionKey={openDefinitionKey}
               onSelect={(g, c) => applyAnswer(g, c, "mouse")}
               onOpenDefinition={onOpenDefinition}
+              onCloseDefinition={() => setOpenDefinitionKey(null)}
               shakeNonce={shakeNonce}
             />
           )}
@@ -1208,25 +1267,8 @@ export default function Label() {
   return (
     <div
       data-surface="label"
-      /* Negative margins cancel `main`'s py-10/sm:py-12 and px-6/sm:px-10 so the
-         dark surface is full-bleed and the page padding becomes §2.2's py-4.
-         App.tsx's shell is shared by every other route and is deliberately not
-         touched. */
-      className="-mx-6 sm:-mx-10 -my-10 sm:-my-12 px-6 sm:px-10 py-4"
       style={{
-        background: "var(--lbl-bg, #16181A)",
         color: INK,
-        // height, NOT minHeight, plus a clip: §2.1's rule is that the per-item
-        // loop never requires a scroll, and the crop already sizes itself by
-        // subtraction to honour that. But the side column is naturally longer
-        // than any laptop, and while the surface could merely GROW, the page
-        // scrollbar it produced put the answer tiles below the fold on a
-        // 1366x768 screen — the exact defect the redesign exists to remove.
-        // Pinning the surface to the viewport makes that structural rather than
-        // a number that has to be re-tuned every time the panel gains a row;
-        // the panel scrolls inside itself instead (LabelProgress).
-        height: "calc(100vh - var(--app-header-h))",
-        overflow: "hidden",
       }}
     >
       <style>{PAGE_CSS}</style>
@@ -1293,15 +1335,6 @@ export default function Label() {
               // Always zero: decision 6 makes the written explanation mandatory
               // at flag time, so there is no deferred-notes queue to owe.
               pendingNotes: 0,
-            }}
-            mix={mix}
-            definition={definitionClass}
-            onClearDefinition={() => setOpenDefinitionKey(null)}
-            recent={recentItems}
-            currentKey={reviewing ? currentKey : null}
-            onJumpToRecent={(key) => {
-              const at = tapeRef.current.items.findIndex((i) => i.instance_key === key);
-              if (at >= 0) goTo(at);
             }}
           />
         </div>
@@ -1373,7 +1406,15 @@ function Shimmer() {
     ternary that fell through to "next", so any binding added to the table would
     have been advertised under the wrong name. */
 function KeyLegend() {
-  const shown = LABEL_ACTIONS.filter((a) => a.action !== "close");
+  // "close" has never been listed: Escape is discoverable from the thing it
+  // closes. "inspect" and "clean" are not listed EITHER, because the crop
+  // already carries them — the chip sits on the photograph, which is where the
+  // eye is when either hold is worth reaching for, and printing them again two
+  // rows down was the same sentence twice on one card.
+  const HELD_ON_CROP = new Set(["inspect", "clean"]);
+  const shown = LABEL_ACTIONS.filter(
+    (a) => a.action !== "close" && !HELD_ON_CROP.has(a.action),
+  );
   return (
     <span>
       {shown.map((a, i) => (

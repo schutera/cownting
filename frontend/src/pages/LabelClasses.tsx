@@ -16,7 +16,7 @@ import {
   updateLabelClass,
   updateLabelGroup,
 } from "../lib/api";
-import { numberKeysFor, visibleClasses, visibleGroups } from "../lib/labelKeys";
+import { optionKeysFor, visibleClasses, visibleGroups } from "../lib/labelKeys";
 import { Button, Card, INPUT_CLS, Kbd, SectionLabel } from "../components/ui";
 import { ClassIcon } from "../components/ClassIcon";
 
@@ -272,12 +272,12 @@ function GroupCard({
   run: Run;
 }) {
   const [editOpen, setEditOpen] = useState(false);
-  // Rows and badges both come off visibleClasses(), via numberKeysFor() for the
+  // Rows and badges both come off visibleClasses(), via optionKeysFor() for the
   // second — the digits are POSITIONAL, so rendering a different order than the
   // keymap computed would make every badge a quiet lie.
   const activeClasses = visibleClasses(group);
   const archivedClasses = ordered(group.classes.filter((c) => !c.active), (c) => c.class_key);
-  const keyByClass = new Map(numberKeysFor(group).map((o) => [o.class_key, o.label]));
+  const keyByClass = new Map(optionKeysFor(group).map((o) => [o.class_key, o.label]));
 
   return (
     <Card className="p-5">

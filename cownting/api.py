@@ -1598,6 +1598,79 @@ def create_app(config: Config) -> FastAPI:
             headers["X-Frame-Sig"] = sig
         return Response(content=jpeg, media_type="image/jpeg", headers=headers)
 
+    @app.get("/api/img/label-frame/{camera}/{frame_file}")
+    def img_label_frame(camera: str, frame_file: str, request: Request,
+                        w: int | None = None, dataset: str | None = None):
+        """The WHOLE uncropped frame behind a queue item — what hold-to-peek
+        shows instead of zooming the square crop.
+
+        **Banner-masked exactly like the crop, and that is the point of the
+        route.** A full frame contains MORE of the burned-in Brinno clock strip
+        than any crop of it does, so a plain FileResponse of the JPEG on disk
+        would hand the annotator the wall-clock time on every key-hold — and
+        time of day IS the "Sun exposure" answer (M3 §4.5). The masking is not
+        re-derived here: labeling.render_frame() shares labeling.mask_banner()
+        with render_crop(), so the peek and the tile cannot drift apart about
+        where the band begins.
+
+        Like /api/img/label-crop this is deliberately NOT an extension of
+        /api/img/frame's `kind=`. That endpoint silently falls back to the raw
+        frame on an unknown kind, and here the fallback would serve an UNMASKED
+        frame — a typo in a query string turning into the exact leak this route
+        exists to prevent, with nothing visibly wrong on screen.
+
+        Path safety is label-crop's, unchanged: three whitelists
+        (uploads.valid_camera_id, _safe_frame_file, _safe_path_id) plus the
+        resolve-under-artifacts_dir check. `_safe_frame_file` is a TOTAL
+        whitelist — never loosen it. Auth is the app-wide require_login
+        dependency on the FastAPI() instance, same as every other /api/img/*
+        route; there is no per-route gate to add or forget.
+        """
+        if not uploads_mod.valid_camera_id(camera):
+            raise HTTPException(400, f"invalid camera name {camera!r}")
+        if not _safe_frame_file(frame_file):
+            raise HTTPException(400, f"invalid frame file {frame_file!r}")
+        if dataset is not None and not _safe_path_id(dataset):
+            raise HTTPException(400, f"invalid dataset id {dataset!r}")
+        w_v = labeling.FRAME_MAX_WIDTH if w is None else max(16, min(int(w), 4096))
+
+        p = labeling.frame_path_for(config, dataset, camera, frame_file)
+        root = Path(config.paths.artifacts_dir).resolve()
+        candidate = p.resolve()
+        if candidate != root and root not in candidate.parents:
+            raise HTTPException(400, "invalid path")
+        try:
+            st = candidate.stat()
+        except OSError:
+            # Routine, not exceptional: a re-ingest rmtrees the frames out from
+            # under a queue the client is still holding.
+            raise HTTPException(404, "frame not found")
+
+        # A computed Response gets no validators of its own, and this one is
+        # fetched on a KEY-HOLD: without the 304 fast path every peek would
+        # re-decode and re-encode a full-resolution JPEG. Computed BEFORE any
+        # decode, off the stat alone. `private` is load-bearing — the image is
+        # session-gated and must never be stored by Caddy or a shared proxy. Not
+        # `immutable`: a re-ingest rewrites the JPEG at the same path, and
+        # mtime_ns here is what invalidates it. The literal tag keeps this ETag
+        # from ever colliding with label-crop's over the same file.
+        etag = '"' + hashlib.sha256(repr(
+            ("label-frame", str(candidate), st.st_mtime_ns, st.st_size, w_v,
+             labeling.RENDER_VERSION)
+        ).encode()).hexdigest() + '"'
+        headers = {"ETag": etag, "Cache-Control": "private, max-age=3600"}
+        if etag in (request.headers.get("if-none-match") or ""):
+            return Response(status_code=304, headers=headers)
+
+        jpeg, sig = labeling.render_frame(candidate, max_width=w_v, cfg=config.annotation)
+        if not jpeg:
+            # A missing or torn JPEG comes back as 404, never a 500 and never a
+            # blank image the annotator might read as an empty pen.
+            raise HTTPException(404, "frame unavailable")
+        if sig:
+            headers["X-Frame-Sig"] = sig
+        return Response(content=jpeg, media_type="image/jpeg", headers=headers)
+
     @app.post("/api/label/submit", dependencies=[Depends(require_labeler)])
     def label_submit(body: LabelSubmitReq, request: Request):
         """Record an answer. NEVER opens the main DB (M3 §4.3): the client echoes

@@ -4,8 +4,11 @@
 SQL. This module owns everything that has to touch the *main* DB or the frame
 JPEGs in order to serve an instance: the derived queue scan and its sampling
 policy, the context manager that ATTACHes the label store onto a main-DB
-connection, the pure crop geometry each queue item carries, and the renderer
-behind `/api/img/label-crop`. The import direction is one-way
+connection, the pure crop geometry each queue item carries, and the two renderers
+behind `/api/img/label-crop` and `/api/img/label-frame` (which share one
+banner mask, so the tile and the hold-to-peek frame cannot disagree about how
+much of the burned-in clock the annotator gets to see). The import direction is
+one-way
 (`labeling` -> `labels_db`) and must stay that way: `labels_db` is opened by the
 CLI and the weekly backup job in processes that never build a queue and must not
 drag pandas/PIL/the main DB in behind it.
@@ -59,6 +62,14 @@ _BANNER_TOP = quality._BANNER_CROP
 _FILL = (96, 96, 96)
 
 _JPEG_QUALITY = 88
+
+# Longest edge of the full-frame view behind `/api/img/label-frame`. A frame is
+# ~5-10x the pixels of a crop and it is fetched on a KEY-HOLD, so the raw JPEG
+# would make hold-to-peek feel broken on the first press of every item. 1600 is
+# wide enough that the whole field of view stays readable on a laptop and still
+# roughly a quarter of the bytes. Not in AnnotationCfg: it is a rendering detail
+# of one route, and RENDER_VERSION already covers changing it.
+FRAME_MAX_WIDTH = 1600
 
 # The client sends back the keys already in its buffer instead of an offset (§4.2).
 # Capped because it arrives in a query string from a session that `require_labeler`
@@ -530,6 +541,13 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         "crop_url": crop_url(camera_id=row["camera_id"], frame_file=frame_file,
                              bbox=bbox, dataset_id=row["dataset_id"],
                              pad=cfg.crop_pad, max_width=cfg.crop_max_width),
+        # The uncropped frame behind the same instance, for hold-to-peek. Built
+        # here for crop_url's reason, which is not a style preference: a
+        # client-built URL routes through lib/api.ts's withDs() and would 404
+        # every item whose day is not the selected one. Banner-masked by its
+        # route, so the peek leaks no more clock time than the crop does.
+        "frame_url": frame_url(camera_id=row["camera_id"], frame_file=frame_file,
+                               dataset_id=row["dataset_id"]),
         "crop_w": out,
         "crop_h": out,
         "ring": [round(v, 2) for v in ring],
@@ -565,6 +583,35 @@ def crop_url(*, camera_id: str, frame_file: str, bbox: Sequence[float],
     params += [("x1", repr(x1)), ("y1", repr(y1)), ("x2", repr(x2)), ("y2", repr(y2)),
                ("pad", repr(float(pad))), ("w", str(int(max_width)))]
     return (f"/api/img/label-crop/{quote(camera_id, safe='')}/{quote(frame_file, safe='')}"
+            f"?{urlencode(params)}")
+
+
+def frame_url(*, camera_id: str, frame_file: str, dataset_id: str | None = None,
+              max_width: int = FRAME_MAX_WIDTH) -> str:
+    """The `/api/img/label-frame/...` URL for one instance, built SERVER-side.
+
+    Same rule as `crop_url` and for the same reason: the frontend must NEVER
+    construct this. Every image URL `lib/api.ts` builds goes through `withDs()`,
+    which stamps the currently-selected day onto any `/api/` URL — and the queue
+    is cross-day by design, so a client-built URL would 404 the moment the
+    annotator holds space on an item from any day but the selected one. The
+    failure would be invisible on the happy path (single-day dataset, local
+    testing) and total in production.
+
+    `dataset` is carried exactly as `crop_url` carries it: omitted entirely when
+    the row has no dataset_id, so the pre-dataset flat layout in
+    `frame_path_for` is still reachable rather than being sent an empty segment.
+
+    `w` rides in the URL rather than being implied by the server so the ETag the
+    route computes covers the size the client actually asked for, and so bumping
+    FRAME_MAX_WIDTH changes the URL instead of silently reusing cached pixels at
+    the old width.
+    """
+    params: list[tuple[str, str]] = []
+    if dataset_id:
+        params.append(("dataset", dataset_id))
+    params.append(("w", str(int(max_width))))
+    return (f"/api/img/label-frame/{quote(camera_id, safe='')}/{quote(frame_file, safe='')}"
             f"?{urlencode(params)}")
 
 
@@ -633,6 +680,48 @@ def frame_path_for(config: Config, dataset_id: str | None, camera_id: str,
     return base / "frames" / camera_id / frame_file
 
 
+def mask_banner(canvas, *, frame_h: int, y0: int, cfg: AnnotationCfg) -> float:
+    """Paint the Brinno timestamp band over `canvas`; return the fraction covered.
+
+    `canvas` is any RGB image cut from a frame `frame_h` pixels tall whose top row
+    is full-frame row `y0` — the crop's padded square (`y0` = the square's origin,
+    which may be negative) or a whole frame (`y0` = 0). The band's first row is
+    fixed in FULL-FRAME coordinates and translated into canvas coordinates here,
+    which is the only reason one function can serve both views.
+
+    Factored out of `render_crop` when `/api/img/label-frame` was added rather
+    than copied into it. A full frame shows MORE of the burned-in clock than any
+    crop does, and two copies of this arithmetic is exactly how one view starts
+    leaking the wall-clock time while the other stays masked. Time of day IS the
+    "Sun exposure" answer (§4.5), so a drift here inflates agreement instead of
+    failing visibly — nothing about the output looks wrong.
+
+    Returns the covered fraction of the canvas height so each caller can decide
+    what a mostly-banner result means: `render_crop` refuses it outright rather
+    than serve an all-grey tile; `render_frame` cannot reach that case, since the
+    band is ~4% of a full frame by construction. Returns 0.0 and paints nothing
+    when masking is configured off, so the refusal test stays a plain comparison.
+
+    Mutates `canvas` in place and must run BEFORE any downscale: the band's first
+    row is derived from the frame's own height, so resizing first moves the line
+    out from under it.
+    """
+    if not cfg.mask_timestamp_banner:
+        return 0.0
+    cw, ch = canvas.size
+    # `start` may be NEGATIVE — these cameras look down and the herd crosses the
+    # bottom of the field of view, so a padded crop of a low cow can begin BELOW
+    # the band line. The max(0, ...) clamp below is what makes that case paint the
+    # whole canvas, which is why the covered fraction is reported rather than
+    # swallowed.
+    start = int(frame_h * _BANNER_TOP) - y0
+    if start >= ch:
+        return 0.0
+    top = max(0, start)
+    canvas.paste(_FILL, (0, top, cw, ch))
+    return (ch - top) / ch
+
+
 def render_crop(frame_path: str | Path, bbox: Sequence[float], *, pad: float,
                 max_width: int, cfg: AnnotationCfg) -> tuple[bytes, str | None]:
     """Cut the padded square out of one frame, mask the Brinno banner, encode JPEG.
@@ -683,24 +772,81 @@ def render_crop(frame_path: str | Path, bbox: Sequence[float], *, pad: float,
     except Exception:  # noqa: BLE001 — a torn/half-written JPEG is a 404, not a 500
         return b"", sig
 
-    if cfg.mask_timestamp_banner:
-        # In full-frame coordinates: every row at or below H * 0.96 that falls
-        # inside the source square. `start` may be NEGATIVE — these cameras look
-        # down and the herd crosses the bottom of the field of view, so a padded
-        # crop of a low cow can begin BELOW the band line. The max(0, ...) guard
-        # alone then paints the entire tile grey and the annotator's honest
-        # "Not visible" is recorded as genuine ambiguity about a real animal:
-        # fabricated ambiguity contaminating exactly the statistic this feature
-        # exists to produce. So measure the covered fraction and refuse outright.
-        start = int(h * _BANNER_TOP) - y0
-        if start < n:
-            top = max(0, start)
-            canvas.paste(_FILL, (0, top, n, n))
-            if (n - top) / n > cfg.max_banner_fraction:
-                return b"", sig
+    # Shared with render_frame so the two views of the same pixels cannot drift
+    # apart on where the band starts. Before the resize, deliberately.
+    if mask_banner(canvas, frame_h=h, y0=y0, cfg=cfg) > cfg.max_banner_fraction:
+        # A crop of a cow below the band line comes back entirely grey once the
+        # mask is clamped to the canvas, and the annotator's honest "Not visible"
+        # is then recorded as genuine ambiguity about a real animal: fabricated
+        # ambiguity contaminating exactly the statistic this feature exists to
+        # produce. So refuse outright rather than serve a blank tile.
+        return b"", sig
 
     if out != n:
         canvas = canvas.resize((out, out), Image.LANCZOS)
+    buf = BytesIO()
+    canvas.save(buf, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
+    return buf.getvalue(), sig
+
+
+def render_frame(frame_path: str | Path, *, max_width: int,
+                 cfg: AnnotationCfg) -> tuple[bytes, str | None]:
+    """The WHOLE frame, banner-masked and downscaled, as JPEG — hold-to-peek's image.
+
+    Returns `(jpeg_bytes, frame_sig)` on `render_crop`'s contract exactly:
+    **empty bytes is the only failure channel and always means 404**, because a
+    frame vanishing mid-session (a re-ingest rmtrees `artifacts/<dataset_id>`) is
+    routine here, never a 500 and never a blank image.
+
+    The banner mask is the entire reason this is a rendered route rather than a
+    `FileResponse` of the JPEG already on disk. A full frame contains MORE of the
+    burned-in Brinno clock strip than any crop of it does, so serving the file
+    raw would hand the annotator the wall-clock time — which IS the "Sun
+    exposure" answer (§4.5) — every single time they hold the key, and would do
+    it invisibly. It goes through `mask_banner`, the one place the band geometry
+    lives, so the peek and the crop can never disagree about where the band
+    starts.
+
+    No mostly-banner refusal: the band is ~4% of a frame's height by
+    construction, so `render_crop`'s all-grey-tile failure mode cannot arise here
+    and refusing would only be dead code pretending to be a guard.
+
+    Masking runs at FULL resolution, before the downscale, exactly as in
+    `render_crop`: the band's first row comes from the frame's own height, so
+    resizing first would move the line out from under the mask.
+
+    Aspect ratio is preserved and the image is only ever made smaller — `w` is a
+    ceiling, not a target — so a narrow frame is served at its native size rather
+    than being upscaled into blur.
+    """
+    from PIL import Image
+
+    p = Path(frame_path)
+    # One pass for the fingerprint, from the bytes we are opening anyway (§2.3).
+    try:
+        with open(p, "rb") as f:
+            head = f.read(labels_db.FRAME_SIG_BYTES)
+            size = f.seek(0, 2)
+    except OSError:
+        return b"", None
+    sig = labels_db.frame_sig_of(size, head)
+    try:
+        with Image.open(p) as opened:
+            # convert() copies, so the canvas outlives the closed file handle and
+            # is safe to paste the mask onto.
+            canvas = opened.convert("RGB")
+    except Exception:  # noqa: BLE001 — a torn/half-written JPEG is a 404, not a 500
+        return b"", sig
+
+    w, h = canvas.size
+    # y0=0: the canvas IS the frame, so canvas rows and full-frame rows coincide.
+    mask_banner(canvas, frame_h=h, y0=0, cfg=cfg)
+
+    if max_width > 0 and w > max_width:
+        # floor(v + 0.5), never round(): banker's rounding is not what the rest of
+        # this module's geometry uses (see crop_geometry).
+        out_h = max(1, int(math.floor(h * (float(max_width) / w) + 0.5)))
+        canvas = canvas.resize((max_width, out_h), Image.LANCZOS)
     buf = BytesIO()
     canvas.save(buf, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
     return buf.getvalue(), sig
