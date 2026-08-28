@@ -42,6 +42,17 @@ _FAILED = 0
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
+    """Record one assertion.
+
+    Standalone (`python tests/test_labels_api.py`) this PRINTS every check and
+    `main()` exits non-zero at the end, so one run shows every failure at once —
+    which is the point of the style.
+
+    Under pytest it must also RAISE, and that is not a nicety: a check that only
+    prints is invisible to a test runner, so `pytest -q` reported this file as
+    fully passing while four assertions inside it were failing. A test that
+    cannot fail is not a test, and it is worse than none — it is a green tick
+    that means nothing."""
     global _FAILED
     status = "ok " if cond else "FAIL"
     line = f"[{status}] {name}"
@@ -50,6 +61,8 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     print(line)
     if not cond:
         _FAILED += 1
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            raise AssertionError(line)
 
 
 # The frozen §5.3 item shape LabelItem mirrors. Every key must be present on
@@ -885,6 +898,69 @@ def test_ok_verdict_is_a_measurement_not_a_noop():
             lc.close()
 
 
+def test_ok_never_destroys_my_own_correction():
+    """REGRESSION. `mask_edits`' supersede matches on (annotator, key) with no
+    `kind` predicate, so a later 'ok' used to wipe an earlier corrected polygon —
+    silently, and by the single most-pressed key on the screen.
+
+    The path is the ordinary one, not a corner case: correct an outline, leave
+    the questions unanswered (a correction retires nothing, by design), reload.
+    The instance is served again, the geometry step asks again, the annotator
+    presses Enter — and the correction they made ten seconds ago is gone from
+    v_current_mask_edits, from the queue's join and from any future export, with
+    nothing on screen to say so.
+
+    The rule: an 'ok' is the WEAKEST verdict — it endorses what the model drew.
+    It must never overrule a stronger statement the same annotator has already
+    made about the same instance."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        item = client.get("/api/label/queue").json()["items"][0]
+        tri = [[10.0, 10.0], [40.0, 12.0], [25.0, 44.0]]
+        check("correcting the outline -> 200",
+              _mask_fix(client, item, polygon=tri).status_code == 200)
+
+        # ...the annotator reloads and the geometry step asks again.
+        r = client.post("/api/label/mask-fix", json={
+            "instance_key": item["instance_key"], "anchor": _anchor(item),
+            "kind": "ok", "polygon": None, "seeded_from": "mask"})
+        check("pressing Enter on an already-corrected instance -> 200",
+              r.status_code == 200, r.text[:160])
+
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            rows = lc.execute(
+                "SELECT kind, polygon FROM mask_edits WHERE instance_key = ? "
+                "AND superseded_at IS NULL", [item["instance_key"]]).fetchall()
+            check("the correction is STILL the current verdict",
+                  len(rows) == 1 and rows[0][0] == "polygon" and rows[0][1],
+                  str(rows))
+        finally:
+            lc.close()
+
+        # And it must still ride the queue item, or the editor reseeds from the
+        # box and the annotator's work is invisible even though it is stored.
+        again = [i for i in client.get("/api/label/queue").json()["items"]
+                 if i["instance_key"] == item["instance_key"]]
+        check("...and still comes back on the item",
+              again and again[0]["mask"] is not None and again[0]["mask_seed"] == "mask",
+              str(again[0]["mask_seed"] if again else "gone"))
+
+        # A false positive is also stronger than 'ok': confirming afterwards must
+        # not resurrect a detection someone judged not to be an animal.
+        item2 = [i for i in client.get("/api/label/queue").json()["items"]
+                 if i["instance_key"] != item["instance_key"]][0]
+        client.post("/api/label/mask-fix", json={
+            "instance_key": item2["instance_key"], "anchor": _anchor(item2),
+            "kind": "false_positive", "polygon": None, "seeded_from": "bbox"})
+        client.post("/api/label/mask-fix", json={
+            "instance_key": item2["instance_key"], "anchor": _anchor(item2),
+            "kind": "ok", "polygon": None, "seeded_from": "bbox"})
+        keys = {i["instance_key"] for i in client.get("/api/label/queue").json()["items"]}
+        check("a removed instance stays removed after a later 'ok'",
+              item2["instance_key"] not in keys)
+
+
 def test_crop_frame_coordinate_roundtrip():
     """M4a §4.1: the editor works in crop-local px and the store in full-frame px,
     so the two converters must be exact inverses. A drift here would shear every
@@ -923,10 +999,21 @@ def test_saved_outline_comes_back_on_the_queue_item():
         check("before any edit the item carries no outline",
               item["mask"] is None and item["mask_frame"] is None
               and item["mask_seed"] == "bbox", str(item["mask_seed"]))
-        check("the item carries the frame's original dimensions",
-              isinstance(item["frame_w"], int) and item["frame_w"] > 0
-              and isinstance(item["frame_h"], int) and item["frame_h"] > 0,
+        # The seeded fixture records frame PATHS without writing the JPEGs, so
+        # dimensions are legitimately null there — which is itself the contract
+        # (a frame rmtree'd by a re-ingest must yield null, not a guess, or the
+        # peek would draw its marks in the wrong place). Write a real frame to
+        # exercise the populated branch.
+        check("a missing frame yields null dimensions rather than a guess",
+              item["frame_w"] is None and item["frame_h"] is None,
               f"{item['frame_w']}x{item['frame_h']}")
+        _noise_frame(config.paths.artifacts_dir, item["dataset_id"],
+                     item["frame_file"], w=640, h=480)
+        sized = [i for i in client.get("/api/label/queue").json()["items"]
+                 if i["instance_key"] == item["instance_key"]][0]
+        check("a present frame carries its ORIGINAL dimensions",
+              sized["frame_w"] == 640 and sized["frame_h"] == 480,
+              f"{sized['frame_w']}x{sized['frame_h']}")
 
         tri = [[10.0, 10.0], [40.0, 12.0], [25.0, 44.0]]
         r = _mask_fix(client, item, polygon=tri)
@@ -984,6 +1071,7 @@ def main():
     test_mask_fix_roundtrip_and_validation()
     test_false_positive_retires_the_instance_for_everyone()
     test_ok_verdict_is_a_measurement_not_a_noop()
+    test_ok_never_destroys_my_own_correction()
     test_crop_frame_coordinate_roundtrip()
     test_saved_outline_comes_back_on_the_queue_item()
     test_crop_endpoint_safety_and_caching()

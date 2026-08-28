@@ -1539,6 +1539,37 @@ def submit_mask_edit(
     version = 0
     con.execute("BEGIN TRANSACTION")
     try:
+        # 'ok' IS THE WEAKEST VERDICT and must never overrule a stronger
+        # statement this annotator has already made about this instance.
+        #
+        # The supersede below matches on (annotator, key) and is deliberately
+        # kind-blind — the latest verdict wins — which is right for every pair
+        # EXCEPT this one. The path that made it wrong is the ordinary one: an
+        # outline correction retires nothing (the cow still needs answering), so
+        # an annotator who corrects a mask, does not finish the questions and
+        # reloads is served that instance again, meets the geometry step again,
+        # and presses Enter — the most-pressed key on the screen. That 'ok'
+        # would supersede their own polygon out of v_current_mask_edits, out of
+        # the queue's join and out of every future export, with nothing on
+        # screen to say so. Worse for 'false_positive': a later 'ok' would
+        # RESURRECT a detection somebody judged not to be an animal.
+        #
+        # So an 'ok' arriving over an existing polygon or removal is a NO-OP
+        # that returns the standing verdict. Not a 409: the client is not wrong
+        # and has nothing to fix — it is confirming geometry that is already
+        # settled, and the honest answer is "yes, it is".
+        if kind == "ok":
+            standing = con.execute(
+                "SELECT edit_id FROM mask_edits WHERE annotator = ? "
+                "AND superseded_at IS NULL AND kind IN ('polygon', 'false_positive') "
+                "AND (effective_key = ? OR instance_key = ?) "
+                "ORDER BY submitted_at DESC LIMIT 1",
+                [annotator, effective_key, instance_key],
+            ).fetchone()
+            if standing is not None:
+                con.execute("COMMIT")
+                return int(standing[0])
+
         prev = con.execute(
             "SELECT max(version) FROM mask_edits WHERE instance_key = ? AND annotator = ?",
             [instance_key, annotator],

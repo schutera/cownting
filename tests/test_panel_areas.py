@@ -25,6 +25,11 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     print(f"[{'ok ' if cond else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
     if not cond:
         _FAILED += 1
+        # A check that only prints is invisible to pytest: the file reports
+        # green while assertions inside it fail. `python -m tests` (the
+        # pre-boot gate) counts them, but nothing else does.
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            raise AssertionError(line)
 
 
 def _under_panel(pts, panel_areas, camera_id):
