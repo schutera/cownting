@@ -25,6 +25,7 @@ import type {
   LabelMinePage,
   LabelSubmitReq,
   LabelFlagReq,
+  LabelMaskFixReq,
   LabelEventReq,
   LabelWriteResult,
   LabelGroupReq,
@@ -667,6 +668,18 @@ export function submitLabel(req: LabelSubmitReq): Promise<LabelWriteResult> {
 // server-side). Collapse to one key once the route settles.
 export function flagLabel(req: LabelFlagReq): Promise<LabelWriteResult> {
   return labelWrite<LabelWriteResult>("/api/label/skip", { ...req, note: req.explanation });
+}
+
+// Correct the instance mask, or declare the detection a false positive
+// (docs/roadmap/M4a_instance_mask_fixup.md §4.2). Shares labelWrite so the
+// anchor 400 and the 401 branch behave exactly as the other two writes do; the
+// route's own 409 is `mask_stale` (the model was re-run mid-session), which
+// arrives here as a plain Error rather than TaxonomyStaleError — the questions
+// did not move, only the outline did, and the two need different words on
+// screen. It is not retried for the same reason a stale taxonomy is not: the
+// correction was drawn against a polygon that no longer exists.
+export function submitMaskFix(req: LabelMaskFixReq): Promise<LabelWriteResult> {
+  return labelWrite<LabelWriteResult>("/api/label/mask-fix", req);
 }
 
 // Effort telemetry (session boundaries, info_opened). Fire-and-forget at the call

@@ -316,7 +316,8 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
     a different mode in the same process, and that error text matches none of
     `db.connect`'s retry substrings, so a `read_only` open surfaces as an un-retried
     500."""
-    for seq in ("seq_annotation", "seq_label_event", "seq_taxonomy_audit", "seq_backup_run"):
+    for seq in ("seq_annotation", "seq_label_event", "seq_taxonomy_audit", "seq_backup_run",
+                "seq_mask_edit"):
         con.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq} START 1;")
 
     # A GROUP is a question ("Sun exposure"). Poweruser-editable at runtime and
@@ -444,6 +445,59 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
         );
         """
     )
+    # One row per (instance, annotator, submission) of an OUTLINE judgement
+    # (docs/roadmap/M4a_instance_mask_fixup.md §3). Same append-only discipline as
+    # `annotations` and for the same reason — a second pass is a new version, never
+    # an overwrite — and deliberately a separate table rather than more columns on
+    # `annotations`: an outline correction is not an answer, must not count towards
+    # coverage, and joins to the answers on `instance_key` for free.
+    #
+    # `kind` discriminates: 'polygon' carries the corrected shape, 'false_positive'
+    # carries no geometry at all and says the detection is not an animal. The
+    # vocabulary is frozen in code (not poweruser-editable like the classes),
+    # because each kind has distinct export semantics and its own UI path.
+    #
+    # `polygon` is JSON [[x,y],…] in FULL-FRAME px — the same space as bbox_* and
+    # as scene/regions.py, so no consumer needs a conversion. The crop-local px the
+    # client edits in are converted at the API boundary, in one place.
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mask_edits (
+            edit_id        BIGINT PRIMARY KEY DEFAULT nextval('seq_mask_edit'),
+            instance_key   VARCHAR NOT NULL,
+            effective_key  VARCHAR NOT NULL,
+            key_version    VARCHAR NOT NULL DEFAULT 'v1',
+            annotator      VARCHAR NOT NULL,
+            version        INTEGER NOT NULL DEFAULT 1,
+            superseded_at  TIMESTAMP,
+            kind           VARCHAR NOT NULL DEFAULT 'polygon',
+            polygon        VARCHAR,
+            n_vertices     INTEGER,
+            area_px        DOUBLE,
+            iou_source     DOUBLE,
+            seeded_from    VARCHAR NOT NULL DEFAULT 'mask',
+            mask_rev       VARCHAR,
+            dataset_id     VARCHAR,
+            camera_id      VARCHAR,
+            frame_path     VARCHAR,
+            frame_basename VARCHAR,
+            frame_sig      VARCHAR,
+            bbox_x1 DOUBLE, bbox_y1 DOUBLE, bbox_x2 DOUBLE, bbox_y2 DOUBLE,
+            ordinal        INTEGER NOT NULL DEFAULT 0,
+            session_id     VARCHAR,
+            serve_event_id BIGINT,
+            submitted_at   TIMESTAMP DEFAULT now(),
+            client_elapsed_ms BIGINT,
+            annotator_role      VARCHAR,
+            annotator_real_role VARCHAR,
+            acting_preview BOOLEAN DEFAULT FALSE,
+            auth_disabled  BOOLEAN DEFAULT FALSE,
+            app_version    VARCHAR,
+            client_info    VARCHAR,
+            UNIQUE (instance_key, annotator, version)
+        );
+        """
+    )
     # Append-only effort telemetry. 'served' is the non-forgeable time-on-task clock:
     # it is written server-side by the queue, so a client cannot claim a shorter
     # elapsed time than it actually took.
@@ -543,6 +597,9 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
         ("idx_choice_class", "annotation_choices", "class_key"),
         ("idx_event_at", "label_events", '"at"'),
         ("idx_alias_old", "instance_key_aliases", "old_key"),
+        # The queue's false-positive anti-join runs on every batch, so it gets an
+        # index for the same reason idx_ann_effective has one.
+        ("idx_mask_effective", "mask_edits", "effective_key"),
     ):
         con.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})")
 
@@ -579,6 +636,27 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
                count(*) FILTER (WHERE outcome = 'skipped') AS n_skipped,
                max(submitted_at) AS last_submitted_at
         FROM annotations WHERE superseded_at IS NULL GROUP BY effective_key;
+        """
+    )
+    con.execute(
+        """
+        CREATE OR REPLACE VIEW v_current_mask_edits AS
+        SELECT * FROM mask_edits WHERE superseded_at IS NULL;
+        """
+    )
+    # The instances at least one annotator has declared not-an-animal. This is what
+    # the queue anti-joins on: there are no questions to ask about a false positive,
+    # so it leaves the pool for EVERYONE rather than only for the annotator who
+    # judged it. Nothing is deleted from `detections` — the verdict is a versioned
+    # row, so an undo is a supersede, not a resurrection.
+    con.execute(
+        """
+        CREATE OR REPLACE VIEW v_false_positives AS
+        SELECT effective_key, count(DISTINCT annotator) AS n_annotators,
+               max(submitted_at) AS last_submitted_at
+        FROM mask_edits
+        WHERE superseded_at IS NULL AND kind = 'false_positive'
+        GROUP BY effective_key;
         """
     )
     con.execute(
@@ -1348,6 +1426,157 @@ def submit_annotation(
         con.execute("ROLLBACK")
         raise
     return int(annotation_id)
+
+
+MASK_EDIT_KINDS: tuple[str, ...] = ("polygon", "false_positive")
+
+# Frozen alongside the vocabulary: a polygon below the floor is not a shape, and
+# one above the cap is a freehand trace that would bloat every row and every
+# export. The client simplifies nothing, so this is the only guard.
+MASK_MIN_POINTS = 3
+MASK_MAX_POINTS = 400
+
+
+def polygon_area(poly: Sequence[Sequence[float]]) -> float:
+    """Shoelace area in the polygon's own units. Always positive — winding
+    direction carries no meaning for an instance outline."""
+    if len(poly) < 3:
+        return 0.0
+    acc = 0.0
+    for i, (x1, y1) in enumerate(poly):
+        x2, y2 = poly[(i + 1) % len(poly)]
+        acc += float(x1) * float(y2) - float(x2) * float(y1)
+    return abs(acc) / 2.0
+
+
+def submit_mask_edit(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    instance_key: str,
+    effective_key: str | None = None,
+    annotator: str,
+    kind: str = "polygon",
+    polygon: Sequence[Sequence[float]] | None = None,
+    seeded_from: str = "mask",
+    mask_rev: str | None = None,
+    iou_source: float | None = None,
+    provenance: Mapping[str, Any] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
+) -> int:
+    """Append one outline judgement and supersede this annotator's previous one.
+
+    Mirrors `submit_annotation` deliberately — same append-only rule, same
+    optimistic-concurrency ValueError on the lost UNIQUE race, same explicit
+    transaction, same `effective_key`-supersedes / `instance_key`-versions split
+    — because the two are the same kind of object written by the same people at
+    the same moment, and a second discipline here would be a second set of bugs.
+
+    It is a SEPARATE table rather than an outcome on `annotations`, because an
+    outline correction must not count towards answer coverage: an instance whose
+    shape was fixed still needs its questions answered.
+
+    `polygon` is full-frame px and is stored as JSON. Geometry is validated here
+    rather than trusted from the caller, and `area_px` is computed here for the
+    same reason `iou_source` is computed at the API boundary: they are QC
+    statistics, and a client must not be able to flatter them."""
+    if kind not in MASK_EDIT_KINDS:
+        raise ValueError(f"kind must be one of {MASK_EDIT_KINDS}, got {kind!r}")
+    if seeded_from not in ("mask", "bbox"):
+        raise ValueError(f"seeded_from must be 'mask' or 'bbox', got {seeded_from!r}")
+    if not annotator:
+        raise ValueError("a mask edit needs an annotator")
+
+    poly_json: str | None = None
+    n_vertices: int | None = None
+    area: float | None = None
+    if kind == "polygon":
+        if polygon is None or len(polygon) < MASK_MIN_POINTS:
+            raise ValueError(f"a corrected outline needs at least {MASK_MIN_POINTS} points")
+        if len(polygon) > MASK_MAX_POINTS:
+            raise ValueError(f"an outline may not exceed {MASK_MAX_POINTS} points")
+        pts: list[list[float]] = []
+        for p in polygon:
+            if len(p) != 2:
+                raise ValueError("every outline point must be [x, y]")
+            x, y = float(p[0]), float(p[1])
+            # NaN/inf would poison every downstream area, IoU and export, and
+            # JSON-serialise to a token no strict reader accepts.
+            if not (math.isfinite(x) and math.isfinite(y)):
+                raise ValueError("outline points must be finite")
+            pts.append([x, y])
+        poly_json = json.dumps(pts, separators=(",", ":"))
+        n_vertices = len(pts)
+        area = polygon_area(pts)
+    elif polygon is not None:
+        # Not a nicety: a false positive with geometry would export as both a
+        # dropped instance and a corrected one.
+        raise ValueError("a false-positive verdict carries no polygon")
+
+    prov = _picked(provenance, PROVENANCE_COLS, "provenance")
+    tel = _picked(telemetry, TELEMETRY_COLS, "telemetry")
+    effective_key = effective_key or instance_key
+
+    cols = ["edit_id", "instance_key", "effective_key", "key_version", "annotator",
+            "version", "kind", "polygon", "n_vertices", "area_px", "iou_source",
+            "seeded_from", "mask_rev",
+            "dataset_id", "camera_id", "frame_path", "frame_basename", "frame_sig",
+            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "ordinal",
+            "session_id", "serve_event_id", "client_elapsed_ms",
+            "annotator_role", "annotator_real_role", "acting_preview", "auth_disabled",
+            "app_version", "client_info"]
+
+    edit_id = con.execute("SELECT nextval('seq_mask_edit')").fetchone()[0]
+    version = 0
+    con.execute("BEGIN TRANSACTION")
+    try:
+        prev = con.execute(
+            "SELECT max(version) FROM mask_edits WHERE instance_key = ? AND annotator = ?",
+            [instance_key, annotator],
+        ).fetchone()[0]
+        version = int(prev or 0) + 1
+        con.execute(
+            "UPDATE mask_edits SET superseded_at = now() WHERE annotator = ? "
+            "AND superseded_at IS NULL AND (effective_key = ? OR instance_key = ?)",
+            [annotator, effective_key, instance_key],
+        )
+        values: list[Any] = [
+            edit_id, instance_key, effective_key, KEY_VERSION, annotator,
+            version, kind, poly_json, n_vertices, area,
+            None if iou_source is None else float(iou_source),
+            seeded_from, mask_rev,
+            prov.get("dataset_id"), prov.get("camera_id"), prov.get("frame_path"),
+            prov.get("frame_basename"), prov.get("frame_sig"),
+            prov.get("bbox_x1"), prov.get("bbox_y1"), prov.get("bbox_x2"), prov.get("bbox_y2"),
+            int(prov.get("ordinal") or 0),
+            tel.get("session_id"), tel.get("serve_event_id"), tel.get("client_elapsed_ms"),
+            tel.get("annotator_role"), tel.get("annotator_real_role"),
+            bool(tel.get("acting_preview")), bool(tel.get("auth_disabled")),
+            tel.get("app_version"), tel.get("client_info"),
+        ]
+        con.execute(
+            f"INSERT INTO mask_edits ({', '.join(cols)}) "
+            f"VALUES ({', '.join(['?'] * len(cols))})",
+            values,
+        )
+        _insert_event(
+            con, kind="submitted", session_id=tel.get("session_id"), annotator=annotator,
+            instance_key=instance_key, class_key=None,
+            # There is no stored event kind for an outline yet (EVENT_KINDS is the
+            # server's frozen list), so the discriminator rides in `detail` rather
+            # than inventing a kind the store would reject.
+            detail=f"mask_{kind}",
+        )
+        con.execute("COMMIT")
+    except duckdb.ConstraintException as e:
+        con.execute("ROLLBACK")
+        raise ValueError(
+            f"{annotator!r} already has version {version} of the outline for "
+            f"{instance_key!r} — a concurrent submit won the race; re-fetch and resubmit"
+        ) from e
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    return int(edit_id)
 
 
 def undo_last(

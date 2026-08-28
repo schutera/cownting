@@ -7,9 +7,11 @@ import type {
   LabelGroup,
   LabelInputMode,
   LabelItem,
+  LabelMaskFixReq,
   LabelSkipReason,
   LabelStats,
   LabelSubmitReq,
+  MaskFixKind,
   Taxonomy,
 } from "../lib/types";
 import { getLabelProgress, getLabelQueue, getTaxonomy, postLabelEvent } from "../lib/api";
@@ -24,9 +26,12 @@ import { emitDecisionEvent, useAnswerQueue } from "../lib/useAnswerQueue";
 import type { AnswerQueueSync, LabelWrite } from "../lib/useAnswerQueue";
 import { ClassIcon } from "../components/ClassIcon";
 import { InstanceCrop } from "../components/InstanceCrop";
+import { MaskEditor } from "../components/MaskEditor";
+import { MaskPanel } from "../components/MaskPanel";
 import { PANEL_H, QuestionPanel } from "../components/QuestionPanel";
 import { TILE_GAP, TILE_H, TILE_W } from "../components/OptionTile";
 import { LabelProgress } from "../components/LabelProgress";
+import { approxIou, rectSeed, type Point } from "../lib/polygon";
 
 /* The labeling screen (docs/roadmap/M3_labeling_ux.md; data model in
  * docs/roadmap/M3_labeling.md §5).
@@ -89,7 +94,12 @@ import { LabelProgress } from "../components/LabelProgress";
 // small screen — which is why they are named constants and not utility classes.
 const CROP_MIN = 300;
 const CROP_MAX = 440;
-const CROP_CHROME = 414;
+// 414 + the Classify|Outline toggle row (TOGGLE_H + CROP_GAP = 32). Every pixel
+// of chrome added above the crop comes off the crop on a small screen, so a new
+// control has to be paid for HERE — leaving this at 414 is how the question
+// panel would have been pushed off a 1366x768 viewport again.
+const CROP_CHROME = 446;
+const TOGGLE_H = 24;
 const STRIP_H = 28;
 const FOOTER_H = 32;
 const CARD_PAD = 16;
@@ -272,6 +282,15 @@ export default function Label() {
   const [inspect, setInspect] = useState(false);
   const [failedKey, setFailedKey] = useState<string | null>(null);
 
+  // ------------------------------------------------------- outline mode (M4a)
+  // The Classify|Outline toggle is PER-ITEM TOOLING, not a destination, so it is
+  // in-page state rather than a route (M4a §5.1) — and it is reset on every
+  // advance below, for the same reason the two holds are: a mode that survived
+  // onto the next cow would have the annotator editing an outline they never
+  // chose to open. `draft` is null exactly when the mode is Classify.
+  const [draft, setDraft] = useState<Point[] | null>(null);
+  const [maskSaving, setMaskSaving] = useState(false);
+
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   // The last refetch produced nothing new — stop polling until a write changes
@@ -360,6 +379,39 @@ export default function Label() {
 
 
   const cropPx = clamp(CROP_MIN, viewportH - CROP_CHROME, CROP_MAX);
+
+  // ------------------------------------------------------------ outline seeds
+  // What the editor opens with, and what Revert returns to. Both read the ITEM,
+  // never the draft, so they are stable across an edit.
+  const servedMask = useMemo<Point[] | null>(() => {
+    const m = current?.mask;
+    // A server that predates M4a sends nothing; one that has no stored mask for
+    // this instance sends null. Both mean "seed from the ring" (§4.1), and a
+    // polygon too short to be a shape is treated the same way rather than
+    // opening an editor on a line.
+    if (m === undefined || m === null || m.length < 3) return null;
+    return m.map(([x, y]): Point => [x, y]);
+  }, [current]);
+  const seed = useMemo<Point[] | null>(() => {
+    if (current === null) return null;
+    return servedMask ?? rectSeed(current.ring);
+  }, [current, servedMask]);
+  const outlineOpen = draft !== null;
+  // The editor is offered even with no stored mask (decision 2: sculpting from
+  // the ring beats a control that is dead on every pre-remask day) — but not on
+  // a crop whose pixels never arrived, where there is nothing to trace against.
+  const outlineAvailable = current !== null && !cropFailed;
+  const maskDirty = useMemo(() => {
+    if (draft === null || seed === null) return false;
+    if (draft.length !== seed.length) return true;
+    return draft.some((p, i) => p[0] !== seed[i][0] || p[1] !== seed[i][1]);
+  }, [draft, seed]);
+  // Only against a REAL model polygon: comparing a sculpted outline to the
+  // rectangle it was seeded from would print a number that means nothing.
+  const maskIou = useMemo(
+    () => (draft === null || servedMask === null ? null : approxIou(draft, servedMask)),
+    [draft, servedMask],
+  );
 
   useEffect(() => {
     const onResize = () => setViewportH(window.innerHeight);
@@ -752,6 +804,90 @@ export default function Label() {
     }
   }, [activeNow, advance, current, currentKey, flag, goTo, markWritten, queue, reviewing, sessionId]);
 
+  // ------------------------------------------------------ outline mode (M4a)
+
+  const openOutline = useCallback(() => {
+    if (current === null || seed === null) return;
+    if (cropFailed) {
+      shake();
+      showHint("this image can't be shown — press F to flag it");
+      return;
+    }
+    setDraft(seed);
+    setFlag({ open: false, reason: null, explanation: "" });
+    setOpenDefinitionKey(null);
+    setHint(null);
+  }, [cropFailed, current, seed, shake, showHint]);
+
+  const closeOutline = useCallback(() => {
+    setDraft(null);
+    setMaskSaving(false);
+  }, []);
+
+  /** Both outline writes: a corrected polygon, or the false-positive verdict.
+      They share everything except `kind` and what happens afterwards, so they
+      share a function — two copies would drift on the anchor or the timing. */
+  const commitMask = useCallback(
+    (kind: MaskFixKind) => {
+      if (current === null || currentKey === null) return;
+      if (kind === "polygon" && (draft === null || draft.length < 3)) return;
+      const req: LabelMaskFixReq = {
+        instance_key: current.instance_key,
+        anchor: anchorOf(current),
+        kind,
+        // Crop-local px, exactly as served (§4.1): the server owns the
+        // conversion to full-frame storage, in one place, so the two spaces can
+        // never disagree about where the annotator put a node.
+        polygon: kind === "polygon" && draft !== null ? draft.map(([x, y]): [number, number] => [x, y]) : null,
+        mask_rev: current.mask_rev ?? null,
+        seeded_from: servedMask === null ? "bbox" : "mask",
+        serve_event_id: current.serve_event_id,
+        session_id: sessionId,
+        client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
+      };
+      setMaskSaving(true);
+      queue.enqueue({ kind: "mask", req });
+      // Deliberately NOT markWritten(): an outline fix is not an answer, and
+      // excluding the key from refetches would hide an instance whose questions
+      // are still unanswered. A removal is different — see below.
+      postLabelEvent({
+        session_id: sessionId,
+        kind: "info_opened", // nearest stored kind until the server learns 'mask_fixed'
+        instance_key: currentKey,
+      }).catch(() => {});
+
+      if (kind === "false_positive") {
+        // There is no cow to ask questions about, so this one is done. The key
+        // IS excluded here: the server will retire it for everyone, and being
+        // served it again before that lands reads as a bug.
+        markWritten(current.instance_key);
+        closeOutline();
+        if (reviewing) goTo(tapeRef.current.frontier);
+        else advance();
+        return;
+      }
+      // A correction returns to the questions on the SAME animal (§5.3): fixing
+      // the outline was a detour, not an answer.
+      closeOutline();
+      showSavedChip();
+    },
+    [
+      activeNow,
+      advance,
+      closeOutline,
+      current,
+      currentKey,
+      draft,
+      goTo,
+      markWritten,
+      queue,
+      reviewing,
+      servedMask,
+      sessionId,
+      showSavedChip,
+    ],
+  );
+
   const goPrev = useCallback(() => {
     const t = tapeRef.current;
     if (t.cursor <= 0) {
@@ -822,9 +958,14 @@ export default function Label() {
     itemMarkRef.current = mark;
     groupMarkRef.current = mark;
     // Both holds reset on a new item (§3.2): a hold that survived the advance
-    // would apply to a cow the annotator has not looked at yet.
+    // would apply to a cow the annotator has not looked at yet. The outline
+    // mode resets for the same reason and is stronger still — a draft carried
+    // onto the next cow would be a polygon drawn on one animal and saved
+    // against another.
     setInspect(false);
     setClean(false);
+    setDraft(null);
+    setMaskSaving(false);
     // A popover must not survive the advance: the same class_key exists in the
     // next item, so it would silently reappear anchored to a cow nobody opened
     // it for.
@@ -858,6 +999,14 @@ export default function Label() {
     // Escape first — it must also fire from inside the flag explanation
     // textarea, which the typing guard below deliberately swallows keys for.
     if (e.key === "Escape") {
+      if (outlineOpen) {
+        // Leaves without saving — the draft is discarded on purpose. Nothing
+        // here is worth an "are you sure": reopening re-seeds from the model
+        // polygon, which is one keystroke away.
+        e.preventDefault();
+        closeOutline();
+        return;
+      }
       if (flag.open) {
         e.preventDefault();
         closeFlag();
@@ -902,6 +1051,37 @@ export default function Label() {
       if (!plain) return;
       e.preventDefault();
       if (!e.repeat) setClean(true);
+      return;
+    }
+
+    // OUTLINE MODE OWNS THE KEYBOARD (M4a §5.1). One hotkey layer at a time is
+    // this page's standing rule; everything below this block — the answer
+    // letters, F, and the arrows — is inert while an outline is open. The
+    // arrows in particular: leaving the item by tape navigation mid-edit would
+    // discard the draft silently, which is precisely the class of loss the
+    // screen was rebuilt to prevent. Space and H are already handled above and
+    // deliberately keep working, because looking harder is always allowed.
+    if (outlineOpen) {
+      if (!plain || e.repeat) return;
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (maskDirty && !maskSaving) commitMask("polygon");
+        else {
+          shake();
+          showHint("nothing changed yet — drag a point first, or press Esc");
+        }
+        return;
+      }
+      if (e.key === "r" || e.key === "R") {
+        e.preventDefault();
+        if (seed !== null) setDraft(seed);
+        return;
+      }
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        shake();
+        showHint("finish the outline first — Enter saves, Esc goes back");
+        return;
+      }
       return;
     }
 
@@ -1066,6 +1246,19 @@ export default function Label() {
         className="w-full max-w-[760px] rounded-xl border box-border"
         style={{ background: CARD, borderColor: HAIRLINE, padding: CARD_PAD }}
       >
+        {/* The Classify|Outline toggle (M4a §5.1) sits directly above the crop —
+            the one place the eye already is when the outline looks wrong. It is
+            drawn at a fixed height inside the existing CROP_GAP budget so the
+            crop below it does not lose a pixel. */}
+        <div className="flex justify-center" style={{ marginBottom: CROP_GAP }}>
+          <ModeToggle
+            outline={outlineOpen}
+            disabled={!outlineAvailable}
+            onClassify={closeOutline}
+            onOutline={openOutline}
+          />
+        </div>
+
         {/* The crop is the brightest region on screen (§2.2) and its size is
             subtraction, not taste (§2.3): clamp(300, 100vh - 414, 440). Space
             enlarges it by TRANSFORM so nothing below it moves. */}
@@ -1079,18 +1272,39 @@ export default function Label() {
               zIndex: inspect ? 5 : undefined,
             }}
           >
-            <InstanceCrop
-              item={current}
-              hideRing={clean || inspect}
-              onError={(k) => {
-                // A late error from an item already advanced past must not blank
-                // the item now on screen — that is why the key rides along.
-                if (k === tapeRef.current.items[tapeRef.current.cursor]?.instance_key) {
-                  setFailedKey(k);
-                }
-              }}
-              className="w-full h-full"
-            />
+            {outlineOpen && draft !== null ? (
+              // Same box, same stretch contract — only the overlay changes, so
+              // the photograph does not move under the cursor at the handoff.
+              <MaskEditor
+                item={current}
+                polygon={draft}
+                onChange={setDraft}
+                hidden={clean || inspect}
+                onRefusedDelete={() => {
+                  shake();
+                  showHint("an outline needs at least three points");
+                }}
+                className="w-full h-full"
+              />
+            ) : (
+              <InstanceCrop
+                item={current}
+                // The mask is shown alongside the ring while the flag row is
+                // open (M4a §5.4): the annotator is deciding whether the
+                // detection is wrong, and that judgement is about the outline
+                // the model drew, not only about the crop.
+                maskPreview={flag.open ? servedMask : null}
+                hideRing={clean || inspect}
+                onError={(k) => {
+                  // A late error from an item already advanced past must not blank
+                  // the item now on screen — that is why the key rides along.
+                  if (k === tapeRef.current.items[tapeRef.current.cursor]?.instance_key) {
+                    setFailedKey(k);
+                  }
+                }}
+                className="w-full h-full"
+              />
+            )}
             {flaggedReason !== undefined ? <FlaggedOverlay size={cropPx} /> : null}
             {/* The zoom affordance sits ON the crop because that is the one place
                 the annotator is already looking; as trailing prose in the footer
@@ -1173,13 +1387,38 @@ export default function Label() {
         ) : null}
 
         <div style={{ marginTop: CROP_GAP }}>
-          {flag.open ? (
+          {outlineOpen ? (
+            <MaskPanel
+              nodeCount={draft?.length ?? 0}
+              iou={maskIou}
+              dirty={maskDirty}
+              seededFromBbox={servedMask === null}
+              saving={maskSaving}
+              onSave={() => commitMask("polygon")}
+              onRevert={() => seed !== null && setDraft(seed)}
+              onRemove={() => commitMask("false_positive")}
+              onCancel={closeOutline}
+            />
+          ) : flag.open ? (
             <FlagRow
               draft={flag}
               onPick={(reason) => setFlag((f) => ({ ...f, reason }))}
               onExplain={(text) => setFlag((f) => ({ ...f, explanation: text }))}
               onSubmit={submitFlag}
               onCancel={closeFlag}
+              // The two repair actions (M4a §5.4). They lead the row because a
+              // detection that is merely mis-outlined is repairable, and a flag
+              // is the outcome for what cannot be repaired — offering the
+              // structured verdicts first is what keeps prose flags for the
+              // cases that genuinely need prose.
+              onFixOutline={openOutline}
+              onRemoveInstance={() => commitMask("false_positive")}
+              canRepair={outlineAvailable}
+              // Whether there is actually an amber shape on the crop to point
+              // at. Until masks are persisted (M4 phase 0) there is not, and a
+              // legend for a thing that is not drawn is worse than no legend —
+              // the annotator hunts the image for it.
+              hasMask={servedMask !== null}
             />
           ) : (
             <QuestionPanel
@@ -1347,6 +1586,105 @@ export default function Label() {
 }
 
 /* ------------------------------------------------------------------ pieces */
+
+/** A compact action inside the flag row's header line. Sized to the 24px header
+    so adding these cost the panel no height at all (see FlagRow's comment). */
+function RepairChip({ children, onClick }: { children: ReactNode; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline-flex items-center h-[22px] px-2 rounded-md border box-border text-[11px]
+                 whitespace-nowrap cursor-pointer transition-opacity duration-150 hover:opacity-80
+                 focus-visible:outline focus-visible:outline-2"
+      style={{
+        background: "var(--lbl-card, #1E2124)",
+        borderColor: ON_IMAGE_ACCENT,
+        color: ON_IMAGE_ACCENT,
+        outlineColor: INK,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** The Classify|Outline toggle (M4a §5.1).
+ *
+ * A segmented control of two buttons rather than a checkbox or a switch: both
+ * states are named, which is what makes it obvious that Outline is a place you
+ * can come back from — the single most important thing to communicate about a
+ * mode on a screen whose whole discipline is "no mode you can be stranded in".
+ *
+ * Disabled rather than hidden when there is nothing to trace (§5.5): a control
+ * that appears only sometimes reads as flaky, and the title says why.
+ */
+function ModeToggle({
+  outline,
+  disabled,
+  onClassify,
+  onOutline,
+}: {
+  outline: boolean;
+  disabled: boolean;
+  onClassify: () => void;
+  onOutline: () => void;
+}) {
+  return (
+    <div
+      className="inline-flex items-center rounded-full border overflow-hidden"
+      style={{ height: TOGGLE_H, borderColor: HAIRLINE, background: CARD }}
+      role="group"
+      aria-label="labeling tool"
+    >
+      <ModeButton active={!outline} disabled={false} onClick={onClassify}>
+        Classify
+      </ModeButton>
+      <ModeButton
+        active={outline}
+        disabled={disabled}
+        onClick={onOutline}
+        title={disabled ? "there are no pixels to trace on this one" : "correct this cow's outline"}
+      >
+        Outline
+      </ModeButton>
+    </div>
+  );
+}
+
+function ModeButton({
+  children,
+  active,
+  disabled,
+  onClick,
+  title,
+}: {
+  children: ReactNode;
+  active: boolean;
+  disabled: boolean;
+  onClick: () => void;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-pressed={active}
+      className="h-full px-3 font-mono text-[11px] uppercase tracking-[0.12em] cursor-pointer
+                 transition-opacity duration-150 disabled:opacity-40 disabled:cursor-default
+                 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2"
+      style={{
+        background: active ? ON_IMAGE_ACCENT : "transparent",
+        color: active ? "#14161A" : INK_DIM,
+        outlineColor: INK,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
 
 /** One big card per terminal state — same surface, different next action. The
     house `Card` is painted in the light theme and is deliberately not reused
@@ -1561,12 +1899,20 @@ function FlagRow({
   onExplain,
   onSubmit,
   onCancel,
+  onFixOutline,
+  onRemoveInstance,
+  canRepair,
+  hasMask,
 }: {
   draft: FlagDraft;
   onPick: (reason: LabelSkipReason) => void;
   onExplain: (text: string) => void;
   onSubmit: () => void;
   onCancel: () => void;
+  onFixOutline: () => void;
+  onRemoveInstance: () => void;
+  canRepair: boolean;
+  hasMask: boolean;
 }) {
   const chosen = FLAG_REASONS.find((r) => r.reason === draft.reason) ?? null;
   const ready = chosen !== null && draft.explanation.trim() !== "";
@@ -1584,12 +1930,30 @@ function FlagRow({
         color: INK,
       }}
     >
+      {/* The header row carries the two repair actions (M4a §5.4). They live
+          HERE rather than in a strip of their own because PANEL_H is exactly
+          consumed by the header and the tile row — an extra 32px band would
+          overflow the rectangle whose height the crop above is sized against.
+          They are ACTIONS, not two more reasons: they write structured verdicts
+          about the segmentation rather than prose about the crop, and the mask
+          is drawn on the crop behind this row so both are decidable without
+          leaving. */}
       <div className="flex items-center gap-2" style={{ height: 24 }}>
         <span className="text-[13px] font-semibold uppercase tracking-[0.08em] leading-none">
           ⚑ Flag — {chosen === null ? "why?" : chosen.label}
         </span>
-        <span className="ml-auto text-[11px]" style={{ color: INK_DIM }}>
-          {chosen === null ? "1–5 · Esc cancels" : "Enter flags · Esc cancels"}
+        {chosen === null && canRepair ? (
+          <span className="flex items-center gap-1.5 ml-2">
+            <RepairChip onClick={onFixOutline}>✎ Fix outline</RepairChip>
+            <RepairChip onClick={onRemoveInstance}>✕ Not a cow</RepairChip>
+          </span>
+        ) : null}
+        <span className="ml-auto text-[11px] shrink-0" style={{ color: INK_DIM }}>
+          {chosen === null
+            ? canRepair && hasMask
+              ? "amber = what the model found · 1–6"
+              : "1–6 · Esc cancels"
+            : "Enter flags · Esc cancels"}
         </span>
       </div>
 

@@ -13,6 +13,16 @@ const SCRIM_OPACITY = 0.45;
    rendered px at any display size. */
 const HALO_STROKE = 3.5;
 const RING_STROKE = 1.75;
+/* The mask preview reads as the same object the outline editor edits, so it
+   uses the editor's amber rather than the ring's white — switching to Outline
+   from the flag row should feel like picking up the shape you were just shown,
+   not like meeting a new one. */
+const MASK_STROKE = "#F0B460";
+const MASK_FILL = "rgba(240,180,96,0.16)";
+
+function maskPath(poly: readonly [number, number][]): string {
+  return `M${poly.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join("L")}Z`;
+}
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -20,6 +30,14 @@ function clamp(v: number, lo: number, hi: number): number {
 
 export interface InstanceCropProps {
   item: LabelItem;
+  /** The model's instance mask, crop-local px, drawn READ-ONLY over the crop.
+      Passed while the flag row is open (M4a §5.4) so "is this detection wrong"
+      is judged against the outline the model actually drew — a bbox says
+      nothing about whether the model found a cow or a shadow. Null in the
+      ordinary answering flow: the polygon would compete with the ring for
+      attention on every single item, and the question is about the animal, not
+      about the segmentation. */
+  maskPreview?: [number, number][] | null;
   /** `H` held down: drop the ring AND the scrim, so occlusion can be judged on
       unobstructed pixels. Both go, not just the stroke — a scrim over unringed
       context is exactly the obstruction the affordance exists to lift. */
@@ -52,7 +70,13 @@ export interface InstanceCropProps {
  * nauseating and delays the pixels the annotator is waiting for. The caption
  * (day + camera, never the clock time) belongs to the page, not to the crop.
  */
-export function InstanceCrop({ item, hideRing = false, onError, className }: InstanceCropProps) {
+export function InstanceCrop({
+  item,
+  maskPreview = null,
+  hideRing = false,
+  onError,
+  className,
+}: InstanceCropProps) {
   // Keyed by URL rather than a boolean so the state cannot survive into the next
   // item and blank out a crop that is perfectly fine — the annotator would be
   // told the image is missing while the server is happily serving it.
@@ -134,6 +158,29 @@ export function InstanceCrop({ item, hideRing = false, onError, className }: Ins
             strokeWidth={RING_STROKE}
             vectorEffect="non-scaling-stroke"
           />
+          {/* The model's mask, when the caller asked for it. Amber and unfilled
+              over the ring's white rectangle: two shapes are on screen at once
+              here, and they have to be told apart at a glance — the ring is
+              WHERE the animal is, the polygon is WHAT the model thinks it is. */}
+          {maskPreview !== null && maskPreview.length >= 3 ? (
+            <>
+              <path
+                d={maskPath(maskPreview)}
+                fill={MASK_FILL}
+                stroke="#000"
+                strokeOpacity={0.55}
+                strokeWidth={3}
+                vectorEffect="non-scaling-stroke"
+              />
+              <path
+                d={maskPath(maskPreview)}
+                fill="none"
+                stroke={MASK_STROKE}
+                strokeWidth={1.75}
+                vectorEffect="non-scaling-stroke"
+              />
+            </>
+          ) : null}
         </svg>
       )}
     </div>

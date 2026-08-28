@@ -212,6 +212,37 @@ export interface LabelItem {
   target: number;
   overlap: boolean;
   serve_event_id: number;
+  // M4a outline fix-up (docs/roadmap/M4a_instance_mask_fixup.md §4.1). The
+  // model's instance mask in CROP-LOCAL px — the same space as `ring`, for the
+  // same reason: the client draws it with zero math. All three are optional
+  // end-to-end because a pre-M4a server simply never sends them; the page then
+  // seeds the editor from the ring rectangle (`mask_seed` "bbox").
+  mask?: [number, number][] | null;
+  mask_rev?: string | null;                 // hash of the stored polygon, echoed on submit
+  mask_seed?: MaskSeed;
+}
+
+// Where the editable outline came from: the stored model mask, or (when none is
+// stored yet) a rectangle at the ring the annotator sculpts into one.
+export type MaskSeed = "mask" | "bbox";
+// The two-way branch the outline tool offers (plan §3): correct the shape, or
+// declare there is nothing to outline. Frozen in code like the flag reasons —
+// each kind has export semantics and its own UI path.
+export type MaskFixKind = "polygon" | "false_positive";
+// POST /api/label/mask-fix. The anchor is echoed verbatim like every other
+// label write; `polygon` is CROP-LOCAL px (required iff kind 'polygon' — the
+// server converts to full-frame px for storage) and `mask_rev` is what makes a
+// mid-session remask a 409 `mask_stale` instead of a silent re-attachment.
+export interface LabelMaskFixReq {
+  instance_key: string;
+  anchor: InstanceAnchor;
+  kind: MaskFixKind;
+  polygon: [number, number][] | null;
+  mask_rev: string | null;
+  seeded_from: MaskSeed;
+  serve_event_id?: number | null;
+  session_id?: string | null;
+  client_elapsed_ms?: number | null;
 }
 
 // Which instances the annotator wants: 'todo' hides the ones they personally have

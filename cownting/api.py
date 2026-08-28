@@ -114,6 +114,25 @@ class LabelSkipReq(BaseModel):
     explanation: str | None = None
 
 
+class LabelMaskFixReq(BaseModel):
+    # The OUTLINE body (docs/roadmap/M4a_instance_mask_fixup.md §4.2). `kind`
+    # discriminates: 'polygon' carries a corrected shape in CROP-LOCAL px (the
+    # space the queue served `ring` in, converted server-side before storage),
+    # 'false_positive' carries no geometry and says the detection is not a cow.
+    # `mask_rev` is what the annotator's outline was drawn against; it is echoed
+    # so a model re-run mid-session is a 409 rather than a correction silently
+    # re-attaching to a shape nobody saw.
+    instance_key: str
+    anchor: InstanceAnchor
+    kind: str = "polygon"
+    polygon: list[list[float]] | None = None
+    mask_rev: str | None = None
+    seeded_from: str = "mask"
+    serve_event_id: int | None = None
+    session_id: str | None = None
+    client_elapsed_ms: int | None = None
+
+
 class LabelUndoReq(BaseModel):
     instance_key: str
 
@@ -1792,6 +1811,100 @@ def create_app(config: Config) -> FastAPI:
         finally:
             lc.close()
         return {"ok": True, "annotation_id": annotation_id, "version": version}
+
+    @app.post("/api/label/mask-fix", dependencies=[Depends(require_labeler)])
+    def label_mask_fix(body: LabelMaskFixReq, request: Request):
+        """Correct this instance's outline, or declare the detection a false
+        positive (M4a §4.2).
+
+        Same anchor discipline as submit/skip: the client echoes what the queue
+        served, `verify_anchor` re-hashes it, a mismatch is a 400 — so this route
+        also never has to open the main DB to know which cow is meant.
+
+        The polygon arrives in CROP-LOCAL px and is converted here, by
+        `labeling.crop_to_frame`, using the SAME pad/max_width the crop endpoint
+        renders with. Storing what the client sent, or converting on the client,
+        would both make the stored geometry depend on a number the client chose.
+
+        `iou_source` is computed server-side for the same reason: it is the
+        statistic that says how wrong the model was, and a client that reports it
+        could flatter it. It is null here until masks are persisted (M4 phase 0)
+        — there is no model polygon to compare against yet, which is also why the
+        `mask_rev` staleness check is a no-op for now rather than a 409 on every
+        submit: the honest 409 needs a stored mask to re-hash, and inventing one
+        would reject every correction the feature exists to collect."""
+        a = body.anchor
+        _valid_anchor(a)
+        if not labeling.verify_anchor(body.instance_key, a):
+            raise HTTPException(400, "anchor does not hash to instance_key")
+        if body.kind not in labels_db.MASK_EDIT_KINDS:
+            raise HTTPException(
+                400, f"kind must be one of {list(labels_db.MASK_EDIT_KINDS)}")
+        if body.seeded_from not in ("mask", "bbox"):
+            raise HTTPException(400, "seeded_from must be 'mask' or 'bbox'")
+
+        cfg = config.annotation
+        polygon: list[list[float]] | None = None
+        if body.kind == "polygon":
+            pts = body.polygon or []
+            if len(pts) < labels_db.MASK_MIN_POINTS:
+                raise HTTPException(
+                    400, f"an outline needs at least {labels_db.MASK_MIN_POINTS} points")
+            if len(pts) > labels_db.MASK_MAX_POINTS:
+                raise HTTPException(
+                    400, f"an outline may not exceed {labels_db.MASK_MAX_POINTS} points")
+            if any(len(p) != 2 for p in pts):
+                raise HTTPException(400, "every outline point must be [x, y]")
+            if any(not math.isfinite(float(v)) for p in pts for v in p):
+                raise HTTPException(400, "outline points must be finite")
+            # Inside the crop the annotator was actually served. A point outside
+            # it is either a client bug or a hand-made request; either way the
+            # stored polygon would not describe the animal.
+            _src, out, _ring = labeling.crop_geometry(
+                a.bbox, cfg.crop_pad, cfg.crop_max_width)
+            if any(not (-1.0 <= float(v) <= out + 1.0) for p in pts for v in p):
+                raise HTTPException(400, "outline points must lie inside the crop")
+            try:
+                polygon = labeling.crop_to_frame(
+                    pts, a.bbox, pad=cfg.crop_pad, max_width=cfg.crop_max_width)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+        elif body.polygon:
+            raise HTTPException(400, "a false-positive verdict carries no polygon")
+
+        ts = _anchor_ts(a)
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            try:
+                edit_id = labels_db.submit_mask_edit(
+                    lc,
+                    instance_key=body.instance_key,
+                    annotator=user["username"] or "local",
+                    kind=body.kind,
+                    polygon=polygon,
+                    seeded_from=body.seeded_from,
+                    mask_rev=_clip(body.mask_rev, 64),
+                    provenance=_anchor_provenance(a, ts),
+                    telemetry=_label_telemetry(
+                        request, user, revision=labels_db.taxonomy_revision(lc),
+                        session_id=body.session_id,
+                        serve_event_id=body.serve_event_id,
+                        client_elapsed_ms=body.client_elapsed_ms),
+                )
+            except ValueError as e:
+                # Same split as the other two writes: a lost UNIQUE race is a
+                # 409 the client retries, a rejected shape is a 400 it must not.
+                if "already has version" in str(e):
+                    raise HTTPException(409, str(e))
+                raise HTTPException(400, str(e))
+            row = lc.execute(
+                "SELECT version FROM mask_edits WHERE edit_id = ?", [edit_id]
+            ).fetchone()
+        finally:
+            lc.close()
+        return {"ok": True, "annotation_id": int(edit_id),
+                "version": int(row[0]) if row else 1}
 
     @app.post("/api/label/undo", dependencies=[Depends(require_labeler)])
     def label_undo(body: LabelUndoReq, request: Request):

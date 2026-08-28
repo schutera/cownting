@@ -3,10 +3,13 @@ import type {
   InstanceAnchor,
   LabelFlagReq,
   LabelInputMode,
+  LabelMaskFixReq,
   LabelSkipReason,
   LabelSubmitReq,
+  MaskFixKind,
+  MaskSeed,
 } from "./types";
-import { flagLabel, submitLabel, TaxonomyStaleError } from "./api";
+import { flagLabel, submitLabel, submitMaskFix, TaxonomyStaleError } from "./api";
 
 /* The Label screen's write path (M3 labeling UX §3.5), plus the two per-decision
  * events of §6.1.
@@ -62,10 +65,17 @@ const STORE_KEY = "cownting.label.pending";
 // posted at unload would lose its prose.
 const SUBMIT_URL = "/api/label/submit";
 const FLAG_URL = "/api/label/skip";
+const MASK_URL = "/api/label/mask-fix";
 
 export type LabelWrite =
   | { kind: "answer"; req: LabelSubmitReq }
-  | { kind: "flag"; req: LabelFlagReq };
+  | { kind: "flag"; req: LabelFlagReq }
+  // An outline correction or a false-positive verdict. It rides the same queue
+  // as the answers rather than posting inline, so a mask fix survives a reload
+  // and a flaky link exactly as an answer does — but see `enqueue`: it must NOT
+  // coalesce against the answer for the same instance, because the two are
+  // different judgements about the same cow and both have to land.
+  | { kind: "mask"; req: LabelMaskFixReq };
 
 /** What the footer's sync indicator draws (§5.5): shape and motion, never hue.
     `pending` 0 = filled dot, >0 = hollow dot with the count, `retrying` = the
@@ -149,13 +159,29 @@ function parseMode(v: unknown): LabelInputMode | null {
   return v === "key" || v === "mouse" ? v : null;
 }
 
-const FLAG_REASON_VALUES: readonly LabelSkipReason[] = [
+/* Every LabelSkipReason, and it has to STAY every one: a reason missing here
+   parses to null on replay, which drops that flag from the sessionStorage
+   mirror IN SILENCE — the exact failure this parsing block exists to prevent.
+   The list was typed `readonly LabelSkipReason[]`, which happily accepts a
+   SUBSET, so `low_resolution` joined the union and never reached this array.
+   The mutual-assignability check below closes that hole: the list must cover the
+   union AND the union must cover the list, so either half drifting is a compile
+   error rather than a flag that vanishes on reload. */
+const FLAG_REASON_VALUES = [
   "bad_crop",
   "no_cow",
   "multiple_cows",
   "occluded",
+  "low_resolution",
   "other",
-];
+] as const;
+type ListedReason = (typeof FLAG_REASON_VALUES)[number];
+const _REASONS_EXHAUSTIVE: LabelSkipReason extends ListedReason
+  ? ListedReason extends LabelSkipReason
+    ? true
+    : never
+  : never = true;
+void _REASONS_EXHAUSTIVE;
 
 function parseReason(v: unknown): LabelSkipReason | null {
   return FLAG_REASON_VALUES.find((r) => r === v) ?? null;
@@ -163,6 +189,27 @@ function parseReason(v: unknown): LabelSkipReason | null {
 
 function optNum(v: unknown): number | null {
   return typeof v === "number" ? v : null;
+}
+
+function parsePolygon(v: unknown): [number, number][] | null {
+  if (!Array.isArray(v) || v.length < 3) return null;
+  const out: [number, number][] = [];
+  for (const pt of v) {
+    if (!Array.isArray(pt) || pt.length !== 2) return null;
+    const [x, y] = pt;
+    if (typeof x !== "number" || typeof y !== "number") return null;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    out.push([x, y]);
+  }
+  return out;
+}
+
+function parseMaskKind(v: unknown): MaskFixKind | null {
+  return v === "polygon" || v === "false_positive" ? v : null;
+}
+
+function parseSeed(v: unknown): MaskSeed | null {
+  return v === "mask" || v === "bbox" ? v : null;
 }
 
 function parseWrite(v: unknown): LabelWrite | null {
@@ -211,6 +258,30 @@ function parseWrite(v: unknown): LabelWrite | null {
       },
     };
   }
+  if (v.kind === "mask") {
+    const kind = parseMaskKind(req.kind);
+    const seeded_from = parseSeed(req.seeded_from);
+    if (kind === null || seeded_from === null) return null;
+    // The polygon is required for a correction and forbidden for a removal —
+    // the server enforces both, and a replayed record that disagrees would post
+    // forever against a 400.
+    const polygon = kind === "polygon" ? parsePolygon(req.polygon) : null;
+    if (kind === "polygon" && polygon === null) return null;
+    return {
+      kind: "mask",
+      req: {
+        instance_key: req.instance_key,
+        anchor,
+        kind,
+        polygon,
+        mask_rev: typeof req.mask_rev === "string" ? req.mask_rev : null,
+        seeded_from,
+        serve_event_id: optNum(req.serve_event_id),
+        session_id,
+        client_elapsed_ms: optNum(req.client_elapsed_ms),
+      },
+    };
+  }
   return null;
 }
 
@@ -245,9 +316,10 @@ function writeStore(queue: readonly LabelWrite[]): void {
 
 function beacon(write: LabelWrite): void {
   if (typeof navigator.sendBeacon !== "function") return;
-  const url = write.kind === "answer" ? SUBMIT_URL : FLAG_URL;
+  const url =
+    write.kind === "answer" ? SUBMIT_URL : write.kind === "mask" ? MASK_URL : FLAG_URL;
   const body =
-    write.kind === "answer" ? write.req : { ...write.req, note: write.req.explanation };
+    write.kind === "flag" ? { ...write.req, note: write.req.explanation } : write.req;
   try {
     navigator.sendBeacon(url, new Blob([JSON.stringify(body)], { type: "application/json" }));
   } catch {
@@ -294,7 +366,11 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
         while (queueRef.current.length > 0) {
           const batch = queueRef.current.slice(0, BATCH_MAX);
           const results = await Promise.allSettled(
-            batch.map((w) => (w.kind === "answer" ? submitLabel(w.req) : flagLabel(w.req))),
+            batch.map((w) => {
+              if (w.kind === "answer") return submitLabel(w.req);
+              if (w.kind === "mask") return submitMaskFix(w.req);
+              return flagLabel(w.req);
+            }),
           );
           // Entries are removed by IDENTITY, never by index: the annotator can
           // enqueue a correction while this batch is in flight, which coalescing
@@ -361,7 +437,14 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
   const enqueue = useCallback(
     (write: LabelWrite) => {
       const key = write.req.instance_key;
-      const kept = queueRef.current.filter((w) => w.req.instance_key !== key);
+      // Coalesce WITHIN a kind, never across kinds. Two writes of the same kind
+      // for one instance are a corrected draft the server never saw. Two writes
+      // of DIFFERENT kinds are two different judgements about the same cow — an
+      // outline correction and the answers to its questions both have to land,
+      // and the old key-only filter would have silently thrown one away.
+      const kept = queueRef.current.filter(
+        (w) => w.req.instance_key !== key || w.kind !== write.kind,
+      );
       queueRef.current = [...kept, write];
       writeStore(queueRef.current);
       publish({});

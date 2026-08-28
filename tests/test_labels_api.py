@@ -22,6 +22,7 @@ from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 
 if __package__ in (None, ""):
@@ -29,7 +30,7 @@ if __package__ in (None, ""):
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from cownting import db, labels_db  # noqa: E402
+from cownting import db, labeling, labels_db  # noqa: E402
 from cownting.api import create_app  # noqa: E402
 from cownting.config import AuthCfg, CameraCfg, Config, PathsCfg  # noqa: E402
 
@@ -706,6 +707,131 @@ def test_every_queue_item_frame_url_resolves():
                   f"{r.status_code} {r.headers.get('content-type', '')}")
 
 
+def _mask_fix(client: TestClient, item: dict, **extra) -> "object":
+    body = {"instance_key": item["instance_key"], "anchor": _anchor(item),
+            "kind": "polygon", "seeded_from": "bbox", **extra}
+    return client.post("/api/label/mask-fix", json=body)
+
+
+def test_mask_fix_roundtrip_and_validation():
+    """M4a §4.2: the outline write, its geometry validation, and the crop-local
+    -> full-frame conversion the store depends on."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        item = client.get("/api/label/queue").json()["items"][0]
+        # A triangle well inside the crop box, in crop-local px like the editor.
+        tri = [[10.0, 10.0], [40.0, 12.0], [25.0, 44.0]]
+        r = _mask_fix(client, item, polygon=tri)
+        check("POST /api/label/mask-fix -> 200", r.status_code == 200,
+              f"{r.status_code} {r.text[:160]}")
+        check("mask fix reports version 1", (r.json() or {}).get("version") == 1)
+
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            row = lc.execute(
+                "SELECT kind, polygon, n_vertices, area_px, seeded_from FROM mask_edits "
+                "WHERE instance_key = ? AND superseded_at IS NULL", [item["instance_key"]]
+            ).fetchone()
+            check("the edit is stored as a current polygon row",
+                  row is not None and row[0] == "polygon", str(row))
+            stored = json.loads(row[1]) if row and row[1] else []
+            check("stored polygon keeps its vertex count", len(stored) == 3, str(stored))
+            check("n_vertices and area are computed server-side",
+                  row is not None and row[2] == 3 and (row[3] or 0) > 0, str(row))
+            check("seeded_from is recorded", row is not None and row[4] == "bbox")
+            # The whole point of storing full-frame px: the polygon must land ON
+            # the animal, i.e. within the padded crop square around its bbox.
+            src, _out, _ring = labeling.crop_geometry(
+                item["bbox"], config.annotation.crop_pad, config.annotation.crop_max_width)
+            inside = all(src[0] <= px <= src[2] and src[1] <= py <= src[3]
+                         for px, py in stored)
+            check("stored points are full-frame px inside the served crop square",
+                  inside, f"{stored} vs {src}")
+            check("stored points are NOT the crop-local ones that were sent",
+                  stored != tri, str(stored))
+
+            # A second save supersedes rather than overwriting — the same
+            # append-only rule the answers follow.
+            r2 = _mask_fix(client, item, polygon=[[11.0, 11.0], [41.0, 13.0], [26.0, 45.0]])
+            check("a second outline save -> 200", r2.status_code == 200, r2.text[:160])
+            check("...and is version 2", (r2.json() or {}).get("version") == 2)
+            n_current = lc.execute(
+                "SELECT count(*) FROM mask_edits WHERE instance_key = ? "
+                "AND superseded_at IS NULL", [item["instance_key"]]).fetchone()[0]
+            n_all = lc.execute("SELECT count(*) FROM mask_edits WHERE instance_key = ?",
+                               [item["instance_key"]]).fetchone()[0]
+            check("exactly one current row survives, both are kept",
+                  n_current == 1 and n_all == 2, f"current={n_current} all={n_all}")
+        finally:
+            lc.close()
+
+        # Validation. Each of these would otherwise reach the store as geometry
+        # no consumer can use.
+        check("a forged anchor is a 400",
+              _mask_fix(client, {**item, "bbox": [1.0, 2.0, 3.0, 4.0]},
+                        polygon=tri).status_code == 400)
+        check("a two-point outline is a 400",
+              _mask_fix(client, item, polygon=[[1.0, 1.0], [2.0, 2.0]]).status_code == 400)
+        # Sent as a RAW body: `json.dumps` refuses to encode infinity, and
+        # JSON.stringify turns it into null, so the only way this reaches the
+        # route is a hand-made request — which is exactly the case the finiteness
+        # check exists for. `1e999` is valid JSON syntax that parses to inf.
+        raw = json.dumps({"instance_key": item["instance_key"], "anchor": _anchor(item),
+                          "kind": "polygon", "seeded_from": "bbox",
+                          "polygon": [[10.0, 10.0], [40.0, 12.0], [25.0, 44.0]]})
+        raw = raw.replace("[25.0, 44.0]", "[1e999, 44.0]")
+        r_inf = client.post("/api/label/mask-fix", content=raw,
+                            headers={"Content-Type": "application/json"})
+        check("a non-finite point is rejected", r_inf.status_code in (400, 422),
+              f"{r_inf.status_code} {r_inf.text[:120]}")
+        check("a point outside the crop is a 400",
+              _mask_fix(client, item,
+                        polygon=[[10.0, 10.0], [40.0, 12.0], [99999.0, 44.0]]
+                        ).status_code == 400)
+        check("an unknown kind is a 400",
+              _mask_fix(client, item, kind="nonsense", polygon=tri).status_code == 400)
+        check("a false positive carrying geometry is a 400",
+              _mask_fix(client, item, kind="false_positive",
+                        polygon=tri).status_code == 400)
+
+
+def test_false_positive_retires_the_instance_for_everyone():
+    """M4a §4.2: 'not a cow' is not a skip. It leaves the pool for every
+    annotator, because there are no questions to ask about a shadow — and the
+    progress numbers have to agree with what the queue will actually serve."""
+    with tempfile.TemporaryDirectory() as d:
+        client, _config = _mk_app(d)
+        before = client.get("/api/label/queue").json()
+        item = before["items"][0]
+        pool_before = int(client.get("/api/label/progress").json()["pool_total"])
+        remaining_before = int(client.get("/api/label/progress").json()["remaining"])
+
+        r = client.post("/api/label/mask-fix", json={
+            "instance_key": item["instance_key"], "anchor": _anchor(item),
+            "kind": "false_positive", "polygon": None, "seeded_from": "mask"})
+        check("removing a false positive -> 200", r.status_code == 200, r.text[:160])
+
+        after = client.get("/api/label/queue").json()
+        keys = {i["instance_key"] for i in after["items"]}
+        check("the removed instance is no longer served",
+              item["instance_key"] not in keys, str(len(keys)))
+        check("...and it is the ONLY one that left",
+              len(after["items"]) == len(before["items"]) - 1,
+              f"{len(before['items'])} -> {len(after['items'])}")
+
+        prog = client.get("/api/label/progress").json()
+        check("pool_total is unchanged — nothing was deleted",
+              int(prog["pool_total"]) == pool_before, str(prog["pool_total"]))
+        check("remaining drops by exactly one, matching the queue",
+              int(prog["remaining"]) == remaining_before - 1,
+              f"{remaining_before} -> {prog['remaining']}")
+
+        # 'mine=all' is a preference; it must not resurrect a false positive.
+        allq = client.get("/api/label/queue?mine=all").json()
+        check("mine=all does not bring it back",
+              item["instance_key"] not in {i["instance_key"] for i in allq["items"]})
+
+
 def main():
     print("=== test_labels_api ===")
     test_queue_shape()
@@ -717,6 +843,8 @@ def main():
     test_serve_event_and_time_on_task()
     test_decision_event_detail_is_stored()
     test_undo_is_scoped_to_me()
+    test_mask_fix_roundtrip_and_validation()
+    test_false_positive_retires_the_instance_for_everyone()
     test_crop_endpoint_safety_and_caching()
     test_banner_mask_does_not_blank_the_tile()
     test_frame_endpoint_safety_and_caching()

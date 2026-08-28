@@ -278,15 +278,24 @@ remask"*. Never hidden: a control that appears only sometimes reads as flaky.
 
 ## 6. Phasing
 
-| # | Phase | Effort | Ships as |
-|---|---|---|---|
-| 0 | M4 phase 0 verbatim: `mask_poly`/`mask_parts` persisted; `DET_COLS`; both ALTERs; clip/restore test | **M** | new data gets masks |
-| 1 | `cownting remask` backfill (M4 phase 1 verbatim) | **M** | old data gets masks |
-| 2 | `mask_edits` DDL + views; `submit_mask_fix`; crop↔frame conversion factored out and shared with the crop endpoint | **M** | store |
-| 3 | Queue item `mask`/`mask_rev`; `POST /api/label/mask-fix`; validation + 409 | **M** | backend complete |
-| 4 | Toggle + `MaskEditor` + `MaskPanel`; queue `kind: "mask"`; empty state | **L** | the feature |
-| 5 | Flag-row integration: mask overlay on `F`, Fix outline / Not a cow — remove; queue anti-join on false positives | **M** | the triage shortcut |
-| 6 | Export override (COALESCE + drop) + progress counters + manual section | **S** | loop closed |
+| # | Phase | Effort | Ships as | Status |
+|---|---|---|---|---|
+| 0 | M4 phase 0 verbatim: `mask_poly`/`mask_parts` persisted; `DET_COLS`; both ALTERs; clip/restore test | **M** | new data gets masks | **todo** |
+| 1 | `cownting remask` backfill (M4 phase 1 verbatim) | **M** | old data gets masks | **todo** |
+| 2 | `mask_edits` DDL + views; `submit_mask_edit`; `crop_to_frame` beside `crop_geometry` | **M** | store | **done** |
+| 3 | `POST /api/label/mask-fix`; validation; queue anti-join on false positives | **M** | backend | **done** |
+| 4 | Toggle + `MaskEditor` + `MaskPanel`; queue `kind: "mask"`; bbox seeding | **L** | the feature | **done** |
+| 5 | Flag-row integration: mask overlay on `F`, Fix outline / Not a cow — remove | **M** | the triage shortcut | **done** |
+| 6 | Export override (COALESCE + drop) + progress counters | **S** | loop closed | **todo** |
+
+**What phases 0–1 still gate.** Everything below the editor is built and
+exercised, but with no `detections.mask_poly` there is no model polygon to show:
+every instance is `mask_seed: "bbox"`, so the editor opens on a rectangle at the
+ring rather than on the model's outline, the flag row draws no amber shape, and
+`mask_rev`/`iou_source` are null (the 409 `mask_stale` check is written but
+cannot fire — see §4.2). Sculpting from the rectangle and the false-positive
+verdict both work today and both store correctly; the *review* half of the
+feature arrives with phase 0.
 
 Tests, mirroring `test_labels_schema.py` / `test_labels_api.py`: the phase-0
 suite from M4 §8 unchanged; crop-local→full-frame round-trips to sub-pixel

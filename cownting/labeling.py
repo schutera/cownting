@@ -336,7 +336,8 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    coalesce(cov.n_annotators_skipped, 0) AS n_skipped,
                    (substr(k.instance_key, 1, 4) < ?) AS overlap,
                    CASE WHEN substr(k.instance_key, 1, 4) < ? THEN ? ELSE ? END AS target,
-                   (mine.effective_key IS NOT NULL) AS mine_done
+                   (mine.effective_key IS NOT NULL) AS mine_done,
+                   (fp.effective_key IS NOT NULL) AS false_positive
             FROM keyed k
             LEFT JOIN datasets ds ON ds.dataset_id = k.dataset_id
             -- Every join is on effective_key, never instance_key (§2.4): after a
@@ -348,6 +349,12 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
             -- correlated subquery inside the FILTER clauses `progress` needs.
             LEFT JOIN (SELECT DISTINCT effective_key FROM {alias}.v_current_annotations
                        WHERE annotator = ?) mine ON mine.effective_key = k.instance_key
+            -- Declared not-an-animal by someone (M4a §4.2). Unlike a skip this
+            -- retires the instance for EVERYONE, not just its author: there are
+            -- no questions to ask about a cow that is not there, and re-serving
+            -- it would collect answers about a shadow. Not annotator-scoped, and
+            -- an anti-join for the same reason `mine` is one.
+            LEFT JOIN {alias}.v_false_positives fp ON fp.effective_key = k.instance_key
         )""",
         params,
     )
@@ -397,7 +404,10 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
     with attached_labels(con, config) as alias:
         cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
                                 camera=camera, day=day)
-        where = ["s.n_labeled < s.target", "s.n_skipped < ?"]
+        # `NOT s.false_positive` is unconditional — it is not a preference like
+        # `mine`, and no filter combination may bring back an instance somebody
+        # has judged not to be an animal.
+        where = ["s.n_labeled < s.target", "s.n_skipped < ?", "NOT s.false_positive"]
         params.append(cfg.skip_retire)
         if excl:
             where.append(f"s.instance_key NOT IN ({', '.join('?' * len(excl))})")
@@ -482,10 +492,16 @@ def progress(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str =
                    count(*) FILTER (WHERE n_labeled >= target)           AS at_target,
                    count(*) FILTER (WHERE n_labeled < target
                                       AND n_skipped >= ?)                AS retired,
+                   -- `remaining` and `mine_remaining` must agree with what the
+                   -- queue will actually serve, or the panel counts down towards
+                   -- a number of items that can never arrive and the page never
+                   -- reaches "you're caught up".
                    count(*) FILTER (WHERE n_labeled < target
-                                      AND n_skipped < ?)                 AS remaining,
+                                      AND n_skipped < ?
+                                      AND NOT false_positive)            AS remaining,
                    count(*) FILTER (WHERE n_labeled < target
-                                      AND n_skipped < ? AND NOT mine_done) AS mine_remaining,
+                                      AND n_skipped < ? AND NOT mine_done
+                                      AND NOT false_positive)            AS mine_remaining,
                    -- The two halves of an honest progress bar: annotations that
                    -- exist against annotations the policy is asking for. Summing
                    -- `target` rather than multiplying by targets_per_instance is
@@ -658,6 +674,30 @@ def crop_geometry(bbox: Sequence[float], pad: float, max_width: int
     out = max(1, int(math.floor(n * scale + 0.5)))
     ring = ((x1 - x0) * scale, (y1 - y0) * scale, (x2 - x0) * scale, (y2 - y0) * scale)
     return (x0, y0, x0 + n, y0 + n), out, ring
+
+
+def crop_to_frame(points: Sequence[Sequence[float]], bbox: Sequence[float], *,
+                  pad: float, max_width: int) -> list[list[float]]:
+    """Crop-local px -> full-frame px, the inverse of `crop_geometry`'s `ring`.
+
+    The outline editor edits in the crop's coordinate space (M4a §4.1) because
+    that is the space `ring` already established and the client can draw in with
+    no math; the STORE is full-frame px, because that is the space `bbox_*`,
+    `scene/regions.py` and the YOLO-seg export all live in. Something has to
+    convert, and it is this — server-side, once, next to the forward transform it
+    inverts, so the two cannot drift apart. A second copy of this arithmetic
+    anywhere else is how every saved polygon would silently shear.
+
+    Derived from `ring`'s own line: `ring_x = (x - x0) * scale`, therefore
+    `x = x0 + crop_x / scale`. `scale` is recomputed from the same inputs rather
+    than passed in, so a caller cannot supply one that disagrees with the crop
+    the annotator was actually served."""
+    (x0, y0, x1c, _y1c), _out, _ring = crop_geometry(bbox, pad, max_width)
+    n = max(1, x1c - x0)
+    scale = min(1.0, float(max_width) / n) if max_width > 0 else 1.0
+    if scale <= 0:
+        raise ValueError("degenerate crop scale")
+    return [[x0 + float(px) / scale, y0 + float(py) / scale] for px, py in points]
 
 
 def frame_path_for(config: Config, dataset_id: str | None, camera_id: str,
