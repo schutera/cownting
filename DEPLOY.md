@@ -206,3 +206,115 @@ as a 500 (`PermissionError`) on some unrelated save. Two layers of defence:
 - **Uploads are in-memory jobs.** A restart mid-processing loses the *job
   progress bar*, not the data (finished rows are durable in DuckDB); just
   re-upload that day if it was interrupted.
+
+## Shipping segmentation outlines (M4 phase 0) and backfilling them
+
+This release stores each detection's **instance outline** (`detections.mask_poly`,
+`mask_parts`) so annotators can correct the model's actual mask instead of a
+rectangle. Two independent steps: deploy the code, then backfill the outlines
+onto footage processed before it. **The deploy is safe on its own** — until the
+backfill runs, the Label page falls back to a box-shaped outline, which is
+degraded but not broken.
+
+### 1. Deploy (no manual migration)
+
+```bash
+git pull
+docker compose up -d --build
+docker compose logs -f cownting
+```
+
+`db.init_db` runs on every boot, so the two columns are added automatically —
+there is no migration command. Verify they landed, on **both** tables:
+
+```bash
+docker compose exec -u cownting cownting python -c \
+'from cownting import db; c=db.connect("data/cownting.duckdb", read_only=True); \
+print([r[1] for r in c.execute("PRAGMA table_info(detections)").fetchall()][-2:]); \
+print([r[1] for r in c.execute("PRAGMA table_info(clipped_detections)").fetchall()][-2:])'
+```
+
+Both must print `['mask_poly', 'mask_parts']`. If `clipped_detections` is missing
+them the next camera clip raises — that table is created once by a CTAS and
+these are the first columns ever added to `detections` after it existed.
+
+### 2. Back up first — nothing does it for you
+
+`data/cownting.duckdb` has **no** automatic backup (the weekly zip covers
+`labels.duckdb` only, and it is off by default). The backfill issues one
+`UPDATE` per detection with no surrounding transaction, so this copy is the only
+undo:
+
+```bash
+docker compose stop cownting
+cp -a data/cownting.duckdb ~/backups/cownting.duckdb.$(date +%F-%H%M)
+docker compose start cownting
+```
+
+### 3. Backfill from the app, NOT from the CLI
+
+```
+POST /api/remask            (poweruser)   optional: ?dataset=&camera=&limit=
+```
+
+Progress appears on the dashboard as **"Tracing cow outlines"** and in
+`GET /api/uploads` like any other job.
+
+> **Do not run `cownting remask` against a live server.** DuckDB allows one
+> read-write *process* per file and the pass holds a write handle for its whole
+> duration, so the CLI does not slow the app down — it takes it **off the air**
+> until it finishes: every request burns its ~9 s connect-retry budget and then
+> 500s. The route runs the same pass *inside* the server process, where the
+> handle is already ours and there is no contention.
+>
+> The CLI form stays correct for a **stopped** stack or a fresh box:
+> ```bash
+> docker compose stop cownting
+> docker compose run --rm -T -u cownting cownting \
+>   python -m cownting.cli remask -c config/cownting.prod.yaml
+> docker compose start cownting
+> ```
+> (`run`, not `exec` — `exec` cannot reach a stopped container.)
+
+**Budget the time.** This server is CPU-only, and the pass is one full
+segmenter inference per frame with `yolo11x-seg` at `imgsz: 1280` — think
+seconds per frame, so a large corpus is hours. It occupies the same serial queue
+uploads use, so a day uploaded meanwhile waits behind it. The pass is
+**resumable** (it only selects frames that still have a detection with no
+outline), so run it in chunks and let uploads through between them:
+
+```bash
+curl -X POST 'https://<site>/api/remask?dataset=2025-07-03'   # one day at a time
+```
+
+Size the job and watch it finish:
+
+```bash
+docker compose exec -u cownting cownting python -c \
+'from cownting import db; c=db.connect("data/cownting.duckdb", read_only=True); \
+print(c.execute("SELECT count(*) AS dets, count(mask_poly) AS with_outline FROM detections").fetchone())'
+```
+
+The job's final message reports the **match rate**. Each re-predicted mask is
+attached to an existing detection by IoU against its stored box, and **only the
+two outline columns are written** — never the box, the score or the area, all of
+which are identity material for the labels already collected. A rate below 80%
+is called out explicitly: it means the current weights no longer reproduce these
+detections, so `detect.yolo_weights` must match what the footage was originally
+segmented with (`yolo11x-seg.pt`). Do not "speed up" the backfill with a smaller
+model — the outlines would come from a different model than the boxes beside them.
+
+### 4. Undo
+
+Rolling back the *data* costs nothing structural — the columns are additive and
+nullable:
+
+```sql
+UPDATE detections SET mask_poly = NULL, mask_parts = NULL;   -- app stopped
+```
+
+That returns the Label page to box-shaped outlines. If you roll back the *code*
+after the columns exist, drop them in the same window: `restore_clip` on old code
+would silently return clipped rows with their outlines NULLed, and a fresh
+archive DB created by old code will not line up with a live table that has two
+extra columns.

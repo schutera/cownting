@@ -46,6 +46,7 @@ from .config import CameraCfg, Config, DatasetCfg
 from .pipeline import ingest as run_ingest
 from .pipeline import ingest_one_camera as run_ingest_one
 from .pipeline import localize as run_localize
+from .pipeline import remask as run_remask
 from .pipeline import segment as run_segment
 
 # A camera id is used verbatim as a filesystem subdir and as a region_id prefix
@@ -69,7 +70,13 @@ class Job:
     dataset_id: str
     label: str
     status: str = "queued"      # queued | running | done | failed
-    stage: str = "queued"       # queued | ingesting | segmenting | localizing | done
+    stage: str = "queued"       # queued | ingesting | segmenting | localizing | remasking | done
+    # What this job IS. 'upload' covers both a whole day and an added camera —
+    # they differ in scope, not in kind. 'remask' is the outline backfill, which
+    # is NOT tied to one day's arrival and must therefore be kept out of the
+    # per-dataset job map the dashboard builds, or it would displace the upload
+    # job for whichever day it happens to name.
+    kind: str = "upload"        # upload | remask
     progress: float = 0.0       # 0..1, coarse (stage boundaries + per-frame during segment)
     message: str = "Queued"
     error: Optional[str] = None
@@ -292,6 +299,64 @@ def start_add_camera_job(
     # the same database, so it must not overlap one.
     _enqueue(_run_add_camera, job, base, dataset_id, camera_id, video_path, start_iso)
     return job
+
+
+def start_remask_job(base: Config, dataset_id: str | None = None,
+                     camera_id: str | None = None, limit: int | None = None) -> Job:
+    """Queue the outline backfill and return immediately.
+
+    IT RUNS IN THIS PROCESS, ON THE SAME SERIAL QUEUE as uploads, and that is the
+    whole reason this exists rather than leaving `cownting remask` as the only
+    entry point. DuckDB allows one read-write PROCESS per file, and `remask` holds
+    a write handle for its entire pass — so running the CLI against a live
+    deployment does not slow the app down, it takes it OFF THE AIR for the
+    duration: every request burns its ~9 s connect-retry budget and then 500s.
+    In-process, the handle is already ours and there is no contention at all.
+
+    The cost of that choice, stated plainly: the backfill occupies the upload
+    queue, so a day uploaded while it runs waits behind it. On a CPU-only
+    deployment a whole-corpus pass is hours, which is why `dataset_id` /
+    `camera_id` / `limit` are here — the pass is resumable, so an operator can
+    run it in bounded chunks and let uploads through between them.
+    """
+    scope = dataset_id or "all days"
+    job = Job(job_id=uuid.uuid4().hex, dataset_id=dataset_id or "",
+              label=f"Outlines · {scope}", kind="remask")
+    with _LOCK:
+        _JOBS[job.job_id] = job
+        _persist(force=True)
+    _enqueue(_run_remask, job, base, dataset_id, camera_id, limit)
+    return job
+
+
+def _run_remask(job: Job, base: Config, dataset_id: str | None,
+                camera_id: str | None, limit: int | None) -> None:
+    try:
+        _update(job, status="running", stage="remasking", progress=0.02,
+                message="Looking for detections without an outline…")
+
+        def on_frame(done: int, total: int) -> None:
+            frac = done / total if total else 1.0
+            _update(job, progress=0.02 + 0.96 * frac,
+                    message=f"Tracing outlines… frame {done}/{total}")
+
+        stats = run_remask(base, dataset_id=dataset_id, camera_id=camera_id,
+                           limit=limit, on_progress=on_frame)
+        matched, dets = stats["matched"], stats["detections"]
+        rate = (100.0 * matched / dets) if dets else 0.0
+        msg = (f"Traced {matched} of {dets} outlines ({rate:.0f}%) "
+               f"across {stats['frames']} frames.")
+        if dets and rate < 80.0:
+            # Not a failure — the rows that matched are correct — but the operator
+            # has to know the segmenter no longer reproduces these detections, or
+            # they will trust outlines that came from different weights than the
+            # boxes beside them.
+            msg += (" LOW MATCH RATE — check the weights match the ones this "
+                    "footage was segmented with.")
+        _update(job, status="done", stage="done", progress=1.0,
+                detections=matched, frames=stats["frames"], message=msg)
+    except Exception as e:  # noqa: BLE001 — surface it in the UI, never kill the worker
+        _update(job, status="failed", error=str(e), message=f"Failed: {e}")
 
 
 def _run_add_camera(

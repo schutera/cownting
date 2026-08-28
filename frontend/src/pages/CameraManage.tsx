@@ -41,6 +41,7 @@ const STAGE_LABEL: Record<UploadJob["stage"], string> = {
   ingesting: "Sampling frames",
   segmenting: "Detecting cows",
   localizing: "Placing in areas",
+  remasking: "Tracing outlines",
   done: "Done",
 };
 

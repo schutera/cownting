@@ -89,6 +89,50 @@ function ProcessingStrip({ row, job }: { row: DatasetRow; job?: UploadJob }) {
   );
 }
 
+/** WHAT THE MODEL IS DOING RIGHT NOW, for any day.
+ *
+ * Distinct from ProcessingStrip, which is about the day on screen and whether
+ * its numbers can be trusted. This one answers a different question — "is the
+ * machine busy?" — and it exists because the two long passes an operator can
+ * start are otherwise invisible from the landing page: a day still segmenting
+ * under another dataset, and the outline backfill, which belongs to no day at
+ * all and so can never appear in a per-dataset strip.
+ *
+ * Renders nothing when nothing is running: a permanent "idle" row is a line the
+ * eye learns to skip, which is exactly the wrong training for a status light.
+ */
+function ModelBusyStrip({ jobs }: { jobs: UploadJob[] }) {
+  if (jobs.length === 0) return null;
+  // One line, and the most advanced job wins it — with several queued, the one
+  // actually running is the one whose progress is moving.
+  const lead = [...jobs].sort((a, b) => b.progress - a.progress)[0];
+  const pct = Math.round(lead.progress * 100);
+  const others = jobs.length - 1;
+  return (
+    <div
+      className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border
+                 border-accent/25 bg-accent-soft/40 px-3.5 py-2.5"
+      role="status"
+      aria-live="polite"
+    >
+      <span className="w-2 h-2 rounded-full shrink-0 bg-accent animate-pulse" />
+      <span className="text-[13px] text-near-black">
+        {lead.kind === "remask" ? "Tracing cow outlines" : "The model is working"}
+        {lead.label ? <span className="text-gray-mid"> · {lead.label}</span> : null}
+      </span>
+      <span className="text-[12px] text-gray-mid truncate">{lead.message}</span>
+      {others > 0 ? (
+        <span className="text-[12px] text-gray-tertiary shrink-0">
+          +{others} queued
+        </span>
+      ) : null}
+      <span className="ml-auto font-mono text-[11px] text-gray-tertiary tabular-nums shrink-0">
+        {pct}%
+      </span>
+    </div>
+  );
+}
+
 function Shimmer() {
   return (
     <div className="animate-shimmer grid grid-cols-1 lg:grid-cols-[264px_minmax(0,1fr)_320px] gap-6 items-start">
@@ -106,7 +150,7 @@ export default function Dashboard() {
   // Processing state for the day on screen. `row.status` (durable) says whether
   // the numbers can be trusted yet; `job` (live) supplies the percentage.
   const { datasets, dataset, refresh, loaded: daysLoaded } = useDataset();
-  const jobs = useUploadJobs();
+  const { byDataset: jobs, active: activeJobs } = useUploadJobs();
   const row = datasets.find((d) => d.dataset_id === dataset) ?? null;
   const job = dataset ? jobs[dataset] : undefined;
   const processing = row ? !isReady(row.status) : false;
@@ -195,6 +239,7 @@ export default function Dashboard() {
     return (
       <div className="flex flex-col gap-6">
         <DatasetPicker />
+        <ModelBusyStrip jobs={activeJobs} />
         {processing && row ? (
           <ProcessingNotice row={row} job={job} />
         ) : (
@@ -212,6 +257,10 @@ export default function Dashboard() {
         {/* Day / data-package selector — dashboard-specific, so it rides here
             rather than in the global header. */}
         <DatasetPicker />
+        {/* Anything the model is chewing on right now, for ANY day — an upload
+            still segmenting, or an outline backfill. Above the day-scoped strip
+            because it is not about the day on screen. */}
+        <ModelBusyStrip jobs={activeJobs} />
         {/* Partly-processed day: the charts below are real but incomplete, so
             say so rather than letting a half-filled dashboard read as the truth. */}
         {processing && row ? <ProcessingStrip row={row} job={job} /> : null}

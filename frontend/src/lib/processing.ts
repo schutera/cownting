@@ -73,8 +73,16 @@ const POLL_IDLE_MS = 20000;
  * Only the newest job per day is kept: `list_jobs()` returns active-first then
  * newest-first, so the first sighting of a dataset_id is the one that matters.
  */
-export function useUploadJobs(): Record<string, UploadJob> {
-  const [byDataset, setByDataset] = useState<Record<string, UploadJob>>({});
+/** Every job the model is working on right now, whatever kind and whatever day.
+    Returned alongside the per-dataset map because a backfill belongs to no
+    single day, so a caller that only has `byDataset` cannot see one at all. */
+export interface UploadJobs {
+  byDataset: Record<string, UploadJob>;
+  active: UploadJob[];
+}
+
+export function useUploadJobs(): UploadJobs {
+  const [state, setState] = useState<UploadJobs>({ byDataset: {}, active: [] });
 
   useEffect(() => {
     let alive = true;
@@ -86,9 +94,18 @@ export function useUploadJobs(): Record<string, UploadJob> {
         const jobs = await listUploadJobs();
         if (!alive) return;
         const map: Record<string, UploadJob> = {};
-        for (const j of jobs) if (!(j.dataset_id in map)) map[j.dataset_id] = j;
-        setByDataset(map);
-        if (jobs.some(isJobActive)) next = POLL_ACTIVE_MS;
+        // Remask jobs are EXCLUDED from the per-dataset map on purpose. The list
+        // is active-first then newest-first, so a backfill naming a day would
+        // otherwise win that day's slot and the dashboard would report "tracing
+        // outlines" as if it were that day's upload — which is how the day's
+        // real progress, and its warnings, would silently disappear.
+        for (const j of jobs) {
+          if (j.kind === "remask") continue;
+          if (!(j.dataset_id in map)) map[j.dataset_id] = j;
+        }
+        const active = jobs.filter(isJobActive);
+        setState({ byDataset: map, active });
+        if (active.length > 0) next = POLL_ACTIVE_MS;
       } catch {
         /* transient — keep the last known state and try again */
       }
@@ -102,5 +119,5 @@ export function useUploadJobs(): Record<string, UploadJob> {
     };
   }, []);
 
-  return byDataset;
+  return state;
 }

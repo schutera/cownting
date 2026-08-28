@@ -1089,6 +1089,27 @@ def create_app(config: Config) -> FastAPI:
         """Background-localize progress for the 'the box is working' spinner."""
         return localize_worker.status()
 
+    @app.post("/api/remask", dependencies=[Depends(require_poweruser)])
+    def remask(dataset: str | None = None, camera: str | None = None,
+               limit: int | None = None):
+        """Backfill segmentation outlines onto already-processed footage.
+
+        Runs IN THIS PROCESS on the upload queue, not as a separate command, and
+        that is a hard requirement rather than a convenience: `cownting remask`
+        holds a DuckDB write handle for its whole pass, and DuckDB allows one
+        read-write process per file — so running the CLI against a live server
+        does not slow it down, it takes it off the air until the pass ends. Here
+        the handle is already ours.
+
+        Poweruser-gated because it is a long, expensive pass that occupies the
+        queue every upload also uses. Returns the job immediately; progress rides
+        `GET /api/uploads` like every other job, so there is no second status
+        route and no second poll.
+        """
+        job = uploads_mod.start_remask_job(config, dataset_id=dataset,
+                                           camera_id=camera, limit=limit)
+        return uploads_mod.job_dict(job)
+
     # ------------------------------------------------------------------ uploads
     @app.post("/api/uploads", dependencies=[Depends(require_poweruser)])
     def create_upload(

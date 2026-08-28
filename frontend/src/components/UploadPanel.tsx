@@ -31,6 +31,7 @@ const STAGE_LABEL: Record<UploadJob["stage"], string> = {
   ingesting: "Sampling frames",
   segmenting: "Detecting cows",
   localizing: "Placing in areas",
+  remasking: "Tracing outlines",
   done: "Done",
 };
 
@@ -85,7 +86,7 @@ export function UploadPanel() {
   const [zones, setZones] = useState<Zone[]>(() => makeZones(DEFAULT_ZONES));
   // Every in-flight day, polled process-wide. One source for both the banner and
   // the queue list, so a day queued from another tab shows up here too.
-  const jobs = useUploadJobs();
+  const { byDataset: jobs } = useUploadJobs();
   // The day THIS panel just submitted, seeded from the 202 so the banner appears
   // before the first poll lands; the polled copy takes over as soon as it does.
   const [seed, setSeed] = useState<UploadJob | null>(null);

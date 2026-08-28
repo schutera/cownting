@@ -27,7 +27,7 @@ export default function DataOverview() {
   const { datasets, dataset, setDataset, refresh, loaded } = useDataset();
   // Live processing state per day: the card shows a day as soon as its footage
   // has landed, so it needs to say how far the model has got on it.
-  const jobs = useUploadJobs();
+  const { byDataset: jobs } = useUploadJobs();
   // Days are processed one at a time, so with several queued this list goes stale
   // repeatedly. Re-read it each time the in-flight count changes — that is when a
   // day's settled frame/cow counts and final status become available.

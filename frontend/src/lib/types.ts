@@ -43,7 +43,12 @@ export interface DatasetRow { dataset_id:string; day:string|null; label:string|n
 export interface UploadJob {
   job_id:string; dataset_id:string; label:string;
   status:"queued"|"running"|"done"|"failed";
-  stage:"queued"|"ingesting"|"segmenting"|"localizing"|"done";
+  stage:"queued"|"ingesting"|"segmenting"|"localizing"|"remasking"|"done";
+  // What the job IS. 'upload' covers a whole day and an added camera alike —
+  // they differ in scope, not in kind. 'remask' is the outline backfill, which
+  // belongs to no single day and must be kept OUT of the per-dataset job map, or
+  // it would displace the upload job for whichever day it names.
+  kind?:"upload"|"remask";
   progress:number; message:string; error:string|null;
   frames:number; detections:number; created_at:number;
   // Advisory per-camera quality warnings, present on completed jobs (e.g.
