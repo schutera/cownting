@@ -1746,16 +1746,27 @@ function GeometryPanel({
   onFix: () => void;
   onRemove: () => void;
 }) {
+  /* The question is PRESENCE first, geometry second — "is there a cow in this
+     box", not "is this the right cow". There is no other cow to be right about:
+     the detector proposed a box, and step 1 asks whether it found an animal and
+     drew it correctly. The three answers are the three stored verdicts
+     (labels_db.MASK_EDIT_KINDS): ok, imprecise-so-corrected, not_a_cow. */
   const CHOICES = [
     {
       key: "Enter",
-      label: hasMask ? "Outline is right" : "Box is right",
-      hint: "accept and answer",
+      label: "Yes",
+      hint: hasMask ? "outline is right" : "box is right",
       onClick: onConfirm,
       primary: true,
     },
-    { key: "E", label: "Fix it", hint: "drag the points", onClick: onFix, primary: false },
-    { key: "X", label: "Not a cow", hint: "remove it", onClick: onRemove, primary: false },
+    {
+      key: "E",
+      label: "Yes, but…",
+      hint: hasMask ? "fix the outline" : "fix the box",
+      onClick: onFix,
+      primary: false,
+    },
+    { key: "X", label: "No cow", hint: "remove it", onClick: onRemove, primary: false },
   ];
   return (
     <div
@@ -1771,7 +1782,7 @@ function GeometryPanel({
     >
       <div className="flex items-center gap-2" style={{ height: 24 }}>
         <span className="text-[13px] font-semibold uppercase tracking-[0.08em] leading-none">
-          {hasMask ? "Is the outline right?" : "Is the box on the right animal?"}
+          Is there a cow in the box?
         </span>
         <span className="ml-auto font-mono text-[11px] tabular-nums" style={{ color: INK_DIM }}>
           {`[1/${stepCount}]`}
