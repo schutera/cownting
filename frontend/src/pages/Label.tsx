@@ -433,7 +433,12 @@ export default function Label() {
      the corpus gains a per-model false-positive rate instead of only corrections.
      A crop that could not be shown is exempt — there is nothing to verify, and F
      is the way out of those. */
-  const geomDone = currentKey === null ? false : (geomByKey[currentKey] ?? false);
+  // This session's verdict first, then the one the server already holds. The
+  // fallback is what makes the step survive a reload: without it the gate
+  // re-asks about a cow this annotator already judged, and answering that second
+  // asking used to overwrite their own correction.
+  const geomDone =
+    currentKey === null ? false : (geomByKey[currentKey] ?? current?.geom_done ?? false);
   const inGeometry = current !== null && !geomDone && !cropFailed;
 
   useEffect(() => {
@@ -612,7 +617,7 @@ export default function Label() {
         ...t,
         items: t.items.map((it) =>
           it.instance_key === key
-            ? { ...it, mask, mask_frame: maskFrame, mask_seed: "mask" }
+            ? { ...it, mask, mask_frame: maskFrame, mask_seed: "edit" }
             : it,
         ),
       });
@@ -896,7 +901,10 @@ export default function Label() {
         // never disagree about where the annotator put a node.
         polygon: kind === "polygon" && draft !== null ? draft.map(([x, y]): [number, number] => [x, y]) : null,
         mask_rev: current.mask_rev ?? null,
-        seeded_from: servedMask === null ? "bbox" : "mask",
+        // What this correction was actually drawn over, straight from the item —
+        // never re-derived here, or the stored provenance would be the client's
+        // opinion rather than what the server served.
+        seeded_from: servedMask === null ? "bbox" : (current.mask_seed ?? "model"),
         serve_event_id: current.serve_event_id,
         session_id: sessionId,
         client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),

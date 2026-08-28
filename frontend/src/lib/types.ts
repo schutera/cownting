@@ -234,11 +234,18 @@ export interface LabelItem {
   // misplaced one.
   frame_w?: number | null;
   frame_h?: number | null;
+  // Whether THIS annotator has already passed the geometry step for this
+  // instance. Server-derived from their standing verdict, not remembered in the
+  // browser: the step's memory used to be React state, so a reload re-asked
+  // about a cow they had already corrected.
+  geom_done?: boolean;
 }
 
-// Where the editable outline came from: the stored model mask, or (when none is
-// stored yet) a rectangle at the ring the annotator sculpts into one.
-export type MaskSeed = "mask" | "bbox";
+// Where the editable outline came from. Echoed on submit so a stored correction
+// says what it was drawn over: improving the MODEL's outline is a statement about
+// the model, refining your own earlier EDIT is a statement about yourself, and
+// sculpting from the BBOX rectangle (no stored outline at all) is neither.
+export type MaskSeed = "model" | "edit" | "bbox";
 // The two-way branch the outline tool offers (plan §3): correct the shape, or
 // declare there is nothing to outline. Frozen in code like the flag reasons —
 // each kind has export semantics and its own UI path.

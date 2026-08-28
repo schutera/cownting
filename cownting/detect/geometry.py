@@ -32,6 +32,132 @@ def ground_point_from_bbox(bbox: Tuple[float, float, float, float]) -> Tuple[flo
     return (x1 + x2) / 2.0, float(y2)
 
 
+# --------------------------------------------------------------- the stored outline
+# The mask reduced to something a database can hold and an annotator can drag
+# (M4 §2.2). It shares its middle three lines with finetune/dataset.py's
+# `_mask_to_polygon` — RETR_EXTERNAL, largest contour by area — but NOT its
+# contract, and the two must not be merged: that one takes a BBOX-LOCAL FiftyOne
+# mask and resizes it to the box, and returns a FLAT NORMALISED list for the YOLO
+# text format. Ours is already frame-aligned (resizing it would shrink it by the
+# frame/box ratio), returns [[x, y], …] PIXEL pairs to match mask_edits.polygon,
+# simplifies, and reports the part count.
+_MIN_MASK_PX = 20        # a speck is not an animal (mirrors finetune/dataset.py)
+_MIN_POLY_PTS = 3        # below this it is not a shape (mirrors labels_db.MASK_MIN_POINTS)
+# == labels_db.MASK_MAX_POINTS. Restated rather than imported: cownting.detect must
+# not depend on the label store. It matters because a served polygon can be echoed
+# straight back into /api/label/mask-fix, which rejects anything above the cap.
+_MAX_POLY_PTS = 400
+# ~300 raw contour points per cow -> ~30. Measured, not guessed: at eps=0 the same
+# corpus costs 26x the storage and DuckDB's string compression stops paying for
+# itself, so this is what makes the column ~40 MB per 200k detections instead of
+# ~1 GB.
+SIMPLIFY_EPS_PX = 2.0
+
+
+def mask_to_polygon(
+    mask: np.ndarray,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+    *,
+    expect_shape: Optional[Tuple[int, int]] = None,
+    eps_px: float = SIMPLIFY_EPS_PX,
+    max_points: int = _MAX_POLY_PTS,
+) -> Optional[Tuple[list, int]]:
+    """Frame-aligned bool mask -> `(largest external contour in FULL-FRAME px, n_parts)`.
+
+    `bbox` is a PERFORMANCE argument and never a semantic one — the coordinates
+    come back in full-frame space either way. It matters more than it looks:
+    findContours over a 4K frame costs ~12 ms per instance (half of it the
+    bool->uint8 cast), so twenty cows would add ~250 ms to a frame, the same order
+    as the inference itself. Cropped to the instance's own box it is ~0.03 ms.
+    Ultralytics' `process_mask_native` already zeroes the mask outside the box, so
+    the crop cannot lose foreground, and it is padded by a pixel so the contour
+    never has to run along the array edge.
+
+    Returns None for a mask that is absent, degenerate or smaller than
+    `_MIN_MASK_PX`. The caller then stores NULL, which every consumer already
+    reads as "no stored outline".
+    """
+    if mask is None or getattr(mask, "ndim", 0) != 2:
+        return None
+    # THE COORDINATE-SPACE GUARD, and it is load-bearing. Full-frame alignment is
+    # not something this repo asserts anywhere — it is a consequence of
+    # `retina_masks=True` routing Ultralytics through process_mask_native; the
+    # default path returns proto-resolution masks about a quarter of the frame.
+    # Today a proto-resolution mask crashes loudly in render_overlay, which
+    # boolean-indexes a frame-shaped array with it. A backfill renders no overlay,
+    # so the same misconfiguration would SILENTLY write every polygon wrong by the
+    # stride factor — outlines landing a quarter of the way up the frame, on the
+    # wrong animal, with nothing to show anything had gone wrong.
+    if expect_shape is not None and tuple(mask.shape[:2]) != tuple(expect_shape):
+        raise ValueError(
+            f"mask is {mask.shape[:2]} but the frame is {tuple(expect_shape)} — "
+            "the segmenter is not returning full-resolution masks "
+            "(check retina_masks=True); refusing to store a mis-scaled outline"
+        )
+    h, w = mask.shape
+    ox = oy = 0
+    sub = mask
+    if bbox is not None:
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+        ox = max(0, int(np.floor(min(x1, x2))) - 1)
+        oy = max(0, int(np.floor(min(y1, y2))) - 1)
+        ex = min(w, int(np.ceil(max(x1, x2))) + 1)
+        ey = min(h, int(np.ceil(max(y1, y2))) + 1)
+        if ex <= ox or ey <= oy:
+            return None
+        sub = mask[oy:ey, ox:ex]
+    # A slice is not contiguous, and findContours needs a contiguous CV_8UC1.
+    m = np.ascontiguousarray(sub, dtype=np.uint8)
+    if int(m.sum()) < _MIN_MASK_PX:
+        return None
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    # RETR_EXTERNAL retrieves only OUTERMOST contours, so a mask with a hole is one
+    # part while a cow split by an occluding panel is two — which is exactly the
+    # "fragmented outline" signal a reviewer needs. Free: same call, no second pass.
+    parts = len(cnts)
+    cnt = max(cnts, key=cv2.contourArea)
+
+    # Escalate rather than reject. A ragged mask that simplifies to more than the
+    # cap is unstorable downstream, and refusing it would throw away a real animal
+    # over a rendering detail; doubling eps converges in a couple of rounds.
+    eps = max(float(eps_px), 0.0)
+    approx = cv2.approxPolyDP(cnt, eps, True) if eps > 0 else cnt
+    # max_points <= 0 means "no cap" — the training-label caller wants the raw
+    # contour, where fidelity is worth the bytes because it is written once and
+    # read by a trainer, not dragged by hand on every queue fetch.
+    if max_points > 0:
+        for _ in range(8):
+            if len(approx) <= max_points:
+                break
+            eps = eps * 2 if eps > 0 else 1.0
+            approx = cv2.approxPolyDP(cnt, eps, True)
+
+    pts = np.asarray(approx).reshape(-1, 2)
+    # The floor is checked AFTER simplification, not before: approxPolyDP can
+    # collapse a 4-point sliver to one or two points, and a 1-point "polygon"
+    # renders as nothing and is rejected by the submit route on echo-back. The
+    # export helper's pre-simplification check would not catch it.
+    if len(pts) < _MIN_POLY_PTS:
+        return None
+    # cv2 contour points are already (x, y) — image convention, not numpy (row,
+    # col) — so only the crop origin has to be added back. Reach for np.argwhere,
+    # skimage.find_contours or rasterio.shapes instead and they return (row, col),
+    # which on a near-square animal still looks like a cow and is silently
+    # transposed. findContours, and nothing else.
+    #
+    # The +0.5 converts a pixel INDEX to a pixel CENTRE. bbox_* are continuous
+    # edge coordinates — pixel i spans [i, i+1) — so raw indices put the outline
+    # half a pixel up-left of the mask and read as 1.5 px inside the ring on the
+    # right and bottom. It is the same index-versus-edge slip this module already
+    # carries between ground_point_from_mask (a row index) and
+    # ground_point_from_bbox (an edge), and it is visible at the zoom the outline
+    # editor works at.
+    poly = [[float(x) + ox + 0.5, float(y) + oy + 0.5] for x, y in pts]
+    return poly, int(parts)
+
+
 def _elongation_from_mask(mask: np.ndarray) -> Optional[float]:
     cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:

@@ -215,7 +215,7 @@ function parseMaskKind(v: unknown): MaskFixKind | null {
 }
 
 function parseSeed(v: unknown): MaskSeed | null {
-  return v === "mask" || v === "bbox" ? v : null;
+  return v === "model" || v === "edit" || v === "bbox" ? v : null;
 }
 
 function parseWrite(v: unknown): LabelWrite | null {

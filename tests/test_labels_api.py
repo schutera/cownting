@@ -73,7 +73,7 @@ _ITEM_FIELDS = (
     "ring", "n_annotators", "target", "overlap", "serve_event_id",
     # M4a: the outline in both spaces, plus the frame's ORIGINAL dimensions the
     # hold-Space peek needs to place full-frame coordinates on a DOWNSCALED image.
-    "mask", "mask_frame", "mask_seed", "frame_w", "frame_h",
+    "mask", "mask_frame", "mask_seed", "frame_w", "frame_h", "geom_done",
 )
 
 
@@ -943,8 +943,13 @@ def test_ok_never_destroys_my_own_correction():
         again = [i for i in client.get("/api/label/queue").json()["items"]
                  if i["instance_key"] == item["instance_key"]]
         check("...and still comes back on the item",
-              again and again[0]["mask"] is not None and again[0]["mask_seed"] == "mask",
+              again and again[0]["mask"] is not None and again[0]["mask_seed"] == "edit",
               str(again[0]["mask_seed"] if again else "gone"))
+        # The trigger, closed at the source: the server tells the client the
+        # geometry step is already passed, so a reload does not ask again.
+        check("...and the item says the geometry step is already passed",
+              again and again[0]["geom_done"] is True,
+              str(again[0]["geom_done"] if again else "gone"))
 
         # A false positive is also stronger than 'ok': confirming afterwards must
         # not resurrect a detection someone judged not to be an animal.
@@ -999,6 +1004,8 @@ def test_saved_outline_comes_back_on_the_queue_item():
         check("before any edit the item carries no outline",
               item["mask"] is None and item["mask_frame"] is None
               and item["mask_seed"] == "bbox", str(item["mask_seed"]))
+        check("...and the geometry step is not yet passed",
+              item["geom_done"] is False, str(item["geom_done"]))
         # The seeded fixture records frame PATHS without writing the JPEGs, so
         # dimensions are legitimately null there — which is itself the contract
         # (a frame rmtree'd by a re-ingest must yield null, not a guess, or the
@@ -1026,8 +1033,8 @@ def test_saved_outline_comes_back_on_the_queue_item():
         it = same[0] if same else {}
         check("...and now carries the saved outline, crop-local",
               it.get("mask") is not None and len(it["mask"]) == 3, str(it.get("mask")))
-        check("...seeded_from flips to 'mask'", it.get("mask_seed") == "mask",
-              str(it.get("mask_seed")))
+        check("...seeded_from flips to 'edit' — my own correction, not the model's",
+              it.get("mask_seed") == "edit", str(it.get("mask_seed")))
         check("...and the same outline in full-frame px",
               it.get("mask_frame") is not None and len(it["mask_frame"]) == 3,
               str(it.get("mask_frame")))

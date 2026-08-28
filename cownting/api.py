@@ -1840,8 +1840,9 @@ def create_app(config: Config) -> FastAPI:
         if body.kind not in labels_db.MASK_EDIT_KINDS:
             raise HTTPException(
                 400, f"kind must be one of {list(labels_db.MASK_EDIT_KINDS)}")
-        if body.seeded_from not in ("mask", "bbox"):
-            raise HTTPException(400, "seeded_from must be 'mask' or 'bbox'")
+        if body.seeded_from not in labels_db.MASK_SEEDS:
+            raise HTTPException(
+                400, f"seeded_from must be one of {list(labels_db.MASK_SEEDS)}")
 
         cfg = config.annotation
         polygon: list[list[float]] | None = None

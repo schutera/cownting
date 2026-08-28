@@ -15,25 +15,39 @@ import cv2
 import numpy as np
 
 from ..config import Config
+from ..detect.geometry import mask_to_polygon
 
 _MIN_POLY_PTS = 3          # a polygon needs >= 3 vertices
 _MIN_MASK_PX = 20          # ignore speck masks
 
 
 def _mask_to_polygon(mask: np.ndarray, box_px, img_w: int, img_h: int) -> list[float] | None:
-    """bbox-cropped bool mask -> normalized [x1,y1,x2,y2,...] over the full frame."""
+    """bbox-cropped bool mask -> normalized [x1,y1,x2,y2,...] over the full frame.
+
+    The CONTOUR REDUCTION is `detect.geometry.mask_to_polygon` — one implementation
+    of "largest external contour", shared with the outline persisted on every
+    detection, so the shape the model is trained on and the shape an annotator is
+    shown can never come from two subtly different reductions.
+
+    What stays here is this function's own contract, which is not that one: the
+    input is a BBOX-LOCAL FiftyOne mask that must be resized to the box, and the
+    output is a FLAT NORMALISED list for the YOLO text format. It also does not
+    simplify — `eps_px=0` — because the training label is written once and read by
+    a trainer, where fidelity is worth the bytes, whereas the stored outline is
+    read on every queue fetch and dragged by hand.
+    """
     bx, by, bw, bh = box_px
-    if bw < 1 or bh < 1 or mask is None or mask.sum() < _MIN_MASK_PX:
+    if bw < 1 or bh < 1 or mask is None:
         return None
-    m = cv2.resize(mask.astype(np.uint8), (max(1, round(bw)), max(1, round(bh))), interpolation=cv2.INTER_NEAREST)
-    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    # Bbox-local -> box-sized, the resize this contract requires and the persisted
+    # outline must never do (its mask is already frame-aligned).
+    m = cv2.resize(mask.astype(np.uint8), (max(1, round(bw)), max(1, round(bh))),
+                   interpolation=cv2.INTER_NEAREST)
+    reduced = mask_to_polygon(m.astype(bool), eps_px=0.0, max_points=0)
+    if reduced is None:
         return None
-    cnt = max(contours, key=cv2.contourArea).squeeze(1)  # (K, 2)
-    if cnt.ndim != 2 or len(cnt) < _MIN_POLY_PTS:
-        return None
-    poly = []
-    for x, y in cnt:
+    poly: list[float] = []
+    for x, y in reduced[0]:
         poly.append(float((x + bx) / img_w))
         poly.append(float((y + by) / img_h))
     return poly

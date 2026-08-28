@@ -1438,6 +1438,13 @@ def submit_annotation(
 MASK_EDIT_KINDS: tuple[str, ...] = ("polygon", "false_positive", "ok")
 # The kinds that carry no geometry.
 MASK_VERDICT_KINDS: tuple[str, ...] = ("false_positive", "ok")
+# What the corrected outline was drawn OVER. 'model' is the segmenter's stored
+# polygon, 'edit' the annotator's own earlier correction, 'bbox' the ring
+# rectangle used when no outline exists at all. The distinction is the difference
+# between a model-quality statistic and a self-consistency one, so it is stored
+# rather than inferred. 'mask' was the pre-M4-phase-0 spelling of 'model', kept
+# accepted so rows written before the split still submit.
+MASK_SEEDS: tuple[str, ...] = ("model", "edit", "bbox", "mask")
 
 # Frozen alongside the vocabulary: a polygon below the floor is not a shape, and
 # one above the cap is a freehand trace that would bloat every row and every
@@ -1490,8 +1497,8 @@ def submit_mask_edit(
     statistics, and a client must not be able to flatter them."""
     if kind not in MASK_EDIT_KINDS:
         raise ValueError(f"kind must be one of {MASK_EDIT_KINDS}, got {kind!r}")
-    if seeded_from not in ("mask", "bbox"):
-        raise ValueError(f"seeded_from must be 'mask' or 'bbox', got {seeded_from!r}")
+    if seeded_from not in MASK_SEEDS:
+        raise ValueError(f"seeded_from must be one of {MASK_SEEDS}, got {seeded_from!r}")
     if not annotator:
         raise ValueError("a mask edit needs an annotator")
 

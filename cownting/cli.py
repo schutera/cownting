@@ -68,6 +68,51 @@ def segment(config: str = CONFIG_OPT, limit: int = typer.Option(None, help="Only
 
 
 @app.command()
+def remask(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(None, help="Scope to one dataset (default: whole DB)."),
+    camera: str = typer.Option(None, help="Scope to one camera."),
+    limit: int = typer.Option(None, help="Only re-run N frames."),
+    min_iou: float = typer.Option(0.9, help="IoU against the stored bbox required to match."),
+):
+    """Backfill instance outlines onto ALREADY-PROCESSED footage.
+
+    `segment` only writes outlines for frames it processes, so every day ingested
+    before they were persisted has detections with no outline — which is the whole
+    existing corpus, and why the Label tool's geometry step currently shows a
+    rectangle instead of the model's mask.
+
+    This re-runs the segmenter over processed frames and writes ONLY `mask_poly`
+    and `mask_parts`, matching each re-predicted mask to an existing detection by
+    IoU against its stored bbox. It never inserts, never deletes, and never
+    touches a column that `instance_key` or the ordinal window is built from, so
+    it cannot detach a label that has already been collected.
+
+    Costs one GPU pass over the frames — the same order as the original `segment`.
+    """
+    from .pipeline import remask as run
+
+    stats = run(_load(config), dataset_id=dataset, camera_id=camera,
+                limit=limit, min_iou=min_iou)
+    matched, dets = stats["matched"], stats["detections"]
+    rate = (100.0 * matched / dets) if dets else 0.0
+    typer.echo(
+        f"remask: {stats['frames']} frames · {matched}/{dets} detections matched "
+        f"({rate:.1f}%) · {stats['unmatched']} left without an outline"
+    )
+    # A low rate is not a crash but it IS a result: it means the current weights
+    # disagree with the run that produced these boxes, and the outlines that did
+    # land came from a different model than the boxes beside them.
+    if dets and rate < 80.0:
+        typer.secho(
+            "remask: LOW MATCH RATE — the segmenter no longer reproduces these "
+            "detections. Check that the weights match the ones this footage was "
+            "processed with before trusting the outlines.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+@app.command()
 def localize(
     config: str = CONFIG_OPT,
     dataset: str = typer.Option(None, help="Scope reassignment to one dataset (default: whole DB)."),

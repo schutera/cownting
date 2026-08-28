@@ -337,13 +337,19 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
             SELECT k.instance_key, k.dataset_id, k.camera_id, k.frame_path, k.ordinal,
                    k.score, k.bbox_x1, k.bbox_y1, k.bbox_x2, k.bbox_y2,
                    ds.day AS day,
+                   -- The MODEL's outline. `ranked` is SELECT d.* so it arrives
+                   -- here for free, but this projection is explicit, so without
+                   -- naming it the column is dropped before _item ever sees it.
+                   k.mask_poly AS model_mask_poly,
+                   k.mask_parts AS model_mask_parts,
                    coalesce(cov.n_annotators_labeled, 0) AS n_labeled,
                    coalesce(cov.n_annotators_skipped, 0) AS n_skipped,
                    (substr(k.instance_key, 1, 4) < ?) AS overlap,
                    CASE WHEN substr(k.instance_key, 1, 4) < ? THEN ? ELSE ? END AS target,
                    (mine.effective_key IS NOT NULL) AS mine_done,
                    (fp.effective_key IS NOT NULL) AS false_positive,
-                   mymask.polygon AS my_mask_poly
+                   mymask.polygon AS my_mask_poly,
+                   coalesce(mymask.n_verdicts, 0) > 0 AS geom_done
             FROM keyed k
             LEFT JOIN datasets ds ON ds.dataset_id = k.dataset_id
             -- Every join is on effective_key, never instance_key (§2.4): after a
@@ -361,15 +367,27 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
             -- it would collect answers about a shadow. Not annotator-scoped, and
             -- an anti-join for the same reason `mine` is one.
             LEFT JOIN {alias}.v_false_positives fp ON fp.effective_key = k.instance_key
-            -- MY OWN current outline correction, if I have made one. Scoped to
-            -- this annotator on purpose, exactly like `mine`: showing another
-            -- annotator's traced outline would anchor this one's judgement, which
-            -- is the same independence rule that keeps `n_annotators` from ever
-            -- carrying WHAT the others answered. Until masks are persisted
-            -- (M4 phase 0) this is the only polygon that exists for an instance;
-            -- afterwards it COALESCEs over detections.mask_poly.
-            LEFT JOIN (SELECT effective_key, polygon FROM {alias}.v_current_mask_edits
-                       WHERE annotator = ? AND kind = 'polygon' AND polygon IS NOT NULL)
+            -- MY OWN standing geometry verdict. Two things come out of one
+            -- grouped join: the corrected polygon if I drew one, and whether I
+            -- have said ANYTHING about this instance's geometry — which is what
+            -- tells the client the geometry step is already passed.
+            --
+            -- Scoped to this annotator on purpose, exactly like `mine`: showing
+            -- another annotator's traced outline would anchor this one's
+            -- judgement, the same independence rule that keeps `n_annotators`
+            -- from ever carrying WHAT the others answered. It also means the
+            -- gate is passed per-annotator, which is right — the step is a
+            -- measurement each of them makes.
+            --
+            -- Until masks are persisted (M4 phase 0) `polygon` here is the only
+            -- outline that exists for an instance; afterwards it COALESCEs over
+            -- detections.mask_poly.
+            LEFT JOIN (SELECT effective_key,
+                              max(polygon) FILTER (WHERE kind = 'polygon'
+                                                   AND polygon IS NOT NULL) AS polygon,
+                              count(*) AS n_verdicts
+                       FROM {alias}.v_current_mask_edits
+                       WHERE annotator = ? GROUP BY effective_key)
                       mymask ON mymask.effective_key = k.instance_key
         )""",
         params,
@@ -567,7 +585,16 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
     # polygon would silently shear away from the pixels it was drawn on.
     mask_frame: list[list[float]] | None = None
     mask_crop: list[list[float]] | None = None
+    # MY OWN CORRECTION WINS over the model's outline. Both are full-frame px, so
+    # this is a plain coalesce and not a conversion — and the precedence is the
+    # whole point: having corrected an outline, the annotator must not be handed
+    # the model's version back on the next visit as though the work never
+    # happened. `mask_seed` reports which one they are looking at, so a submitted
+    # correction records what it was actually drawn over.
     raw = row.get("my_mask_poly")
+    seed_kind = "edit" if raw else ("model" if row.get("model_mask_poly") else "bbox")
+    if not raw:
+        raw = row.get("model_mask_poly")
     if raw:
         try:
             pts = json.loads(raw)
@@ -575,9 +602,17 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
             pts = None
         if isinstance(pts, list) and len(pts) >= 3:
             mask_frame = [[float(p[0]), float(p[1])] for p in pts]
-            mask_crop = [[round(v, 2) for v in p] for p in
-                         frame_to_crop(mask_frame, bbox, pad=cfg.crop_pad,
-                                       max_width=cfg.crop_max_width)]
+            # CLAMPED to the crop the annotator is actually served. A YOLO mask is
+            # cropped to its own box by the model, but the SAM2 backend applies no
+            # such crop and the stored bbox is the DINO box — so a mask can bleed
+            # past the padded square. Unclamped, the annotator would be shown an
+            # outline running off the canvas, nudge one vertex, and have the save
+            # rejected by the route's inside-the-crop check AFTER doing the work.
+            # Clamping at the edge is honest: it is the shape as far as this crop
+            # can show it.
+            mask_crop = [[round(min(max(v, 0.0), float(out)), 2) for v in p]
+                         for p in frame_to_crop(mask_frame, bbox, pad=cfg.crop_pad,
+                                                max_width=cfg.crop_max_width)]
     # Original dimensions, for the peek overlay's viewBox. One lazy header open
     # per item, the same cost class as the frame_sig read below, and the only way
     # the client can place a full-frame coordinate on a DOWNSCALED frame image.
@@ -614,7 +649,22 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         "frame_h": frame_h,
         "mask": mask_crop,
         "mask_frame": mask_frame,
-        "mask_seed": "mask" if mask_crop is not None else "bbox",
+        # WHICH outline the annotator is looking at: their own correction, the
+        # model's, or (when neither exists) the ring rectangle the editor falls
+        # back to. Echoed on submit as `seeded_from`, so a stored correction says
+        # what it was drawn over — the difference between "the annotator improved
+        # the model" and "the annotator refined their own earlier pass", which is
+        # the difference between a model-quality statistic and a self-consistency
+        # one.
+        "mask_seed": seed_kind if mask_crop is not None else "bbox",
+        "mask_parts": (int(row["model_mask_parts"])
+                       if row.get("model_mask_parts") is not None else None),
+        # Whether THIS annotator has already judged this instance's geometry.
+        # Served rather than remembered by the client: the step's memory used to
+        # live in React state, so a reload re-asked about a cow the annotator had
+        # already corrected — and pressing Enter on that second asking is what
+        # used to destroy the correction (labels_db.submit_mask_edit).
+        "geom_done": bool(row.get("geom_done")),
         # How many annotators already answered it — never WHAT they answered.
         # Showing the distribution would anchor the next annotator and destroy the
         # independence the agreement statistic assumes.

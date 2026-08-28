@@ -27,6 +27,16 @@ DET_COLS = [
     "track_id", "global_id",
     "motion", "in_shade", "near_infra", "cluster_size",
     "under_panel", "panel_id", "region_id",
+    # --- the persisted instance outline (M4 phase 0) ---
+    # APPEND-ONLY, AT THE TAIL, and the same at the tail of the CREATE TABLE body
+    # below. `archive_dataset` copies with `INSERT INTO archive.t SELECT * FROM t`,
+    # which is POSITIONAL: a fresh archive gets CREATE-TABLE order while a
+    # long-deployed live DB gets ALTER order (appended last), so the two only agree
+    # if new columns go last in both. Inserting them mid-list either raises a
+    # ConversionException or — when the shifted types happen to line up — writes
+    # every column one slot over into the archive, which is the only copy of a
+    # deleted day.
+    "mask_poly", "mask_parts",
 ]
 
 
@@ -135,7 +145,14 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
             motion      VARCHAR,
             in_shade    BOOLEAN, near_infra BOOLEAN, cluster_size INTEGER,
             under_panel BOOLEAN, panel_id VARCHAR,
-            region_id   VARCHAR
+            region_id   VARCHAR,
+            -- The segmenter's instance outline, JSON [[x,y],…] in FULL-FRAME px
+            -- (the same space as bbox_* and scene/regions.py), largest external
+            -- contour, approxPolyDP-simplified. `mask_parts` is how many
+            -- disconnected pieces the mask had, so a fragmented outline is
+            -- visible to a reviewer as a plausible cause rather than a silently
+            -- truncated shape. NEW COLUMNS GO AT THE TAIL — see DET_COLS.
+            mask_poly   VARCHAR, mask_parts INTEGER
         );
         """
     )
@@ -149,6 +166,15 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS dataset_id VARCHAR")
     # Forward-compat: pose overlay for DBs created before the pose stage.
     con.execute("ALTER TABLE frames ADD COLUMN IF NOT EXISTS pose_overlay_path VARCHAR")
+    # Forward-compat: the persisted instance outline, for DBs created before it.
+    # LAST of the detections ALTERs on purpose. ALTER always appends at the tail,
+    # so this is what keeps a long-deployed DB in the same column order as a
+    # freshly-created archive for archive_dataset's positional `SELECT *` — and
+    # in particular it must come AFTER the dataset_id ALTER above, or a
+    # pre-dataset-era DB ends up with dataset_id behind the mask columns while a
+    # fresh archive has it second.
+    con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS mask_poly VARCHAR")
+    con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS mask_parts INTEGER")
     # Reversible-clip staging: when a camera is clipped to a time window, the
     # out-of-window frames/detections are MOVED here (not deleted) so the clip can be
     # undone. Same columns as the live tables — created AFTER the ALTERs above (CTAS
@@ -156,6 +182,24 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     # in place while clipped, so a restore just re-inserts the rows.
     con.execute("CREATE TABLE IF NOT EXISTS clipped_frames AS SELECT * FROM frames WHERE 1=0")
     con.execute("CREATE TABLE IF NOT EXISTS clipped_detections AS SELECT * FROM detections WHERE 1=0")
+    # ...except that "created AFTER the ALTERs" is only true on a FIRST boot. On
+    # every already-deployed DB the CTAS above is a no-op, so a column added to
+    # `detections` after the clip feature shipped never reaches this table — and
+    # mask_poly/mask_parts are the first columns in this repo's history to be added
+    # after it, so nothing has ever crossed that gap before.
+    #
+    # Without these, clip_camera's `INSERT INTO clipped_detections (DET_COLS)`
+    # raises a BinderException. That abort is non-destructive (it happens before
+    # the DELETEs), but the tempting workaround — dropping the mask columns from
+    # the clip lists — silently NULLs a whole GPU pass of outlines on the first
+    # clip. Fixing the schema is the only safe direction.
+    #
+    # They must sit AFTER the CTAS: `ADD COLUMN IF NOT EXISTS` guards the COLUMN,
+    # not the TABLE, so running these against a fresh DB where clipped_detections
+    # does not exist yet raises a CatalogException — which would be every first
+    # boot and every test.
+    con.execute("ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS mask_poly VARCHAR")
+    con.execute("ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS mask_parts INTEGER")
 
 
 # --------------------------------------------------------------------------- writes

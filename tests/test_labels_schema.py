@@ -262,6 +262,89 @@ def test_key_survives_clip_and_restore():
         con.close()
 
 
+def test_mask_survives_clip_restore_on_a_deployed_shape_db():
+    """The persisted outline must survive the same round trip the key does — and
+    on the schema an ALREADY-DEPLOYED database actually has.
+
+    That last part is the whole test. `clipped_detections` is created by a
+    `CREATE TABLE IF NOT EXISTS ... AS SELECT * FROM detections WHERE 1=0`, which
+    is a no-op on every database that already has the table, so a column added to
+    `detections` afterwards never reaches it. mask_poly/mask_parts are the FIRST
+    columns in this repo's history added after the clip feature shipped, so this
+    migration path has never been exercised. A fresh-DB test cannot see it: there
+    the CTAS copies the columns and the ALTERs are no-ops.
+
+    Simulated by dropping the columns from `clipped_detections` and re-running
+    init_db, which is exactly the shape a deployed DB boots with."""
+    from datetime import datetime
+
+    with tempfile.TemporaryDirectory() as d:
+        con = db.connect(os.path.join(d, "cownting.duckdb"))
+        db.init_db(con)
+        # Rewind to the deployed shape: the staging table as it existed before
+        # outlines were persisted.
+        con.execute("ALTER TABLE clipped_detections DROP COLUMN mask_poly")
+        con.execute("ALTER TABLE clipped_detections DROP COLUMN mask_parts")
+        db.init_db(con)  # the forward-compat pass a real boot would run
+        cols = {r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'clipped_detections'").fetchall()}
+        check("init_db re-adds the mask columns to an old clipped_detections",
+              {"mask_poly", "mask_parts"} <= cols, str(sorted(cols)[-4:]))
+
+        ds, cam = "2026-07-03", "camera_01"
+        f1 = f"data/artifacts/{ds}/frames/{cam}/00000001.jpg"
+        poly = "[[10.0,20.0],[110.0,20.0],[110.0,220.0]]"
+        db.insert_frames(con, pd.DataFrame([
+            {"dataset_id": ds, "camera_id": cam, "frame_idx": 1,
+             "ts": datetime(2026, 7, 3, 6, 0), "frame_path": f1},
+        ]))
+        db.insert_detections(con, pd.DataFrame([
+            {"dataset_id": ds, "camera_id": cam, "ts": datetime(2026, 7, 3, 6, 0),
+             "frame_path": f1, "score": 0.9,
+             "bbox_x1": 10.5, "bbox_y1": 20.0, "bbox_x2": 110.5, "bbox_y2": 220.0,
+             "mask_poly": poly, "mask_parts": 2},
+        ]))
+        stored = con.execute("SELECT mask_poly, mask_parts FROM detections").fetchone()
+        check("insert_detections carries the outline through DET_COLS",
+              stored == (poly, 2), str(stored))
+
+        db.clip_camera(con, ds, cam, "2026-07-03T23:00:00", "2026-07-03T23:30:00")
+        staged = con.execute(
+            "SELECT mask_poly, mask_parts FROM clipped_detections").fetchone()
+        check("the outline is staged with the row, not dropped", staged == (poly, 2),
+              str(staged))
+        db.restore_clip(con, ds, cam)
+        back = con.execute("SELECT mask_poly, mask_parts FROM detections").fetchone()
+        check("...and comes back intact on restore", back == (poly, 2), str(back))
+        con.close()
+
+
+def test_mask_columns_are_last_so_the_archive_stays_aligned():
+    """`archive_dataset` copies live -> archive with a POSITIONAL
+    `INSERT INTO archive.t SELECT * FROM t`. The archive is always built fresh, so
+    it gets CREATE-TABLE column order, while a long-deployed live DB gets ALTER
+    order — and ALTER always appends. The two therefore agree only while new
+    columns are appended LAST in the DDL body.
+
+    Put them mid-list and a deleted day is written one slot over into the only
+    surviving copy of it — silently, whenever the shifted columns happen to be
+    NULL and the types happen to cast. This pins the ordering so a later tidy-up
+    cannot quietly reintroduce that."""
+    with tempfile.TemporaryDirectory() as d:
+        con = db.connect(os.path.join(d, "cownting.duckdb"))
+        db.init_db(con)
+        cols = [r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'detections' ORDER BY ordinal_position").fetchall()]
+        check("mask_poly/mask_parts are the LAST two columns of detections",
+              cols[-2:] == ["mask_poly", "mask_parts"], str(cols[-3:]))
+        check("...and the last two of DET_COLS, which drives every named insert",
+              list(db.DET_COLS)[-2:] == ["mask_poly", "mask_parts"],
+              str(list(db.DET_COLS)[-3:]))
+        con.close()
+
+
 def test_schema_is_idempotent_and_seeded():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "labels.duckdb")
@@ -457,6 +540,8 @@ def main():
     test_python_and_sql_keys_agree()
     test_ordinal_is_dense_and_total()
     test_key_survives_clip_and_restore()
+    test_mask_survives_clip_restore_on_a_deployed_shape_db()
+    test_mask_columns_are_last_so_the_archive_stays_aligned()
     test_schema_is_idempotent_and_seeded()
     test_relabel_appends_and_double_submit_is_refused()
     test_archived_class_still_resolves()
