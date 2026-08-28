@@ -248,32 +248,38 @@ export default function Manual() {
       <Section id="label-classify" n="5" title="Label animals (classification)">
         <p>
           You’re shown one animal at a time — a photo crop with a <B>white ring</B>{" "}
-          around the one to judge — and answer the questions beneath it. Anyone who
-          is signed in can label.
+          around the one to judge. Each animal takes <B>three steps</B>: first check
+          the outline, then answer the two questions. Anyone signed in can label.
         </p>
         <Steps>
           <li>
             Click <NavPill>Label</NavPill> in the top navigation. The next animal
-            appears by itself.
+            appears by itself, at step <B>1 · Outline</B>.
           </li>
           <li>
-            <B>Answer</B> by clicking a tile or pressing its letter (<Kbd>Y</Kbd>{" "}
-            <Kbd>X</Kbd> <Kbd>C</Kbd> <Kbd>V</Kbd> <Kbd>B</Kbd> <Kbd>N</Kbd>). The
-            last answer <B>saves automatically</B> and brings the next animal.
+            <B>Step 1 — check the outline.</B> Press <Kbd>Enter</Kbd> if it’s right,{" "}
+            <Kbd>E</Kbd> to fix it (section 6), or <Kbd>X</Kbd> if it isn’t a cow at
+            all. You can’t answer the questions until you’ve done this — an answer
+            about the wrong animal is worse than no answer.
+          </li>
+          <li>
+            <B>Steps 2 and 3 — answer</B> by clicking a tile or pressing its letter
+            (<Kbd>Y</Kbd> <Kbd>X</Kbd> <Kbd>C</Kbd> <Kbd>V</Kbd> <Kbd>B</Kbd>{" "}
+            <Kbd>N</Kbd>). The last answer <B>saves automatically</B> and brings the
+            next animal.
           </li>
           <li>
             <B>Correct</B>: the same letter again clears an answer; <Kbd>←</Kbd>{" "}
             revisits earlier animals, <Kbd>→</Kbd> returns.
           </li>
           <li>
-            <B>Look closer</B>: hold <Kbd>Space</Kbd> for the whole frame, hold{" "}
-            <Kbd>H</Kbd> to hide the ring.
+            <B>Look closer</B>: hold <Kbd>Space</Kbd> to see the whole camera frame
+            with this animal ringed and outlined — so you can tell where it is in the
+            scene — and hold <Kbd>H</Kbd> to strip the marks off.
           </li>
           <li>
-            <B>Something’s wrong?</B> Press <Kbd>F</Kbd>. The outline Cownting found
-            appears on the photo — then either <B>fix the outline</B> (section 6),
-            mark it <B>Not a cow</B> to remove a false detection, or pick a reason
-            (<Kbd>1</Kbd>–<Kbd>5</Kbd>), type one line why, and <Kbd>Enter</Kbd>.
+            <B>Can’t judge it?</B> Press <Kbd>F</Kbd>, pick a reason, type one line
+            why, and <Kbd>Enter</Kbd>.
           </li>
         </Steps>
       </Section>
@@ -281,14 +287,14 @@ export default function Manual() {
       {/* 6 — LABEL: SEGMENTATION ---------------------------------------------- */}
       <Section id="label-outline" n="6" title="Fix a cow’s outline (segmentation)">
         <p>
-          When the shape Cownting found is off — it clips a leg, swallows a
-          neighbour, hugs a shadow — correct it right on the animal.
+          At <B>step 1</B> of every animal <OutlineToggle /> you either accept the
+          outline or fix it here — when it clips a leg, swallows a neighbour, or
+          hugs a shadow.
         </p>
         <Steps>
           <li>
-            Switch the toggle above the photo <OutlineToggle /> from <B>Classify</B>{" "}
-            to <B>Outline</B> (flagging offers the same jump). The animal’s outline
-            appears with draggable corner points.
+            Press <Kbd>E</Kbd> (or click <B>Fix it</B>). The outline appears with
+            draggable corner points.
           </li>
           <li>
             <B>Drag</B> a point to move it, <B>click an edge</B> to add one,{" "}
@@ -296,18 +302,20 @@ export default function Manual() {
             count-area editor. <Kbd>R</Kbd> reverts to Cownting’s outline.
           </li>
           <li>
-            Not a cow at all? Click <B>Not a cow — remove</B> to mark it a false
-            detection instead of sculpting a shape around nothing.
+            Not a cow at all? <Kbd>X</Kbd> (<B>Not a cow</B>) marks it a false
+            detection instead of sculpting a shape around nothing. It leaves the
+            queue for everyone and you move to the next animal.
           </li>
           <li>
-            <B>Save outline</B> (<Kbd>Enter</Kbd>) stores your correction and returns
-            to the questions — fixing the outline doesn’t skip them. <Kbd>Esc</Kbd>{" "}
-            leaves without saving.
+            <B>Save outline</B> (<Kbd>Enter</Kbd>) stores your correction and hands
+            you the questions for the same animal. <Kbd>Esc</Kbd> goes back without
+            saving.
           </li>
         </Steps>
         <Callout>
-          A greyed-out toggle means no outline is stored for this animal yet —
-          ask a poweruser to run the outline backfill.
+          Until Cownting starts storing outlines with each detection, step 1 shows
+          the <B>detection box</B> as four corners you can drag — so it reads “is the
+          box on the right animal?” rather than “is the outline right?”.
         </Callout>
       </Section>
 
@@ -385,8 +393,8 @@ function Kbd({ children }: { children: ReactNode }) {
 function OutlineToggle() {
   return (
     <span className="inline-flex items-center rounded-full border border-border text-[11px] font-mono align-middle mx-0.5 overflow-hidden">
-      <span className="px-2 py-0.5 text-gray-mid">Classify</span>
-      <span className="px-2 py-0.5 bg-accent-soft text-accent-deep">Outline</span>
+      <span className="px-2 py-0.5 bg-accent-soft text-accent-deep">1 · Outline</span>
+      <span className="px-2 py-0.5 text-gray-tertiary">2 · Classify</span>
     </span>
   );
 }

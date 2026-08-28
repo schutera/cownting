@@ -92,8 +92,14 @@ export interface UseAnswerQueueOpts {
   /** The taxonomy moved under an un-flushed write. The page refetches it and
       surfaces the notice; this hook never retries such a write. */
   onStale?: () => void;
-  /** A write landed. The page uses it to refresh the pool stats without polling. */
-  onWritten?: (write: LabelWrite) => void;
+  /** A write landed. The page uses it to refresh the pool stats without polling.
+      `result` is the route's parsed response, typed `unknown` because the three
+      write kinds return different shapes and this hook has no business knowing
+      which — the page narrows it by `write.kind`. It is what lets an outline
+      correction be reflected on the item immediately rather than at the next
+      queue fetch. Absent when the write landed via the unload beacon, which by
+      construction has no response to read. */
+  onWritten?: (write: LabelWrite, result?: unknown) => void;
 }
 
 export interface AnswerQueue {
@@ -205,7 +211,7 @@ function parsePolygon(v: unknown): [number, number][] | null {
 }
 
 function parseMaskKind(v: unknown): MaskFixKind | null {
-  return v === "polygon" || v === "false_positive" ? v : null;
+  return v === "polygon" || v === "false_positive" || v === "ok" ? v : null;
 }
 
 function parseSeed(v: unknown): MaskSeed | null {
@@ -387,7 +393,7 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
             const write = batch[i];
             if (res.status === "fulfilled") {
               settled.add(write);
-              optsRef.current.onWritten?.(write);
+              optsRef.current.onWritten?.(write, res.value);
             } else if (res.reason instanceof TaxonomyStaleError) {
               settled.add(write);
               staleCount += 1;

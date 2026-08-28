@@ -203,9 +203,17 @@ export interface QuestionPanelProps {
       `[n/N]` counter and the tone. Position rather than group_key, so a
       poweruser reordering the questions reorders the colours with them. */
   stepIndex: number;
-  /** How many questions this item has — visibleGroups().length. Rendered
-      literally as `[1/2]`, stolen verbatim from CVAT's attribute-switcher. */
+  /** How many steps this item has, INCLUDING any that are not questions.
+      Rendered literally as `[1/2]`, stolen verbatim from CVAT's
+      attribute-switcher. */
   stepCount: number;
+  /** How many non-question steps precede the questions — 1 while the geometry
+      step gates the item (M4a §5.1). It shifts the COUNTER and the pips only,
+      deliberately not the tone: colour is bound to the question's own position
+      so a poweruser reordering the questions reorders the colours with them, and
+      a hue that moved because an unrelated step was added in front would break
+      the association the annotator has already learned. */
+  stepOffset?: number;
   /** Tile count of the WIDEST question on this item, i.e.
       max(visibleClasses(g).length). The tile row reserves that width so the
       frame does not resize at the handoff (§2.7). Pass the per-item maximum,
@@ -256,6 +264,7 @@ export function QuestionPanel({
   group,
   stepIndex,
   stepCount,
+  stepOffset = 0,
   reserveOptions,
   selectedClassKey,
   reviewing,
@@ -376,8 +385,8 @@ export function QuestionPanel({
           className="ml-auto flex items-center gap-2 shrink-0 font-mono text-[12px] leading-none tabular-nums"
           style={{ color: INK_DIM }}
         >
-          <span>{`[${stepIndex + 1}/${stepCount}]`}</span>
-          <StepPips index={stepIndex} count={stepCount} />
+          <span>{`[${stepIndex + stepOffset + 1}/${stepCount}]`}</span>
+          <StepPips index={stepIndex + stepOffset} count={stepCount} />
         </span>
       </div>
 

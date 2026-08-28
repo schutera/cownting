@@ -220,6 +220,20 @@ export interface LabelItem {
   mask?: [number, number][] | null;
   mask_rev?: string | null;                 // hash of the stored polygon, echoed on submit
   mask_seed?: MaskSeed;
+  // The SAME outline in FULL-FRAME px, for the hold-Space peek. Two projections
+  // of one stored polygon, both built server-side: the peek draws over the whole
+  // frame (viewBox = frame_w x frame_h) and the editor over the crop, and
+  // converting between those spaces in TypeScript is how a saved polygon would
+  // silently shear away from the pixels it was drawn on.
+  mask_frame?: [number, number][] | null;
+  // The frame's ORIGINAL dimensions. Required to place anything on the peeked
+  // frame at all, because /api/img/label-frame serves it DOWNSCALED to
+  // FRAME_MAX_WIDTH — the served image is a uniform scale of the original, so
+  // this viewBox stretched over the rendered <img> aligns whatever the scale
+  // turned out to be. Null when the JPEG has gone: draw no overlay rather than a
+  // misplaced one.
+  frame_w?: number | null;
+  frame_h?: number | null;
 }
 
 // Where the editable outline came from: the stored model mask, or (when none is
@@ -228,7 +242,10 @@ export type MaskSeed = "mask" | "bbox";
 // The two-way branch the outline tool offers (plan §3): correct the shape, or
 // declare there is nothing to outline. Frozen in code like the flag reasons —
 // each kind has export semantics and its own UI path.
-export type MaskFixKind = "polygon" | "false_positive";
+// 'ok' is the confirmation the mandatory geometry step writes when the annotator
+// accepts the outline as drawn — a measurement (M4's pass-A triage), not a no-op:
+// it is what turns "the annotator looked" into a false-positive rate.
+export type MaskFixKind = "polygon" | "false_positive" | "ok";
 // POST /api/label/mask-fix. The anchor is echoed verbatim like every other
 // label write; `polygon` is CROP-LOCAL px (required iff kind 'polygon' — the
 // server converts to full-frame px for storage) and `mask_rev` is what makes a
@@ -403,6 +420,14 @@ export interface LabelWriteResult {
   ok: boolean;
   annotation_id: number;
   version: number;
+}
+// The outline write echoes the STORED polygon back in both spaces, so the page
+// can patch the item it is holding rather than waiting for the next queue fetch
+// to show the annotator their own correction. Both are server-derived from the
+// row that was actually written — the client never converts between the two.
+export interface LabelMaskFixResult extends LabelWriteResult {
+  mask: [number, number][] | null;        // crop-local px
+  mask_frame: [number, number][] | null;  // full-frame px
 }
 
 // GET /api/label/mine — the annotator's own recent submissions, newest first.

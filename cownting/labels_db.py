@@ -1428,7 +1428,16 @@ def submit_annotation(
     return int(annotation_id)
 
 
-MASK_EDIT_KINDS: tuple[str, ...] = ("polygon", "false_positive")
+# The three verdicts the mandatory geometry step can produce. 'ok' is the cheap
+# one and the reason the step is worth its keystroke: a confirmed outline is a
+# MEASUREMENT (this is M4's pass-A triage, collected inside the classification
+# flow rather than as a separate sweep), so the corpus gets a false-positive rate
+# and a precision figure per model version instead of only the corrections.
+# Frozen in code, not poweruser-editable: each kind branches the UI and the
+# export, so a runtime-added one would have neither.
+MASK_EDIT_KINDS: tuple[str, ...] = ("polygon", "false_positive", "ok")
+# The kinds that carry no geometry.
+MASK_VERDICT_KINDS: tuple[str, ...] = ("false_positive", "ok")
 
 # Frozen alongside the vocabulary: a polygon below the floor is not a shape, and
 # one above the cap is a freehand trace that would bloat every row and every
@@ -1508,9 +1517,10 @@ def submit_mask_edit(
         n_vertices = len(pts)
         area = polygon_area(pts)
     elif polygon is not None:
-        # Not a nicety: a false positive with geometry would export as both a
-        # dropped instance and a corrected one.
-        raise ValueError("a false-positive verdict carries no polygon")
+        # Not a nicety: a verdict with geometry would export ambiguously — a
+        # false positive as both a dropped and a corrected instance, an 'ok' as
+        # both an endorsement of the model's outline and a replacement for it.
+        raise ValueError(f"a {kind!r} verdict carries no polygon")
 
     prov = _picked(provenance, PROVENANCE_COLS, "provenance")
     tel = _picked(telemetry, TELEMETRY_COLS, "telemetry")

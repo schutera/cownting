@@ -22,6 +22,7 @@ Every non-obvious decision below is argued in docs/roadmap/M3_labeling.md
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import threading
@@ -309,7 +310,11 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
         params.append(day)
 
     threshold = hex_threshold(cfg.overlap_fraction)
-    params += [threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance, annotator]
+    # The trailing two are the annotator, once for the `mine` anti-join and once
+    # for `mymask`. Order matters: these are positional and must match the order
+    # the joins appear in the CTE below.
+    params += [threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance,
+               annotator, annotator]
 
     return (
         f"""
@@ -337,7 +342,8 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    (substr(k.instance_key, 1, 4) < ?) AS overlap,
                    CASE WHEN substr(k.instance_key, 1, 4) < ? THEN ? ELSE ? END AS target,
                    (mine.effective_key IS NOT NULL) AS mine_done,
-                   (fp.effective_key IS NOT NULL) AS false_positive
+                   (fp.effective_key IS NOT NULL) AS false_positive,
+                   mymask.polygon AS my_mask_poly
             FROM keyed k
             LEFT JOIN datasets ds ON ds.dataset_id = k.dataset_id
             -- Every join is on effective_key, never instance_key (§2.4): after a
@@ -355,6 +361,16 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
             -- it would collect answers about a shadow. Not annotator-scoped, and
             -- an anti-join for the same reason `mine` is one.
             LEFT JOIN {alias}.v_false_positives fp ON fp.effective_key = k.instance_key
+            -- MY OWN current outline correction, if I have made one. Scoped to
+            -- this annotator on purpose, exactly like `mine`: showing another
+            -- annotator's traced outline would anchor this one's judgement, which
+            -- is the same independence rule that keeps `n_annotators` from ever
+            -- carrying WHAT the others answered. Until masks are persisted
+            -- (M4 phase 0) this is the only polygon that exists for an instance;
+            -- afterwards it COALESCEs over detections.mask_poly.
+            LEFT JOIN (SELECT effective_key, polygon FROM {alias}.v_current_mask_edits
+                       WHERE annotator = ? AND kind = 'polygon' AND polygon IS NOT NULL)
+                      mymask ON mymask.effective_key = k.instance_key
         )""",
         params,
     )
@@ -541,6 +557,31 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
             float(row["bbox_x2"]), float(row["bbox_y2"])]
     _src, out, ring = crop_geometry(bbox, cfg.crop_pad, cfg.crop_max_width)
     day = row["day"]
+
+    # The outline, in BOTH spaces, both derived server-side from the one stored
+    # polygon (M4a §4.1). `mask` is crop-local because that is what the editor and
+    # the ring draw in; `mask_frame` is full-frame because that is what the
+    # hold-Space peek draws over, and its viewBox is the frame's own dimensions.
+    # Sending both rather than converting on the client is the whole point: a
+    # second copy of crop_geometry's arithmetic in TypeScript is how a saved
+    # polygon would silently shear away from the pixels it was drawn on.
+    mask_frame: list[list[float]] | None = None
+    mask_crop: list[list[float]] | None = None
+    raw = row.get("my_mask_poly")
+    if raw:
+        try:
+            pts = json.loads(raw)
+        except (TypeError, ValueError):
+            pts = None
+        if isinstance(pts, list) and len(pts) >= 3:
+            mask_frame = [[float(p[0]), float(p[1])] for p in pts]
+            mask_crop = [[round(v, 2) for v in p] for p in
+                         frame_to_crop(mask_frame, bbox, pad=cfg.crop_pad,
+                                       max_width=cfg.crop_max_width)]
+    # Original dimensions, for the peek overlay's viewBox. One lazy header open
+    # per item, the same cost class as the frame_sig read below, and the only way
+    # the client can place a full-frame coordinate on a DOWNSCALED frame image.
+    frame_w, frame_h = frame_size(row["frame_path"])
     return {
         "instance_key": row["instance_key"],
         "dataset_id": row["dataset_id"],
@@ -567,6 +608,13 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         "crop_w": out,
         "crop_h": out,
         "ring": [round(v, 2) for v in ring],
+        # The frame's ORIGINAL size — null when the JPEG is gone, which the
+        # client reads as "draw no overlay" rather than drawing a misplaced one.
+        "frame_w": frame_w,
+        "frame_h": frame_h,
+        "mask": mask_crop,
+        "mask_frame": mask_frame,
+        "mask_seed": "mask" if mask_crop is not None else "bbox",
         # How many annotators already answered it — never WHAT they answered.
         # Showing the distribution would anchor the next annotator and destroy the
         # independence the agreement statistic assumes.
@@ -698,6 +746,49 @@ def crop_to_frame(points: Sequence[Sequence[float]], bbox: Sequence[float], *,
     if scale <= 0:
         raise ValueError("degenerate crop scale")
     return [[x0 + float(px) / scale, y0 + float(py) / scale] for px, py in points]
+
+
+def frame_to_crop(points: Sequence[Sequence[float]], bbox: Sequence[float], *,
+                  pad: float, max_width: int) -> list[list[float]]:
+    """Full-frame px -> crop-local px. The exact inverse of `crop_to_frame`.
+
+    Storage is full-frame (it is the space `bbox_*` and the export live in) while
+    the editor works crop-local (the space `ring` established). Both directions
+    are therefore needed, and both live here, beside `crop_geometry`, so a change
+    to the crop's shape moves all three together. A polygon that round-trips
+    through this pair must come back where it started — that is what the
+    round-trip test pins."""
+    (x0, y0, x1c, _y1c), _out, _ring = crop_geometry(bbox, pad, max_width)
+    n = max(1, x1c - x0)
+    scale = min(1.0, float(max_width) / n) if max_width > 0 else 1.0
+    return [[(float(px) - x0) * scale, (float(py) - y0) * scale] for px, py in points]
+
+
+def frame_size(frame_path: str | Path) -> tuple[int | None, int | None]:
+    """The frame's ORIGINAL pixel dimensions, or `(None, None)`.
+
+    Needed because `/api/img/label-frame` serves the frame DOWNSCALED to
+    `FRAME_MAX_WIDTH`, while `bbox` and every stored polygon are in original
+    full-frame px. To draw either on the peeked frame the client needs the
+    original dimensions as its SVG viewBox — the served image is a uniform scale
+    of the original, so one viewBox stretched over the rendered <img> aligns
+    exactly, whatever the downscale turned out to be. Without this the overlay
+    would be off by the scale factor, which is worse than no overlay: it would
+    point confidently at the wrong animal.
+
+    PIL's open is lazy — this parses the JPEG header and never decodes pixels —
+    so it is the same cost class as the `frame_sig` read the item already does.
+    A missing or torn frame is routine (a re-ingest rmtrees the artifacts under a
+    live queue) and yields `(None, None)`; the client then draws no overlay
+    rather than a misplaced one."""
+    from PIL import Image
+
+    try:
+        with Image.open(frame_path) as im:
+            w, h = im.size
+        return int(w), int(h)
+    except Exception:
+        return None, None
 
 
 def frame_path_for(config: Config, dataset_id: str | None, camera_id: str,

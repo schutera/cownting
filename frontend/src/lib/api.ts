@@ -28,6 +28,7 @@ import type {
   LabelMaskFixReq,
   LabelEventReq,
   LabelWriteResult,
+  LabelMaskFixResult,
   LabelGroupReq,
   LabelGroupPatchReq,
   LabelClassReq,
@@ -678,8 +679,8 @@ export function flagLabel(req: LabelFlagReq): Promise<LabelWriteResult> {
 // did not move, only the outline did, and the two need different words on
 // screen. It is not retried for the same reason a stale taxonomy is not: the
 // correction was drawn against a polygon that no longer exists.
-export function submitMaskFix(req: LabelMaskFixReq): Promise<LabelWriteResult> {
-  return labelWrite<LabelWriteResult>("/api/label/mask-fix", req);
+export function submitMaskFix(req: LabelMaskFixReq): Promise<LabelMaskFixResult> {
+  return labelWrite<LabelMaskFixResult>("/api/label/mask-fix", req);
 }
 
 // Effort telemetry (session boundaries, info_opened). Fire-and-forget at the call

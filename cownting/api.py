@@ -1870,7 +1870,7 @@ def create_app(config: Config) -> FastAPI:
             except ValueError as e:
                 raise HTTPException(400, str(e))
         elif body.polygon:
-            raise HTTPException(400, "a false-positive verdict carries no polygon")
+            raise HTTPException(400, f"a {body.kind!r} verdict carries no polygon")
 
         ts = _anchor_ts(a)
         user = current_user(request)
@@ -1903,8 +1903,20 @@ def create_app(config: Config) -> FastAPI:
             ).fetchone()
         finally:
             lc.close()
+        # Echo the STORED polygon back in both spaces, so the client can patch the
+        # item it already holds instead of waiting for the next queue fetch to see
+        # its own correction. Re-derived from `polygon` (what was actually
+        # written) rather than from the request, and converted here for the reason
+        # everything else is: the crop<->frame arithmetic lives in exactly one
+        # place. Without this the editor and the hold-Space peek disagree about
+        # the same instance for the rest of the session.
+        mask_crop = None
+        if polygon is not None:
+            mask_crop = [[round(v, 2) for v in p] for p in labeling.frame_to_crop(
+                polygon, a.bbox, pad=cfg.crop_pad, max_width=cfg.crop_max_width)]
         return {"ok": True, "annotation_id": int(edit_id),
-                "version": int(row[0]) if row else 1}
+                "version": int(row[0]) if row else 1,
+                "mask": mask_crop, "mask_frame": polygon}
 
     @app.post("/api/label/undo", dependencies=[Depends(require_labeler)])
     def label_undo(body: LabelUndoReq, request: Request):

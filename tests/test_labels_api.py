@@ -58,6 +58,9 @@ _ITEM_FIELDS = (
     "instance_key", "dataset_id", "day", "camera_id", "frame_file", "bbox",
     "ordinal", "score", "frame_sig", "crop_url", "frame_url", "crop_w", "crop_h",
     "ring", "n_annotators", "target", "overlap", "serve_event_id",
+    # M4a: the outline in both spaces, plus the frame's ORIGINAL dimensions the
+    # hold-Space peek needs to place full-frame coordinates on a DOWNSCALED image.
+    "mask", "mask_frame", "mask_seed", "frame_w", "frame_h",
 )
 
 
@@ -832,6 +835,141 @@ def test_false_positive_retires_the_instance_for_everyone():
               item["instance_key"] not in {i["instance_key"] for i in allq["items"]})
 
 
+def test_ok_verdict_is_a_measurement_not_a_noop():
+    """The mandatory geometry step's fast path. Confirming an outline stores an
+    'ok' verdict — that is what turns "the annotator looked" into a
+    false-positive rate — and must NOT retire the instance: the cow still has to
+    be answered."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        item = client.get("/api/label/queue").json()["items"][0]
+        before = len(client.get("/api/label/queue").json()["items"])
+
+        r = client.post("/api/label/mask-fix", json={
+            "instance_key": item["instance_key"], "anchor": _anchor(item),
+            "kind": "ok", "polygon": None, "seeded_from": "bbox"})
+        check("confirming an outline -> 200", r.status_code == 200, r.text[:160])
+
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            row = lc.execute(
+                "SELECT kind, polygon FROM mask_edits WHERE instance_key = ? "
+                "AND superseded_at IS NULL", [item["instance_key"]]).fetchone()
+            check("an 'ok' verdict is stored with no geometry",
+                  row is not None and row[0] == "ok" and row[1] is None, str(row))
+        finally:
+            lc.close()
+
+        after = client.get("/api/label/queue").json()["items"]
+        check("confirming does NOT retire the instance — it still needs answers",
+              len(after) == before
+              and item["instance_key"] in {i["instance_key"] for i in after},
+              f"{before} -> {len(after)}")
+        check("an 'ok' verdict carrying geometry is a 400",
+              client.post("/api/label/mask-fix", json={
+                  "instance_key": item["instance_key"], "anchor": _anchor(item),
+                  "kind": "ok", "polygon": [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]],
+                  "seeded_from": "bbox"}).status_code == 400)
+
+        # A later correction supersedes the confirmation: latest verdict wins.
+        r2 = _mask_fix(client, item, polygon=[[10.0, 10.0], [40.0, 12.0], [25.0, 44.0]])
+        check("correcting after confirming -> 200", r2.status_code == 200, r2.text[:160])
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            rows = lc.execute(
+                "SELECT kind FROM mask_edits WHERE instance_key = ? AND superseded_at IS NULL",
+                [item["instance_key"]]).fetchall()
+            check("exactly one current verdict, and it is the correction",
+                  len(rows) == 1 and rows[0][0] == "polygon", str(rows))
+        finally:
+            lc.close()
+
+
+def test_crop_frame_coordinate_roundtrip():
+    """M4a §4.1: the editor works in crop-local px and the store in full-frame px,
+    so the two converters must be exact inverses. A drift here would shear every
+    saved polygon away from the pixels it was drawn on — silently, because both
+    ends would still look plausible."""
+    for bbox in ([300.2, 40.7, 420.9, 160.1],      # ordinary
+                 [-4.5, 3.2, 90.8, 77.7],          # crosses the frame edge
+                 [10.0, 10.0, 11.0, 2000.0]):      # extreme aspect
+        for pad, w in ((0.35, 768), (0.0, 768), (1.0, 64)):
+            crop = [[1.0, 2.0], [30.0, 4.0], [17.5, 40.25], [3.0, 39.0]]
+            frame = labeling.crop_to_frame(crop, bbox, pad=pad, max_width=w)
+            back = labeling.frame_to_crop(frame, bbox, pad=pad, max_width=w)
+            worst = max(abs(a - b) for p, q in zip(crop, back) for a, b in zip(p, q))
+            check(f"crop->frame->crop is exact (bbox={bbox[0]}, pad={pad}, w={w})",
+                  worst < 1e-6, f"max drift {worst}")
+
+    # And the ring the queue serves must be what crop_to_frame maps back onto the
+    # bbox itself — the pin between the two halves of the contract.
+    bbox = [300.2, 40.7, 420.9, 160.1]
+    _src, _out, ring = labeling.crop_geometry(bbox, 0.35, 768)
+    corners = [[ring[0], ring[1]], [ring[2], ring[1]], [ring[2], ring[3]]]
+    mapped = labeling.crop_to_frame(corners, bbox, pad=0.35, max_width=768)
+    check("the served ring maps back onto the original bbox",
+          all(abs(mapped[0][i] - bbox[i]) < 0.75 for i in (0, 1))
+          and abs(mapped[2][0] - bbox[2]) < 0.75 and abs(mapped[2][1] - bbox[3]) < 0.75,
+          f"{mapped} vs {bbox}")
+
+
+def test_saved_outline_comes_back_on_the_queue_item():
+    """A correction the annotator saved must reappear: as `mask` (crop-local, so
+    the editor reopens it instead of the bare rectangle) and as `mask_frame`
+    (full-frame, so hold-Space can draw it on the whole scene)."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        item = client.get("/api/label/queue").json()["items"][0]
+        check("before any edit the item carries no outline",
+              item["mask"] is None and item["mask_frame"] is None
+              and item["mask_seed"] == "bbox", str(item["mask_seed"]))
+        check("the item carries the frame's original dimensions",
+              isinstance(item["frame_w"], int) and item["frame_w"] > 0
+              and isinstance(item["frame_h"], int) and item["frame_h"] > 0,
+              f"{item['frame_w']}x{item['frame_h']}")
+
+        tri = [[10.0, 10.0], [40.0, 12.0], [25.0, 44.0]]
+        r = _mask_fix(client, item, polygon=tri)
+        check("saving an outline -> 200", r.status_code == 200, r.text[:160])
+
+        again = client.get("/api/label/queue").json()["items"]
+        same = [i for i in again if i["instance_key"] == item["instance_key"]]
+        check("the instance is still served (an outline fix is not an answer)",
+              len(same) == 1, str(len(same)))
+        it = same[0] if same else {}
+        check("...and now carries the saved outline, crop-local",
+              it.get("mask") is not None and len(it["mask"]) == 3, str(it.get("mask")))
+        check("...seeded_from flips to 'mask'", it.get("mask_seed") == "mask",
+              str(it.get("mask_seed")))
+        check("...and the same outline in full-frame px",
+              it.get("mask_frame") is not None and len(it["mask_frame"]) == 3,
+              str(it.get("mask_frame")))
+        # The crop-local copy must land back where the annotator drew it.
+        drift = max(abs(a - b) for p, q in zip(it.get("mask") or [], tri)
+                    for a, b in zip(p, q)) if it.get("mask") else 999
+        check("the returned crop-local outline matches what was drawn",
+              drift < 0.75, f"max drift {drift}")
+        # The two projections must be projections of ONE polygon.
+        back = labeling.frame_to_crop(it["mask_frame"], it["bbox"],
+                                      pad=config.annotation.crop_pad,
+                                      max_width=config.annotation.crop_max_width)
+        agree = max(abs(a - b) for p, q in zip(back, it["mask"]) for a, b in zip(p, q))
+        check("mask and mask_frame are the same polygon in two spaces",
+              agree < 0.75, f"max disagreement {agree}")
+
+        # Another annotator's outline must never leak into my item: the same
+        # independence rule that keeps n_annotators from carrying WHAT was said.
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            lc.execute("UPDATE mask_edits SET annotator = 'someone_else'")
+        finally:
+            lc.close()
+        mine = client.get("/api/label/queue").json()["items"]
+        theirs = [i for i in mine if i["instance_key"] == item["instance_key"]]
+        check("another annotator's outline is not shown to me",
+              theirs and theirs[0]["mask"] is None, str(theirs[0]["mask"] if theirs else None))
+
+
 def main():
     print("=== test_labels_api ===")
     test_queue_shape()
@@ -845,6 +983,9 @@ def main():
     test_undo_is_scoped_to_me()
     test_mask_fix_roundtrip_and_validation()
     test_false_positive_retires_the_instance_for_everyone()
+    test_ok_verdict_is_a_measurement_not_a_noop()
+    test_crop_frame_coordinate_roundtrip()
+    test_saved_outline_comes_back_on_the_queue_item()
     test_crop_endpoint_safety_and_caching()
     test_banner_mask_does_not_blank_the_tile()
     test_frame_endpoint_safety_and_caching()

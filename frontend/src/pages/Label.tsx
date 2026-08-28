@@ -290,6 +290,12 @@ export default function Label() {
   // chose to open. `draft` is null exactly when the mode is Classify.
   const [draft, setDraft] = useState<Point[] | null>(null);
   const [maskSaving, setMaskSaving] = useState(false);
+  // Which instances have PASSED the geometry step. Keyed by instance_key for the
+  // same reason the answers are (see the header's point 3): a shared boolean is
+  // how a confirmation given for one cow ends up gating a different one. It also
+  // makes going back along the tape behave — a revisited item keeps its verdict
+  // and does not ask again.
+  const [geomByKey, setGeomByKey] = useState<Record<string, boolean>>({});
 
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -412,6 +418,23 @@ export default function Label() {
     () => (draft === null || servedMask === null ? null : approxIou(draft, servedMask)),
     [draft, servedMask],
   );
+
+  /* THE GEOMETRY STEP (M4a §5.1, revised). Checking the outline is no longer an
+     optional mode: it is step 1 of the item, and the questions are not reachable
+     until it is passed. The reason is a data one rather than a UI one — an answer
+     recorded against a box that is on the wrong animal, or on no animal, is not a
+     weak label but a WRONG one, and nothing downstream can tell the two apart.
+     Asking first is also the only order that is cheap: the annotator is already
+     looking at the pixels, and finding out afterwards means re-deciding answers
+     that were given about something else.
+
+     It costs one keystroke on a correct detection (Enter), which is the price of
+     the measurement it produces: a confirmation is stored as an 'ok' verdict, so
+     the corpus gains a per-model false-positive rate instead of only corrections.
+     A crop that could not be shown is exempt — there is nothing to verify, and F
+     is the way out of those. */
+  const geomDone = currentKey === null ? false : (geomByKey[currentKey] ?? false);
+  const inGeometry = current !== null && !geomDone && !cropFailed;
 
   useEffect(() => {
     const onResize = () => setViewportH(window.innerHeight);
@@ -563,12 +586,38 @@ export default function Label() {
   }, []);
 
   const onWritten = useCallback(
-    (_write: LabelWrite) => {
+    (write: LabelWrite, result?: unknown) => {
       // The pool moved under us, so any "drained" verdict is stale by definition.
       setQueueDrained(false);
       refreshStats();
+      // An outline landed: fold the STORED polygon back into the item on the
+      // tape, in both spaces, so hold-Space draws the correction the annotator
+      // just made instead of the state before it. Both come from the server —
+      // the client never converts between crop and frame coordinates. Without
+      // this the editor and the peek disagree until the next queue fetch.
+      if (write.kind !== "mask" || result === null || typeof result !== "object") return;
+      const r = result as { mask?: unknown; mask_frame?: unknown };
+      const key = write.req.instance_key;
+      const asPoly = (v: unknown): [number, number][] | null =>
+        Array.isArray(v) &&
+        v.length >= 3 &&
+        v.every((p) => Array.isArray(p) && p.length === 2 && p.every((n) => typeof n === "number"))
+          ? v.map((p) => [p[0], p[1]] as [number, number])
+          : null;
+      const mask = asPoly(r.mask);
+      const maskFrame = asPoly(r.mask_frame);
+      if (mask === null && maskFrame === null) return; // a removal carries no geometry
+      const t = tapeRef.current;
+      setTape({
+        ...t,
+        items: t.items.map((it) =>
+          it.instance_key === key
+            ? { ...it, mask, mask_frame: maskFrame, mask_seed: "mask" }
+            : it,
+        ),
+      });
     },
-    [refreshStats],
+    [refreshStats, setTape],
   );
 
   const queue = useAnswerQueue({ onStale, onWritten });
@@ -631,6 +680,13 @@ export default function Label() {
     if (drop > 0) {
       const dropped = tapeRef.current.items.slice(0, drop);
       setAnswersByKey((prev) => {
+        const next = { ...prev };
+        for (const it of dropped) delete next[it.instance_key];
+        return next;
+      });
+      // The geometry verdicts go with them, for the same reason: a map that grew
+      // for a whole shift would hold every cow the annotator can no longer reach.
+      setGeomByKey((prev) => {
         const next = { ...prev };
         for (const it of dropped) delete next[it.instance_key];
         return next;
@@ -856,6 +912,12 @@ export default function Label() {
         instance_key: currentKey,
       }).catch(() => {});
 
+      // Any verdict passes the geometry step: the annotator has now looked at
+      // the outline and said something about it, which is exactly what the step
+      // is for. Set before the branch so a removal cannot leave the flag behind
+      // on an item the tape may still hold.
+      setGeomByKey((prev) => ({ ...prev, [currentKey]: true }));
+
       if (kind === "false_positive") {
         // There is no cow to ask questions about, so this one is done. The key
         // IS excluded here: the server will retire it for everyone, and being
@@ -866,10 +928,14 @@ export default function Label() {
         else advance();
         return;
       }
-      // A correction returns to the questions on the SAME animal (§5.3): fixing
-      // the outline was a detour, not an answer.
+      // 'ok' and 'polygon' both hand on to the questions on the SAME animal: the
+      // geometry step is satisfied, and the cow still has to be answered.
       closeOutline();
-      showSavedChip();
+      setStep(0);
+      // Only a CORRECTION gets the chip. Confirming is the routine path taken by
+      // most items, and a "saved ✓" flashing on every cow is noise that teaches
+      // the annotator to ignore the one place the screen reports a write.
+      if (kind === "polygon") showSavedChip();
     },
     [
       activeNow,
@@ -887,6 +953,15 @@ export default function Label() {
       showSavedChip,
     ],
   );
+
+  /** "The outline is right" — the fast path through the geometry step, and the
+      one the great majority of items take. It writes an 'ok' verdict (the
+      measurement, §5.1) and hands straight to question 1. */
+  const confirmGeometry = useCallback(() => {
+    if (current === null || currentKey === null || maskSaving) return;
+    commitMask("ok");
+    setStep(0);
+  }, [commitMask, current, currentKey, maskSaving]);
 
   const goPrev = useCallback(() => {
     const t = tapeRef.current;
@@ -1052,6 +1127,40 @@ export default function Label() {
       e.preventDefault();
       if (!e.repeat) setClean(true);
       return;
+    }
+
+    // THE GEOMETRY STEP OWNS THE KEYBOARD until it is passed. Enter accepts the
+    // outline, E opens the editor, X removes a false detection; the answer
+    // letters are deliberately inert, because the whole point of the step is
+    // that an answer cannot be given about geometry nobody has checked. A
+    // pressed letter shakes and says why rather than doing nothing — a silent
+    // no-op on this screen is indistinguishable from a slow save.
+    // F (flag) and the two holds keep working: looking harder, and giving up on
+    // an unjudgeable crop, are both legitimate at this point.
+    if (inGeometry && !flag.open && !outlineOpen) {
+      if (!plain || e.repeat) {
+        // fall through to the action table for F/Escape only
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        confirmGeometry();
+        return;
+      } else if (e.key === "e" || e.key === "E") {
+        e.preventDefault();
+        openOutline();
+        return;
+      } else if (e.key === "x" || e.key === "X") {
+        e.preventDefault();
+        commitMask("false_positive");
+        return;
+      } else if (e.key === "ArrowRight") {
+        shake();
+        showHint("check the outline first — Enter accepts it, E fixes it");
+        return;
+      } else if (resolveLabelKey(e, activeOptions.length)?.kind === "option") {
+        shake();
+        showHint("check the outline first — Enter accepts it, E fixes it");
+        return;
+      }
     }
 
     // OUTLINE MODE OWNS THE KEYBOARD (M4a §5.1). One hotkey layer at a time is
@@ -1252,8 +1361,14 @@ export default function Label() {
             crop below it does not lose a pixel. */}
         <div className="flex justify-center" style={{ marginBottom: CROP_GAP }}>
           <ModeToggle
-            outline={outlineOpen}
-            disabled={!outlineAvailable}
+            stage={outlineOpen || inGeometry ? "outline" : "classify"}
+            // Classify cannot be selected until the geometry step is passed:
+            // the sequence is the feature, and a control that let you click past
+            // step 1 would make the gate a suggestion. Once passed, going BACK
+            // to the outline stays available — the tape's whole ethos is that a
+            // decision can be revisited, and a second look costs nothing.
+            classifyDisabled={inGeometry}
+            outlineDisabled={!outlineAvailable}
             onClassify={closeOutline}
             onOutline={openOutline}
           />
@@ -1289,11 +1404,13 @@ export default function Label() {
             ) : (
               <InstanceCrop
                 item={current}
-                // The mask is shown alongside the ring while the flag row is
-                // open (M4a §5.4): the annotator is deciding whether the
-                // detection is wrong, and that judgement is about the outline
-                // the model drew, not only about the crop.
-                maskPreview={flag.open ? servedMask : null}
+                // The outline is drawn during the geometry step (it is the thing
+                // being judged) and while the flag row is open (M4a §5.4 — the
+                // annotator is deciding whether the detection is wrong, and that
+                // is a judgement about the shape the model drew). It is NOT
+                // drawn while answering: the question is about the animal, and a
+                // polygon competing with the ring on every item is clutter.
+                maskPreview={flag.open || inGeometry ? servedMask : null}
                 hideRing={clean || inspect}
                 onError={(k) => {
                   // A late error from an item already advanced past must not blank
@@ -1351,12 +1468,13 @@ export default function Label() {
             className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none"
             style={{ background: "rgba(12,14,16,0.92)" }}
           >
-            <img
-              src={current.frame_url}
-              alt=""
-              className="max-w-[94vw] max-h-[88vh] object-contain"
-              style={{ boxShadow: "0 0 0 1px rgba(255,255,255,0.22)" }}
-            />
+            {/* The peek exists to answer "where is this animal in the scene",
+                so it carries the SAME marks the crop does: the box, and the
+                outline when one exists. Holding H strips them, which is the
+                composition the two holds were designed for — the clean full
+                frame is a legitimate thing to want, and sun exposure is judged
+                on unobstructed pixels. */}
+            <FramePeek item={current} hideMarks={clean} />
             <div
               className="absolute left-4 bottom-4 flex items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px]"
               style={{
@@ -1366,7 +1484,7 @@ export default function Label() {
               }}
             >
               <ZoomGlyph />
-              release Space
+              {clean ? "release H for the outline" : "release Space · H hides the marks"}
             </div>
           </div>
         ) : null}
@@ -1420,11 +1538,25 @@ export default function Label() {
               // the annotator hunts the image for it.
               hasMask={servedMask !== null}
             />
+          ) : inGeometry ? (
+            <GeometryPanel
+              hasMask={servedMask !== null}
+              saving={maskSaving}
+              stepCount={steps.length + 1}
+              onConfirm={confirmGeometry}
+              onFix={openOutline}
+              onRemove={() => commitMask("false_positive")}
+            />
           ) : (
             <QuestionPanel
               group={activeGroup}
+              // The questions are steps 2..n+1 of the item now: geometry is
+              // step 1, and a counter that still read [1/2] would be telling the
+              // annotator they are somewhere they are not. The offset moves the
+              // counter without moving the per-question colours.
               stepIndex={step}
-              stepCount={steps.length}
+              stepOffset={1}
+              stepCount={steps.length + 1}
               reserveOptions={reserveOptions}
               selectedClassKey={answers[activeGroup.group_key] ?? null}
               reviewing={reviewing}
@@ -1587,6 +1719,266 @@ export default function Label() {
 
 /* ------------------------------------------------------------------ pieces */
 
+/** STEP 1 OF THE ITEM: check the outline before answering anything about it.
+ *
+ * Not a dialog and not a mode — the same rectangle the questions use, at the
+ * same PANEL_H, so passing this step is the same gesture as answering one: look
+ * at the crop, press one key. Enter is the overwhelmingly common answer and is
+ * therefore the one that needs no aiming; E and X are the exceptions and are
+ * spelled out on their tiles.
+ *
+ * The three outcomes are the three stored verdicts (labels_db.MASK_EDIT_KINDS),
+ * so this step is M4's pass-A triage collected inside the classification flow:
+ * accepting is a measurement, not a no-op.
+ */
+function GeometryPanel({
+  hasMask,
+  saving,
+  stepCount,
+  onConfirm,
+  onFix,
+  onRemove,
+}: {
+  hasMask: boolean;
+  saving: boolean;
+  stepCount: number;
+  onConfirm: () => void;
+  onFix: () => void;
+  onRemove: () => void;
+}) {
+  const CHOICES = [
+    {
+      key: "Enter",
+      label: hasMask ? "Outline is right" : "Box is right",
+      hint: "accept and answer",
+      onClick: onConfirm,
+      primary: true,
+    },
+    { key: "E", label: "Fix it", hint: "drag the points", onClick: onFix, primary: false },
+    { key: "X", label: "Not a cow", hint: "remove it", onClick: onRemove, primary: false },
+  ];
+  return (
+    <div
+      className="box-border w-full flex flex-col"
+      style={{
+        background: TILE,
+        borderLeft: `3px solid ${ON_IMAGE_ACCENT}`,
+        borderRadius: 10,
+        padding: 10,
+        height: PANEL_H,
+        color: INK,
+      }}
+    >
+      <div className="flex items-center gap-2" style={{ height: 24 }}>
+        <span className="text-[13px] font-semibold uppercase tracking-[0.08em] leading-none">
+          {hasMask ? "Is the outline right?" : "Is the box on the right animal?"}
+        </span>
+        <span className="ml-auto font-mono text-[11px] tabular-nums" style={{ color: INK_DIM }}>
+          {`[1/${stepCount}]`}
+        </span>
+      </div>
+      <div
+        className="grid"
+        style={{
+          marginTop: 8,
+          gridAutoFlow: "column",
+          gridAutoColumns: `${TILE_W}px`,
+          gap: TILE_GAP,
+          justifyContent: "start",
+          height: TILE_H,
+        }}
+      >
+        {CHOICES.map((c) => (
+          <button
+            key={c.key}
+            type="button"
+            onClick={c.onClick}
+            disabled={saving}
+            className="flex flex-col items-center rounded-lg border box-border cursor-pointer
+                       disabled:opacity-40 disabled:cursor-default
+                       focus-visible:outline-2 focus-visible:outline-offset-2"
+            style={{
+              width: TILE_W,
+              height: TILE_H,
+              padding: 7,
+              background: CARD,
+              borderColor: c.primary ? ON_IMAGE_ACCENT : HAIRLINE,
+              color: INK,
+              outlineColor: INK,
+            }}
+          >
+            <span className="flex w-full items-center" style={{ height: 20 }}>
+              <span
+                className="grid place-items-center rounded-md px-1 font-mono text-[11px] font-bold leading-none"
+                style={{
+                  minWidth: 20,
+                  height: 20,
+                  color: c.primary ? "#14161A" : INK,
+                  background: c.primary ? ON_IMAGE_ACCENT : HAIRLINE,
+                }}
+              >
+                {c.key}
+              </span>
+            </span>
+            <span className="grid w-full flex-1 place-items-center text-[12px] leading-[14px] text-center px-1">
+              {c.label}
+            </span>
+            <span className="w-full text-center text-[11px] leading-[13px]" style={{ color: INK_DIM }}>
+              {c.hint}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Hold-Space's whole frame, with the instance marked on it.
+ *
+ * WHY THE WRAPPER SHRINK-WRAPS THE IMAGE. The frame is sized by `max-w`/`max-h`
+ * against the viewport, so its rendered rectangle is not known until it loads
+ * and is a different shape on every screen. An SVG absolutely positioned over
+ * the flex CONTAINER would therefore be letterboxed relative to the photograph
+ * and every mark would be offset. The inline-block wrapper is exactly the
+ * image's rendered box, so an `inset-0` SVG inside it covers the pixels and
+ * nothing else.
+ *
+ * WHY THE viewBox IS `frame_w x frame_h` AND NOT THE IMAGE'S NATURAL SIZE.
+ * /api/img/label-frame serves the frame DOWNSCALED (labeling.render_frame caps
+ * it at FRAME_MAX_WIDTH), while `bbox` and `mask_frame` are in the frame's
+ * ORIGINAL pixels. The served image is a uniform scale of the original, so the
+ * original dimensions as the viewBox — stretched over the rendered box with
+ * `preserveAspectRatio="none"` — map original px onto displayed px correctly
+ * whatever that scale turned out to be. Using naturalWidth here would silently
+ * misplace every mark by the downscale factor, which is worse than drawing
+ * nothing: it would point confidently at the wrong animal.
+ */
+function FramePeek({ item, hideMarks }: { item: LabelItem; hideMarks: boolean }) {
+  const fw = item.frame_w ?? 0;
+  const fh = item.frame_h ?? 0;
+  // No dimensions (an older server, or the JPEG has gone) -> the photo alone.
+  // Guessing would be worse than not drawing.
+  const canMark = fw > 0 && fh > 0;
+  const [x1, y1, x2, y2] = item.bbox;
+  const bw = Math.max(x2 - x1, 1);
+  const bh = Math.max(y2 - y1, 1);
+  const poly = item.mask_frame ?? null;
+  const d =
+    poly !== null && poly.length >= 3
+      ? `M${poly.map(([x, y]) => `${x.toFixed(1)} ${y.toFixed(1)}`).join("L")}Z`
+      : null;
+  // Even-odd hole at the box: on a 4K frame of a full pen the ring alone is a
+  // thin rectangle among many animals, and the eye does not find it. The scrim
+  // is light — this view is also how sun exposure is judged, so the surroundings
+  // must stay readable — and H removes it outright.
+  const scrim = `M0 0H${fw}V${fh}H0Z M${x1} ${y1}H${x1 + bw}V${y1 + bh}H${x1}Z`;
+
+  // A distant cow is a ~25px box in a 1920px frame: the ring is *drawn*, but the
+  // eye still has to sweep the whole pen to find it, which is precisely the cost
+  // this peek exists to remove. Below this fraction of the frame, four leader
+  // lines run in from the edges and stop short of the animal — the eye lands on
+  // the intersection without anything being painted over the pixels being judged.
+  // A big, obvious box gets no leaders: they would be clutter around something
+  // already impossible to miss.
+  const LOCATOR_MAX_FRAC = 0.08;
+  const small = canMark && Math.max(bw / fw, bh / fh) < LOCATOR_MAX_FRAC;
+  const cx = x1 + bw / 2;
+  const cy = y1 + bh / 2;
+  const gap = Math.max(bw, bh) * 1.4;
+  const leaders = small
+    ? [
+        `M${cx} 0V${Math.max(0, cy - gap)}`,
+        `M${cx} ${Math.min(fh, cy + gap)}V${fh}`,
+        `M0 ${cy}H${Math.max(0, cx - gap)}`,
+        `M${Math.min(fw, cx + gap)} ${cy}H${fw}`,
+      ].join(" ")
+    : null;
+
+  return (
+    <div className="relative inline-block leading-none">
+      <img
+        src={item.frame_url}
+        alt=""
+        className="block max-w-[94vw] max-h-[88vh]"
+        style={{ boxShadow: "0 0 0 1px rgba(255,255,255,0.22)" }}
+      />
+      {canMark ? (
+        <svg
+          className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-100"
+          viewBox={`0 0 ${fw} ${fh}`}
+          preserveAspectRatio="none"
+          style={{ opacity: hideMarks ? 0 : 1 }}
+          aria-hidden="true"
+        >
+          <path d={scrim} fill="#000" fillOpacity={0.35} fillRule="evenodd" />
+          {leaders !== null ? (
+            <>
+              <path
+                d={leaders}
+                stroke="#000"
+                strokeOpacity={0.5}
+                strokeWidth={3}
+                vectorEffect="non-scaling-stroke"
+                fill="none"
+              />
+              <path
+                d={leaders}
+                stroke="#fff"
+                strokeOpacity={0.75}
+                strokeWidth={1}
+                vectorEffect="non-scaling-stroke"
+                fill="none"
+              />
+            </>
+          ) : null}
+          {/* Dark under light, the ring's own rule: one colour disappears
+              against either a sunlit flank or panel shade. */}
+          <rect
+            x={x1}
+            y={y1}
+            width={bw}
+            height={bh}
+            fill="none"
+            stroke="#000"
+            strokeOpacity={0.55}
+            strokeWidth={4}
+            vectorEffect="non-scaling-stroke"
+          />
+          <rect
+            x={x1}
+            y={y1}
+            width={bw}
+            height={bh}
+            fill="none"
+            stroke="#fff"
+            strokeWidth={2}
+            vectorEffect="non-scaling-stroke"
+          />
+          {d !== null ? (
+            <>
+              <path
+                d={d}
+                fill="rgba(240,180,96,0.20)"
+                stroke="#000"
+                strokeOpacity={0.55}
+                strokeWidth={3.5}
+                vectorEffect="non-scaling-stroke"
+              />
+              <path
+                d={d}
+                fill="none"
+                stroke={ON_IMAGE_ACCENT}
+                strokeWidth={2}
+                vectorEffect="non-scaling-stroke"
+              />
+            </>
+          ) : null}
+        </svg>
+      ) : null}
+    </div>
+  );
+}
+
 /** A compact action inside the flag row's header line. Sized to the 24px header
     so adding these cost the panel no height at all (see FlagRow's comment). */
 function RepairChip({ children, onClick }: { children: ReactNode; onClick: () => void }) {
@@ -1620,13 +2012,15 @@ function RepairChip({ children, onClick }: { children: ReactNode; onClick: () =>
  * that appears only sometimes reads as flaky, and the title says why.
  */
 function ModeToggle({
-  outline,
-  disabled,
+  stage,
+  classifyDisabled,
+  outlineDisabled,
   onClassify,
   onOutline,
 }: {
-  outline: boolean;
-  disabled: boolean;
+  stage: "outline" | "classify";
+  classifyDisabled: boolean;
+  outlineDisabled: boolean;
   onClassify: () => void;
   onOutline: () => void;
 }) {
@@ -1635,18 +2029,23 @@ function ModeToggle({
       className="inline-flex items-center rounded-full border overflow-hidden"
       style={{ height: TOGGLE_H, borderColor: HAIRLINE, background: CARD }}
       role="group"
-      aria-label="labeling tool"
+      aria-label="annotation step"
     >
-      <ModeButton active={!outline} disabled={false} onClick={onClassify}>
-        Classify
+      <ModeButton
+        active={stage === "outline"}
+        disabled={outlineDisabled}
+        onClick={onOutline}
+        title={outlineDisabled ? "there are no pixels to check on this one" : "check the outline"}
+      >
+        1 · Outline
       </ModeButton>
       <ModeButton
-        active={outline}
-        disabled={disabled}
-        onClick={onOutline}
-        title={disabled ? "there are no pixels to trace on this one" : "correct this cow's outline"}
+        active={stage === "classify"}
+        disabled={classifyDisabled}
+        onClick={onClassify}
+        title={classifyDisabled ? "check the outline first" : "answer the questions"}
       >
-        Outline
+        2 · Classify
       </ModeButton>
     </div>
   );

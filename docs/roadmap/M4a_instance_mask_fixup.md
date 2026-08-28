@@ -19,6 +19,38 @@ storage, polygon validation — so nothing here is throwaway.
 
 ---
 
+> **Revision (post-review).** The toggle is no longer optional. Checking the
+> geometry is **step 1 of every item**, ahead of the questions, and the questions
+> are unreachable until it is passed — §1a below supersedes the "in-page state,
+> per-item tooling" framing of §5.1. Accepting is one keystroke and is **stored**
+> as an `ok` verdict, which turns the step from a gate into M4's pass-A triage
+> collected inside the classification flow.
+
+## 1a. The three-step item (what shipped)
+
+```
+  [1/3] Outline    Enter accept · E fix · X not a cow      -> writes an ok|polygon|false_positive verdict
+  [2/3] Sun exposure   Y X C V                             -> answer
+  [3/3] Behaviour      Y X C V B N                         -> answer, commits, next animal
+```
+
+The ordering is the point, and it is a **data** argument rather than a UI one: an
+answer recorded against a box that is on the wrong animal is not a weak label but
+a wrong one, and nothing downstream can separate the two. Asking first is also
+the only cheap order — the annotator is already looking at the pixels, and
+discovering the problem afterwards means re-deciding answers that were given
+about something else.
+
+Cost: **one keystroke per item** on a correct detection. That is paid for by what
+it buys — a per-model false-positive rate and precision figure, which is the
+measurement M4 was going to build a separate replicated pass to obtain.
+
+Enforcement is in three places, deliberately, because a gate with one hole is not
+a gate: the answer letters are inert during step 1 (they shake and say why),
+`ArrowRight` refuses to leave the item, and the `2 · Classify` half of the step
+control is disabled. Going *back* to step 1 after passing it stays available —
+the tape's ethos is that any decision can be revisited.
+
 ## 1. What the annotator gets
 
 1. On `/label`, above the crop, a two-state toggle: **Classify | Outline**.
@@ -287,6 +319,8 @@ remask"*. Never hidden: a control that appears only sometimes reads as flaky.
 | 4 | Toggle + `MaskEditor` + `MaskPanel`; queue `kind: "mask"`; bbox seeding | **L** | the feature | **done** |
 | 5 | Flag-row integration: mask overlay on `F`, Fix outline / Not a cow — remove | **M** | the triage shortcut | **done** |
 | 6 | Export override (COALESCE + drop) + progress counters | **S** | loop closed | **todo** |
+| 7 | The mandatory geometry step (§1a): `ok` verdict, step gate, `[n/3]` counter | **M** | verification, not an option | **done** |
+| 8 | Hold-Space peek draws the box + outline on the whole frame (`frame_w/h`, leader lines); the queue returns your own saved outline | **M** | "where do I look" | **done** |
 
 **What phases 0–1 still gate.** Everything below the editor is built and
 exercised, but with no `detections.mask_poly` there is no model polygon to show:
