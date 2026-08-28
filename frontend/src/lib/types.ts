@@ -353,7 +353,10 @@ export interface LabelFlagReq {
   instance_key: string;
   anchor: InstanceAnchor;
   reason: LabelSkipReason;
-  explanation: string;                 // non-empty, non-whitespace; server-checked
+  /** Optional. The mandatory written justification was removed: the reason
+      codes carry the signal it stood in for, and a blank one is stored as
+      NULL rather than as an empty string. */
+  explanation?: string;
   serve_event_id?: number | null;
   session_id?: string | null;
   client_elapsed_ms?: number | null;

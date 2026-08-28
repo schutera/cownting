@@ -1736,18 +1736,20 @@ def create_app(config: Config) -> FastAPI:
         until `skip_retire` distinct declines. `multiple_cows` in particular is a
         direct signal the detector merged two animals.
 
-        A reason ALONE is no longer enough: a free-text explanation is required
-        and a blank one is a 400. The tool has no skip button any more, so this
-        route is the only escape hatch left, and an escape hatch nobody has to
-        justify is exactly what silently drains the ambiguous instances out of
-        the corpus — the ones inter-rater variability is most informative about.
-        The five-item `reason` vocabulary cannot describe a crop we have not
-        thought of; the sentence beside it can.
+        A REASON IS ENOUGH; the explanation is optional. It was mandatory for one
+        release, on the argument that an escape hatch nobody has to justify is
+        what silently drains the ambiguous instances out of the corpus — the ones
+        inter-rater variability is most informative about. Two things retired
+        that: the vocabulary now carries the signal the prose was standing in for
+        (`multiple_cows` and `low_resolution` are already machine-countable
+        statements about capture quality, which a sentence is not), and once
+        instance masks land the defective crop can be inspected directly instead
+        of described. The cost is real and worth naming: a crop broken in a way
+        the six codes do not cover now arrives as `other` with nothing attached.
 
-        Enforced here rather than in `submit_annotation`, because it is a rule
-        about this ENDPOINT's contract, not about the store: rows written before
-        the rework carry no explanation and are deliberately left alone (no
-        migration), and the CLI/reconciler paths must keep writing them.
+        A blank explanation is stored as NULL, never as "", so "no note" and "an
+        empty note" cannot be confused downstream. Rows written while it was
+        mandatory keep their text — there is no migration either way.
 
         The outcome, the route path and the stored columns are unchanged — this
         is a validation tightening, not a schema change. No revision check: a
@@ -1764,9 +1766,15 @@ def create_app(config: Config) -> FastAPI:
         # the requirement back into a button press.
         explanation = ((body.explanation or "").strip()
                        or (body.note or "").strip())
-        if not explanation:
-            raise HTTPException(400, "a flag needs an explanation: say in your own "
-                                     "words why this instance cannot be answered")
+        # An explanation is OPTIONAL. It used to be mandatory (decision 6), on the
+        # argument that an escape hatch nobody has to justify gets pulled whenever
+        # the work gets hard. That was overridden: the reason codes now carry the
+        # signal the prose was there to supply -- `multiple_cows` and
+        # `low_resolution` in particular are already machine-countable statements
+        # about capture quality -- and once instance masks land the defective crop
+        # is inspectable directly rather than needing to be described. A blank one
+        # is stored as NULL rather than as an empty string, so "no note" and "an
+        # empty note" cannot be told apart downstream by accident.
         ts = _anchor_ts(a)
         user = current_user(request)
         lc = _labels_con()
@@ -1784,7 +1792,7 @@ def create_app(config: Config) -> FastAPI:
                         session_id=body.session_id,
                         serve_event_id=body.serve_event_id,
                         client_elapsed_ms=body.client_elapsed_ms,
-                        skip_reason=body.reason, note=explanation),
+                        skip_reason=body.reason, note=explanation or None),
                 )
             except ValueError as e:
                 raise HTTPException(409, str(e))

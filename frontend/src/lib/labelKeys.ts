@@ -88,7 +88,7 @@ export const LABEL_ACTIONS: readonly LabelActionKey[] = [
 // a second row — a class list that long is a taxonomy problem, and silently
 // reusing an already-bound key is the kind of thing an annotator finds by
 // mis-pressing it.
-const OPTION_KEYS: readonly { letter: string; code: string }[] = [
+export const OPTION_KEYS: readonly { letter: string; code: string }[] = [
   { letter: "Y", code: "KeyZ" },
   { letter: "X", code: "KeyX" },
   { letter: "C", code: "KeyC" },
