@@ -52,7 +52,12 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 _WEBHOOK = "https://discord.com/api/webhooks/1234567890/SuperSecretToken1234567890"
 _TOKEN = "SuperSecretToken1234567890"
 
-_MEMBERS = {"labels.duckdb", "annotations.csv", "taxonomy.json", "MANIFEST.json", "README.md"}
+# `mask_edits.csv` is a member in its own right, not folded into annotations.csv:
+# an instance can carry a geometry verdict and NO answer (a "not a cow" removal
+# retires it before any question is asked), so a join would drop exactly the
+# rows that have no other readable copy.
+_MEMBERS = {"labels.duckdb", "annotations.csv", "mask_edits.csv", "taxonomy.json",
+            "MANIFEST.json", "README.md"}
 
 _SHADED = {"class_key": "sun_exposure.shaded", "group_key": "sun_exposure",
            "class_name": "Shaded"}
@@ -148,7 +153,7 @@ def test_gate_and_bundle():
               str(r1["zip_path"]))
         with zipfile.ZipFile(r1["zip_path"]) as z:
             names = set(z.namelist())
-        check("zip members are exactly the five bundle files",
+        check("zip members are exactly the bundle files",
               names == _MEMBERS, str(sorted(names)))
         check("nothing resembling .session_secret is swept in",
               all("session_secret" not in n for n in names), str(sorted(names)))

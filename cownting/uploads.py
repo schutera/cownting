@@ -329,6 +329,17 @@ def start_remask_job(base: Config, dataset_id: str | None = None,
     return job
 
 
+def _upload_waiting() -> bool:
+    """Is a real upload queued behind us?
+
+    The backfill is hours and an upload is minutes, so a strict FIFO would make
+    someone who just dropped in a day of footage wait all afternoon to see it
+    processed. This is the signal the backfill yields on.
+    """
+    with _LOCK:
+        return any(j.kind != "remask" and j.status in ACTIVE for j in _JOBS.values())
+
+
 def _run_remask(job: Job, base: Config, dataset_id: str | None,
                 camera_id: str | None, limit: int | None) -> None:
     try:
@@ -341,7 +352,20 @@ def _run_remask(job: Job, base: Config, dataset_id: str | None,
                     message=f"Tracing outlines… frame {done}/{total}")
 
         stats = run_remask(base, dataset_id=dataset_id, camera_id=camera_id,
-                           limit=limit, on_progress=on_frame)
+                           limit=limit, on_progress=on_frame,
+                           should_stop=_upload_waiting)
+
+        if stats.get("stopped"):
+            # Step aside and get back in line. Nothing is lost: the pass only
+            # selects frames that still have a detection without an outline, so
+            # resuming continues where this stopped. Re-queued rather than
+            # abandoned so the backfill finishes on its own once the uploads are
+            # through, without anyone remembering to restart it.
+            _update(job, status="queued", stage="queued",
+                    message=(f"Paused for an upload — {stats['matched']} outlines "
+                             "traced so far; resumes when the day is processed."))
+            _enqueue(_run_remask, job, base, dataset_id, camera_id, limit)
+            return
         matched, dets = stats["matched"], stats["detections"]
         rate = (100.0 * matched / dets) if dets else 0.0
         msg = (f"Traced {matched} of {dets} outlines ({rate:.0f}%) "

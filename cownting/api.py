@@ -2179,6 +2179,16 @@ def create_app(config: Config) -> FastAPI:
             candidate = (dist / full_path).resolve()
             if full_path and (candidate == root or root in candidate.parents) and candidate.is_file():
                 return FileResponse(str(candidate))
-            return FileResponse(str(dist / "index.html"))  # client-side routing fallback
+            # index.html MUST NOT be cached. Its asset filenames are content-hashed
+            # (and /assets is therefore safe to cache hard), but this file is the
+            # only thing that says WHICH hashes are current — so a browser holding
+            # a stale copy keeps loading the previous build's bundle and a deploy
+            # looks like it silently did nothing. It was being served with no
+            # cache headers at all, which leaves browsers to guess, and they guess
+            # "reuse it".
+            return FileResponse(
+                str(dist / "index.html"),
+                headers={"Cache-Control": "no-cache, must-revalidate"},
+            )  # client-side routing fallback
 
     return app

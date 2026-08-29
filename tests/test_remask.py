@@ -310,6 +310,53 @@ def test_remask_is_resumable_and_reports_what_it_could_not_match():
               stats["matched"] == 0, str(stats))
 
 
+def test_remask_yields_to_a_waiting_upload_and_loses_nothing():
+    """The backfill is hours and an upload is minutes, so it steps aside rather
+    than making someone wait all afternoon to see their day processed.
+
+    The property that makes yielding safe is the same one that makes the pass
+    resumable: it only ever selects frames that still have a detection without an
+    outline. So stopping mid-run costs the frames already done nothing, and
+    resuming does not redo them."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _mk(d)
+        # Yield after the very first frame, as a waiting upload would.
+        seen = {"n": 0}
+
+        def stop_after_one() -> bool:
+            seen["n"] += 1
+            return seen["n"] > 1
+
+        undo = _install(_BOXES)
+        try:
+            first = pipeline.remask(cfg, should_stop=stop_after_one)
+        finally:
+            undo()
+        check("it reports that it stopped rather than finishing",
+              first.get("stopped") is True, str(first))
+        check("...having done real work first", first["matched"] > 0, str(first))
+        done_after_yield = sum(1 for r in _rows(cfg.paths.db_path) if r[10])
+        check("...and the outlines it did trace are committed, not rolled back",
+              done_after_yield == first["matched"], f"{done_after_yield} vs {first}")
+
+        # Now let it run to completion, as the re-queued job would.
+        undo = _install(_BOXES)
+        try:
+            second = pipeline.remask(cfg)
+        finally:
+            undo()
+        check("resuming finishes the rest", second.get("stopped") is False, str(second))
+        rows = _rows(cfg.paths.db_path)
+        check("every detection ends up with an outline exactly once",
+              all(r[10] for r in rows) and len(rows) == 3,
+              str([bool(r[10]) for r in rows]))
+        check("...and the two passes did not overlap — no frame was traced twice",
+              first["matched"] + second["matched"] == 3,
+              f"{first['matched']} + {second['matched']}")
+        check("a run that is never asked to stop reports stopped=False",
+              pipeline.remask(cfg).get("stopped") is False)
+
+
 def test_remask_scopes_and_bbox_iou():
     check("identical boxes are IoU 1", abs(pipeline._bbox_iou((0, 0, 10, 10), (0, 0, 10, 10)) - 1.0) < 1e-9)
     check("disjoint boxes are IoU 0", pipeline._bbox_iou((0, 0, 10, 10), (50, 50, 60, 60)) == 0.0)
@@ -333,6 +380,7 @@ def main():
     test_mask_to_polygon_is_full_frame_and_bounded()
     test_remask_writes_only_the_outline_and_never_moves_a_key()
     test_remask_is_resumable_and_reports_what_it_could_not_match()
+    test_remask_yields_to_a_waiting_upload_and_loses_nothing()
     test_remask_scopes_and_bbox_iou()
     print("===================")
     if _FAILED:

@@ -198,8 +198,17 @@ def due(con: duckdb.DuckDBPyConnection, backup: BackupCfg) -> tuple[bool, str]:
     something new landed since the watermark, no successful run within
     `every_days`, and no genuine failure within the cooldown. An empty store is
     never due — there is nothing to lose yet."""
-    last_ann = con.execute("SELECT max(submitted_at) FROM annotations").fetchone()[0]
-    if last_ann is None:
+    # BOTH keyed tables. The geometry step writes to `mask_edits` and, for a
+    # 'not a cow' verdict, to NOTHING else — the instance is retired, so the
+    # annotator never answers it. An annotations-only watermark would therefore
+    # never consider a day of pure outline work worth backing up, which is
+    # exactly the work that has no other copy.
+    last_ann = con.execute(
+        "SELECT greatest("
+        "  coalesce((SELECT max(submitted_at) FROM annotations), CAST('epoch' AS TIMESTAMP)),"
+        "  coalesce((SELECT max(submitted_at) FROM mask_edits),  CAST('epoch' AS TIMESTAMP)))"
+    ).fetchone()[0]
+    if last_ann is None or str(last_ann).startswith("1970-01-01"):
         return False, "empty store: nothing to back up yet"
     wm = labels_db.get_meta(con, META_WATERMARK)
     if wm is not None and last_ann <= datetime.fromisoformat(wm):
@@ -220,7 +229,7 @@ def due(con: duckdb.DuckDBPyConnection, backup: BackupCfg) -> tuple[bool, str]:
     ).fetchone()[0]
     if recent:
         return False, f"already backed up within the last {backup.every_days} days"
-    return True, "due: new annotations since the watermark"
+    return True, "due: new annotator work since the watermark"
 
 
 def _claim(con: duckdb.DuckDBPyConnection, *, trigger: str) -> dict[str, Any] | None:
@@ -366,6 +375,34 @@ ORDER BY a.submitted_at, a.annotation_id, c.ordinal
 """
 
 
+_MASK_CSV_SQL = """
+SELECT e.edit_id, e.instance_key, e.effective_key, e.version, e.kind,
+       e.seeded_from, e.n_vertices, e.area_px, e.iou_source, e.mask_rev,
+       e.dataset_id, e.camera_id, e.frame_basename,
+       e.bbox_x1, e.bbox_y1, e.bbox_x2, e.bbox_y2, e.ordinal,
+       e.annotator, e.annotator_role, e.annotator_real_role,
+       e.acting_preview, e.auth_disabled,
+       e.submitted_at, e.superseded_at, e.client_elapsed_ms, e.session_id,
+       e.polygon
+FROM mask_edits e
+ORDER BY e.submitted_at, e.edit_id
+"""
+
+
+def export_mask_csv(con: duckdb.DuckDBPyConnection, out_path: str | Path) -> int:
+    """Write the geometry-verdict CSV — every outline correction, 'not a cow'
+    removal and confirmation, with the day and camera it belongs to.
+
+    A sibling of the answers CSV rather than a join onto it: an instance can have
+    a geometry verdict and no answer (a removal retires it before any question is
+    asked), so folding the two together would either drop those rows or duplicate
+    every answer once per verdict."""
+    safe = str(out_path).replace("'", "''")
+    row = con.execute(
+        f"COPY ({_MASK_CSV_SQL}) TO '{safe}' (HEADER, DELIMITER ',')").fetchone()
+    return int(row[0]) if row else 0
+
+
 def export_csv(con: duckdb.DuckDBPyConnection, out_path: str | Path) -> int:
     """Write the long-format annotations CSV. Returns the number of rows written."""
     safe = str(out_path).replace("'", "''")
@@ -442,6 +479,8 @@ Members:
 
 - `labels.duckdb`    — engine-consistent snapshot of the whole store (COPY FROM DATABASE)
 - `annotations.csv`  — long format, one row per (annotation, choice); skips included
+- `mask_edits.csv`   — one row per geometry verdict: outline corrections, 'not a
+  cow' removals and confirmations, with the day and camera each belongs to
 - `taxonomy.json`    — groups + classes including archived ones, with the revision
 - `MANIFEST.json`    — counts, watermarks, versions
 - `README.md`        — this file
@@ -683,6 +722,7 @@ def run_backup(
             sdir = Path(staging)
             snapshot_db(config.paths.labels_db_path, sdir / "labels.duckdb")
             export_csv(lcon, sdir / "annotations.csv")
+            export_mask_csv(lcon, sdir / "mask_edits.csv")
             (sdir / "taxonomy.json").write_text(
                 json.dumps(labels_db.taxonomy(lcon, include_archived=True),
                            indent=2, default=str),
@@ -691,6 +731,10 @@ def run_backup(
             members = [
                 ("labels.duckdb", sdir / "labels.duckdb"),
                 ("annotations.csv", sdir / "annotations.csv"),
+                # Ordered right after the answers so the degraded, CSV-only
+                # bundle (the fallback when the zip is over the webhook budget)
+                # still carries the geometry work rather than only the answers.
+                ("mask_edits.csv", sdir / "mask_edits.csv"),
                 ("taxonomy.json", sdir / "taxonomy.json"),
                 ("MANIFEST.json", sdir / "MANIFEST.json"),
                 ("README.md", sdir / "README.md"),

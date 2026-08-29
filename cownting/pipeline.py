@@ -100,7 +100,8 @@ def ingest_one_camera(config: Config, dataset_id: str, cam) -> int:
 def remask(config: Config, limit: int | None = None,
            on_progress: Callable[[int, int], None] | None = None,
            dataset_id: str | None = None, camera_id: str | None = None,
-           min_iou: float = 0.9) -> dict:
+           min_iou: float = 0.9,
+           should_stop: Callable[[], bool] | None = None) -> dict:
     """Backfill `mask_poly` / `mask_parts` on ALREADY-PROCESSED frames.
 
     `segment` only touches frames where `processed = FALSE`, so every day ingested
@@ -128,7 +129,8 @@ def remask(config: Config, limit: int | None = None,
     """
     con = db.connect(config.paths.db_path)
     try:
-        return _remask(con, config, limit, on_progress, dataset_id, camera_id, min_iou)
+        return _remask(con, config, limit, on_progress, dataset_id, camera_id,
+                       min_iou, should_stop)
     finally:
         # A leaked write handle is not a leaked file descriptor here: DuckDB
         # allows one read-write process per file, and this runs INSIDE the API
@@ -141,7 +143,8 @@ def remask(config: Config, limit: int | None = None,
 
 def _remask(con, config: Config, limit: int | None,
             on_progress: Callable[[int, int], None] | None,
-            dataset_id: str | None, camera_id: str | None, min_iou: float) -> dict:
+            dataset_id: str | None, camera_id: str | None, min_iou: float,
+            should_stop: Callable[[], bool] | None = None) -> dict:
     # This command exists FOR databases older than the mask columns, so it has to
     # run the forward-compat migration before it can select on them. Idempotent;
     # every other stage that may meet an old DB does the same.
@@ -175,7 +178,17 @@ def _remask(con, config: Config, limit: int | None,
 
     total = len(frames)
     n_frames = n_matched = n_dets = n_missing = 0
+    stopped = False
     for done, (_, fr) in enumerate(frames.iterrows(), start=1):
+        # CHECKED BETWEEN FRAMES. The caller uses this to hand the machine to a
+        # waiting upload: this pass is hours long and an upload is minutes, so a
+        # strict queue would make someone wait all afternoon to see their day
+        # processed. Stopping here costs nothing — the frame selection only picks
+        # frames that still have a detection without an outline, so resuming
+        # continues exactly where this left off rather than redoing anything.
+        if should_stop is not None and should_stop():
+            stopped = True
+            break
         rows = con.execute(
             "SELECT detection_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2 FROM detections "
             "WHERE frame_path = ? AND camera_id = ? "
@@ -243,7 +256,8 @@ def _remask(con, config: Config, limit: int | None,
         if on_progress:
             on_progress(done, total)
     return {"frames": n_frames, "detections": n_dets, "matched": n_matched,
-            "unmatched": n_dets - n_matched, "missing_frames": n_missing}
+            "unmatched": n_dets - n_matched, "missing_frames": n_missing,
+            "stopped": stopped}
 
 
 def _bbox_iou(a, b) -> float:
