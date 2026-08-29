@@ -196,8 +196,8 @@ export interface Taxonomy {
 // masked server-side for the same reason, since time of day hands the annotator
 // the sun/shade answer. `n_annotators` is how many already labeled this instance,
 // never WHAT they said. `frame_url` is the whole banner-masked frame behind this
-// crop, shown on hold-Space; there is still no frame_w/frame_h, because nothing
-// measures it.
+// crop, shown on hold-Space, with `frame_w`/`frame_h` below giving its ORIGINAL
+// dimensions so marks can be placed on it.
 export interface LabelItem {
   instance_key: string;
   dataset_id: string | null;
@@ -244,6 +244,23 @@ export interface LabelItem {
   // browser: the step's memory used to be React state, so a reload re-asked
   // about a cow they had already corrected.
   geom_done?: boolean;
+  // The outline editor's zoom ladder, and the level it opens on. Every level's
+  // geometry is computed server-side, so the client can only ever occupy a
+  // viewport the server has already described — which is what keeps
+  // crop_geometry out of TypeScript and makes a sheared save unrepresentable.
+  crop_levels?: CropLevel[];
+  crop_level?: number;
+}
+
+/** One rung of the outline editor's zoom ladder. `src` is the square this crop
+    was cut from, in FULL-FRAME px — it is the editor's SVG viewBox, which is
+    what lets the polygon stay in full-frame coordinates while the visible crop
+    changes underneath it. */
+export interface CropLevel {
+  pad: number;
+  url: string;
+  src: [number, number, number, number];
+  out: number;
 }
 
 // Where the editable outline came from. Echoed on submit so a stored correction
@@ -266,6 +283,10 @@ export interface LabelMaskFixReq {
   instance_key: string;
   anchor: InstanceAnchor;
   kind: MaskFixKind;
+  // Which space `polygon` is in. The editor sends 'frame' (full-frame px): it
+  // edits in frame coordinates so zooming changes only the visible crop, never
+  // the numbers, and the server then stores them with no conversion at all.
+  space?: "crop" | "frame";
   polygon: [number, number][] | null;
   mask_rev: string | null;
   seeded_from: MaskSeed;

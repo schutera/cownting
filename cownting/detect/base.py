@@ -14,7 +14,11 @@ class Instance:
     area_px: float
     ground_px: Tuple[float, float]            # ground-contact point (image px)
     posture: Optional[str] = None             # 'lying' | 'standing' | None
-    mask: Optional[np.ndarray] = None         # bool HxW, not persisted to the DB
+    # bool HxW, in FULL-FRAME px — `mask.shape[:2] == frame.shape[:2]` is a hard
+    # postcondition of Segmenter.segment. Reduced to a polygon and PERSISTED as
+    # detections.mask_poly (detect.geometry.mask_to_polygon); the array itself is
+    # not stored.
+    mask: Optional[np.ndarray] = None
     keypoints: Optional[np.ndarray] = None    # (K,3) x,y,conf in image px; pose stage only, not persisted
 
 

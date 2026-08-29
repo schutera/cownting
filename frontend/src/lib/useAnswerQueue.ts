@@ -273,12 +273,22 @@ function parseWrite(v: unknown): LabelWrite | null {
     // forever against a 400.
     const polygon = kind === "polygon" ? parsePolygon(req.polygon) : null;
     if (kind === "polygon" && polygon === null) return null;
+    if (req.space !== undefined && req.space !== "frame" && req.space !== "crop") return null;
     return {
       kind: "mask",
       req: {
         instance_key: req.instance_key,
         anchor,
         kind,
+        // WITHOUT THIS the replay is stored in the wrong coordinate system. The
+        // editor sends full-frame px (`space: "frame"`); the route defaults to
+        // "crop" for the pre-zoom contract. A rebuilt record that dropped the
+        // field would hand 4K coordinates to the crop-local branch — rejected
+        // forever on a large cow (the queue has no give-up state), or, on an
+        // animal near the frame origin, quietly passed through crop_to_frame and
+        // stored SHEARED. Which is exactly the class of corruption this
+        // field-by-field rebuild exists to prevent.
+        space: req.space === "frame" ? "frame" : "crop",
         polygon,
         mask_rev: typeof req.mask_rev === "string" ? req.mask_rev : null,
         seeded_from,

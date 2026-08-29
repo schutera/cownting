@@ -125,6 +125,12 @@ class LabelMaskFixReq(BaseModel):
     instance_key: str
     anchor: InstanceAnchor
     kind: str = "polygon"
+    # Which space `polygon` is in. 'frame' is what the outline editor sends: it
+    # works in FULL-FRAME px so that zooming changes only which crop is on
+    # screen, never the coordinates being edited. 'crop' is the original
+    # crop-local contract, kept because a queued write from a client loaded
+    # before this change may still be in flight.
+    space: str = "crop"
     polygon: list[list[float]] | None = None
     mask_rev: str | None = None
     seeded_from: str = "mask"
@@ -1864,6 +1870,8 @@ def create_app(config: Config) -> FastAPI:
         if body.seeded_from not in labels_db.MASK_SEEDS:
             raise HTTPException(
                 400, f"seeded_from must be one of {list(labels_db.MASK_SEEDS)}")
+        if body.space not in ("crop", "frame"):
+            raise HTTPException(400, "space must be 'crop' or 'frame'")
 
         cfg = config.annotation
         polygon: list[list[float]] | None = None
@@ -1879,18 +1887,33 @@ def create_app(config: Config) -> FastAPI:
                 raise HTTPException(400, "every outline point must be [x, y]")
             if any(not math.isfinite(float(v)) for p in pts for v in p):
                 raise HTTPException(400, "outline points must be finite")
-            # Inside the crop the annotator was actually served. A point outside
-            # it is either a client bug or a hand-made request; either way the
-            # stored polygon would not describe the animal.
-            _src, out, _ring = labeling.crop_geometry(
-                a.bbox, cfg.crop_pad, cfg.crop_max_width)
-            if any(not (-1.0 <= float(v) <= out + 1.0) for p in pts for v in p):
-                raise HTTPException(400, "outline points must lie inside the crop")
-            try:
-                polygon = labeling.crop_to_frame(
-                    pts, a.bbox, pad=cfg.crop_pad, max_width=cfg.crop_max_width)
-            except ValueError as e:
-                raise HTTPException(400, str(e))
+            if body.space == "frame":
+                # Already full-frame: no conversion, so nothing can shear. It is
+                # bounded by the WIDEST zoom level the editor can reach — the
+                # annotator can only have drawn inside a crop we served, and that
+                # is the largest one — rather than by the frame, which would
+                # accept an outline nobody could have seen.
+                widest = max(labeling.ZOOM_PADS + (cfg.crop_pad,))
+                sx0, sy0, sx1, sy1 = labeling.crop_geometry(
+                    a.bbox, widest, cfg.crop_max_width)[0]
+                if any(not (sx0 - 1 <= float(p[0]) <= sx1 + 1
+                            and sy0 - 1 <= float(p[1]) <= sy1 + 1) for p in pts):
+                    raise HTTPException(
+                        400, "outline points must lie inside the widest crop of this animal")
+                polygon = [[float(p[0]), float(p[1])] for p in pts]
+            else:
+                # Inside the crop the annotator was actually served. A point
+                # outside it is either a client bug or a hand-made request;
+                # either way the stored polygon would not describe the animal.
+                _src, out, _ring = labeling.crop_geometry(
+                    a.bbox, cfg.crop_pad, cfg.crop_max_width)
+                if any(not (-1.0 <= float(v) <= out + 1.0) for p in pts for v in p):
+                    raise HTTPException(400, "outline points must lie inside the crop")
+                try:
+                    polygon = labeling.crop_to_frame(
+                        pts, a.bbox, pad=cfg.crop_pad, max_width=cfg.crop_max_width)
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
         elif body.polygon:
             raise HTTPException(400, f"a {body.kind!r} verdict carries no polygon")
 

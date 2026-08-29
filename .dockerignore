@@ -47,3 +47,5 @@ tests/
 docs/
 *.md
 !DEPLOY.md
+config/*.local.yaml
+*.local.ts

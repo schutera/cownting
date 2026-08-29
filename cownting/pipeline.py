@@ -127,6 +127,21 @@ def remask(config: Config, limit: int | None = None,
     Returns `{"frames": n, "matched": n, "detections": n, "unmatched": n}`.
     """
     con = db.connect(config.paths.db_path)
+    try:
+        return _remask(con, config, limit, on_progress, dataset_id, camera_id, min_iou)
+    finally:
+        # A leaked write handle is not a leaked file descriptor here: DuckDB
+        # allows one read-write process per file, and this runs INSIDE the API
+        # server, so a connection left open by a failed pass would lock every
+        # later request out of the database for the life of the process. `segment`
+        # could get away with the same shape because it runs from the CLI and the
+        # process exits; this cannot.
+        con.close()
+
+
+def _remask(con, config: Config, limit: int | None,
+            on_progress: Callable[[int, int], None] | None,
+            dataset_id: str | None, camera_id: str | None, min_iou: float) -> dict:
     # This command exists FOR databases older than the mask columns, so it has to
     # run the forward-compat migration before it can select on them. Idempotent;
     # every other stage that may meet an old DB does the same.
@@ -192,7 +207,6 @@ def remask(config: Config, limit: int | None = None,
         bad = [i for i in instances
                if i.mask is not None and tuple(i.mask.shape[:2]) != tuple(image.shape[:2])]
         if bad:
-            con.close()
             raise RuntimeError(
                 f"{fr['frame_path']}: mask is {bad[0].mask.shape[:2]} but the frame "
                 f"is {image.shape[:2]} — the segmenter is not returning "
@@ -228,7 +242,6 @@ def remask(config: Config, limit: int | None = None,
             n_matched += 1
         if on_progress:
             on_progress(done, total)
-    con.close()
     return {"frames": n_frames, "detections": n_dets, "matched": n_matched,
             "unmatched": n_dets - n_matched, "missing_frames": n_missing}
 

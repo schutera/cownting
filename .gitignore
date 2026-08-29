@@ -50,3 +50,5 @@ config/cownting.yaml
 # alerts/webhook.url is the Discord webhook (secret)
 alerts/webhook.url
 docker-compose.override.yml
+config/*.local.yaml
+frontend/*.local.ts

@@ -617,6 +617,9 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
     # per item, the same cost class as the frame_sig read below, and the only way
     # the client can place a full-frame coordinate on a DOWNSCALED frame image.
     frame_w, frame_h = frame_size(row["frame_path"])
+    levels, default_level = zoom_levels(
+        bbox, camera_id=row["camera_id"], frame_file=frame_file,
+        dataset_id=row["dataset_id"], pad=cfg.crop_pad, max_width=cfg.crop_max_width)
     return {
         "instance_key": row["instance_key"],
         "dataset_id": row["dataset_id"],
@@ -665,6 +668,12 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         # already corrected — and pressing Enter on that second asking is what
         # used to destroy the correction (labels_db.submit_mask_edit).
         "geom_done": bool(row.get("geom_done")),
+        # The zoom ladder for the outline editor, with the level it opens on.
+        # Sent per item because every level's geometry is a function of THIS
+        # animal's box, and computing it here is what keeps crop_geometry out of
+        # the client entirely.
+        "crop_levels": levels,
+        "crop_level": default_level,
         # How many annotators already answered it — never WHAT they answered.
         # Showing the distribution would anchor the next annotator and destroy the
         # independence the agreement statistic assumes.
@@ -772,6 +781,49 @@ def crop_geometry(bbox: Sequence[float], pad: float, max_width: int
     out = max(1, int(math.floor(n * scale + 0.5)))
     ring = ((x1 - x0) * scale, (y1 - y0) * scale, (x2 - x0) * scale, (y2 - y0) * scale)
     return (x0, y0, x0 + n, y0 + n), out, ring
+
+
+# The zoom ladder for the outline editor. Padding is a multiple of the animal's
+# longer side, so the square is (1 + 2*pad) times it: 0.1 is a tight crop that
+# fills the canvas with the cow (precision), 2.5 shows it small in a lot of
+# surroundings (reach). The annotator's own `crop_pad` is folded in and the list
+# deduped, so the default view is always ON the ladder and zooming returns to it
+# exactly rather than to a neighbouring approximation.
+#
+# A LADDER, not a continuous zoom, and the reason is that every level's geometry
+# is computed HERE: the client never runs crop_geometry, so it can only occupy
+# positions the server has already described. A free-form pad would mean either
+# shipping that arithmetic to TypeScript or asking the server on every wheel
+# tick.
+ZOOM_PADS: tuple[float, ...] = (0.1, 0.35, 1.0, 2.5)
+
+
+def zoom_levels(bbox: Sequence[float], *, camera_id: str, frame_file: str,
+                dataset_id: str | None, pad: float, max_width: int
+                ) -> tuple[list[dict], int]:
+    """Every crop the outline editor may show, and which one it opens on.
+
+    Each level carries its own image URL and its SOURCE BOX in full-frame px.
+    That source box is the editor's viewBox, which is what makes zooming free:
+    the outline is held in full-frame coordinates, so changing level changes what
+    is visible and nothing else — no polygon is converted, and a point dragged at
+    one zoom is the same point at another.
+    """
+    pads = sorted({round(float(p), 4) for p in (*ZOOM_PADS, float(pad))})
+    levels: list[dict] = []
+    for p in pads:
+        src, out, _ring = crop_geometry(bbox, p, max_width)
+        levels.append({
+            "pad": p,
+            "url": crop_url(camera_id=camera_id, frame_file=frame_file, bbox=bbox,
+                            dataset_id=dataset_id, pad=p, max_width=max_width),
+            # [x0, y0, x1, y1] in FULL-FRAME px — the square the renderer cuts.
+            "src": [float(src[0]), float(src[1]), float(src[2]), float(src[3])],
+            "out": int(out),
+        })
+    default = next((i for i, lv in enumerate(levels)
+                    if abs(lv["pad"] - float(pad)) < 1e-6), 0)
+    return levels, default
 
 
 def crop_to_frame(points: Sequence[Sequence[float]], bbox: Sequence[float], *,

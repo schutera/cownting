@@ -262,6 +262,176 @@ def test_key_survives_clip_and_restore():
         con.close()
 
 
+def _reingest_fixture(d: str):
+    """One dataset, one camera, ONE detection — so the re-ingest shift below has
+    exactly one candidate and `_best_candidate`'s runner-up guard cannot mask a
+    failure of the thing under test."""
+    from datetime import datetime
+
+    ds, cam, base = "2026-07-03", "camera_01", "00000001.jpg"
+    f1 = f"data/artifacts/{ds}/frames/{cam}/{base}"
+    mcon = db.connect(os.path.join(d, "cownting.duckdb"))
+    db.init_db(mcon)
+    db.upsert_dataset(mcon, ds, __import__("datetime").date(2026, 7, 3),
+                      "Jul 03, 2026", status="localized")
+    db.insert_frames(mcon, pd.DataFrame([
+        {"dataset_id": ds, "camera_id": cam, "frame_idx": 1,
+         "ts": datetime(2026, 7, 3, 6, 0), "frame_path": f1}]))
+    db.insert_detections(mcon, pd.DataFrame([
+        {"dataset_id": ds, "camera_id": cam, "ts": datetime(2026, 7, 3, 6, 0),
+         "frame_path": f1, "score": 0.9,
+         "bbox_x1": 10.0, "bbox_y1": 20.0, "bbox_x2": 110.0, "bbox_y2": 220.0}]))
+    bbox = [10.0, 20.0, 110.0, 220.0]
+    prov = {"dataset_id": ds, "camera_id": cam, "frame_basename": base,
+            "frame_path": f1, "bbox_x1": bbox[0], "bbox_y1": bbox[1],
+            "bbox_x2": bbox[2], "bbox_y2": bbox[3], "ordinal": 0}
+    return mcon, _store(d), ds, cam, base, bbox, prov
+
+
+def _shift_boxes(mcon, dx: float = 3.0) -> str:
+    """A re-ingest with a drifted detector: the box moves a few px, so the key
+    changes while the animal did not. 3px on a 100x200 box is IoU 0.94 — over
+    IOU_ATTACH with no runner-up, i.e. the `aliased` branch."""
+    mcon.execute("UPDATE detections SET bbox_x1 = bbox_x1 + ?, bbox_x2 = bbox_x2 + ?",
+                 [dx, dx])
+    return str(mcon.execute(_key_scan_sql()).fetchall()[0][-1])
+
+
+def test_a_false_positive_stays_removed_across_a_rekey():
+    """REGRESSION. 'Not a cow' lives in `mask_edits` and NOWHERE else — the route
+    retires the instance, so the annotator never answers it and no `annotations`
+    row is ever written. A repair that both enumerates and rewrites only
+    `annotations` therefore never SEES this key: no alias, no reconciliation row,
+    no move. `v_false_positives` is left pointing at a key no detection has, the
+    queue's anti-join misses, and a detection a human declared not to be an animal
+    walks back into everybody's queue."""
+    with tempfile.TemporaryDirectory() as d:
+        mcon, lcon, ds, cam, base, bbox, prov = _reingest_fixture(d)
+        old_key = labels_db.instance_key(ds, cam, base, bbox, 0)
+        labels_db.submit_mask_edit(lcon, instance_key=old_key, annotator="alice",
+                                   kind="false_positive", seeded_from="model",
+                                   provenance=prov)
+        check("the removal is visible to the queue's anti-join before the re-ingest",
+              lcon.execute("SELECT count(*) FROM v_false_positives WHERE effective_key = ?",
+                           [old_key]).fetchone()[0] == 1)
+        check("...and it is the ONLY human work on this instance",
+              lcon.execute("SELECT count(*) FROM annotations").fetchone()[0] == 0)
+
+        new_key = _shift_boxes(mcon)
+        check("the re-ingest really did change the key", new_key != old_key)
+
+        rep = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+        check("the reconciler SEES an instance that has no annotations",
+              rep["instances"] == 1 and rep["outline_only_instances"] == 1, str(rep))
+        check("...and aliases it", rep["states"]["aliased"] == 1, str(rep["states"]))
+        check("...and reports the mask_edits row it moved",
+              rep["rekeyed"]["mask_edits"] == 1, str(rep["rekeyed"]))
+        check("the removal now joins to the LIVE detection",
+              lcon.execute("SELECT count(*) FROM v_false_positives WHERE effective_key = ?",
+                           [new_key]).fetchone()[0] == 1)
+        check("...and no longer to the dead one — it MOVED, it did not fan out",
+              lcon.execute("SELECT count(*) FROM v_false_positives WHERE effective_key = ?",
+                           [old_key]).fetchone()[0] == 0)
+        check("instance_key is untouched: it records what was actually hashed",
+              lcon.execute("SELECT count(*) FROM mask_edits WHERE instance_key = ?",
+                           [old_key]).fetchone()[0] == 1)
+        mcon.close(); lcon.close()
+
+
+def test_an_outline_correction_follows_its_instance():
+    """REGRESSION. The answers and the corrected outline are two rows about ONE
+    cow, written in one sitting. A repair that moves only `annotations` tears them
+    apart: the answers re-attach, the polygon does not, and the annotator is
+    re-served the same animal with the bare model outline while their correction
+    is invisible forever."""
+    with tempfile.TemporaryDirectory() as d:
+        mcon, lcon, ds, cam, base, bbox, prov = _reingest_fixture(d)
+        old_key = labels_db.instance_key(ds, cam, base, bbox, 0)
+        labels_db.submit_annotation(lcon, instance_key=old_key, annotator="alice",
+                                    outcome="labeled", choices=[_SHADED], provenance=prov)
+        labels_db.submit_mask_edit(lcon, instance_key=old_key, annotator="alice",
+                                   kind="polygon",
+                                   polygon=[[12.0, 22.0], [108.0, 30.0], [60.0, 215.0]],
+                                   seeded_from="bbox", provenance=prov)
+        new_key = _shift_boxes(mcon)
+        rep = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+        check("both tables were rewritten, not just the answers",
+              rep["rekeyed"] == {"annotations": 1, "mask_edits": 1}, str(rep["rekeyed"]))
+        eff = lcon.execute("SELECT effective_key FROM v_current_mask_edits "
+                           "WHERE instance_key = ?", [old_key]).fetchone()
+        check("the correction points at the live detection", eff == (new_key,), str(eff))
+        row = lcon.execute("SELECT kind, n_vertices FROM v_current_mask_edits "
+                           "WHERE effective_key = ?", [new_key]).fetchone()
+        check("...and is still the polygon, intact — a move, not a rewrite",
+              row == ("polygon", 3), str(row))
+        ans = lcon.execute("SELECT effective_key FROM v_current_answers "
+                           "WHERE instance_key = ?", [old_key]).fetchone()
+        check("the answer and the outline agree on which cow this is",
+              ans == (new_key,) and ans == eff, f"{ans} vs {eff}")
+        mcon.close(); lcon.close()
+
+
+def test_rekey_collides_with_nothing_when_one_annotator_has_rows_in_both_tables():
+    """The scariest shape: alice has several versions in BOTH tables under the old
+    key, AND has already worked the re-ingested detection under the new one.
+
+    A fix that rewrote `instance_key`, or that superseded-and-reinserted, would
+    violate UNIQUE (instance_key, annotator, version) the moment those identities
+    met. Rewriting only `effective_key` — which is in no UNIQUE and no PK on
+    either table — cannot. This test is what says so, and what stops the next
+    person 'simplifying' it into a merge."""
+    with tempfile.TemporaryDirectory() as d:
+        mcon, lcon, ds, cam, base, bbox, prov = _reingest_fixture(d)
+        old_key = labels_db.instance_key(ds, cam, base, bbox, 0)
+        for _ in range(2):
+            labels_db.submit_annotation(lcon, instance_key=old_key, annotator="alice",
+                                        outcome="labeled", choices=[_SHADED],
+                                        provenance=prov)
+        labels_db.submit_mask_edit(lcon, instance_key=old_key, annotator="alice",
+                                   kind="polygon",
+                                   polygon=[[12.0, 22.0], [108.0, 30.0], [60.0, 215.0]],
+                                   seeded_from="bbox", provenance=prov)
+        labels_db.submit_mask_edit(lcon, instance_key=old_key, annotator="alice",
+                                   kind="false_positive", seeded_from="edit",
+                                   provenance=prov)
+        new_key = _shift_boxes(mcon)
+        new_prov = {**prov, "bbox_x1": bbox[0] + 3, "bbox_x2": bbox[2] + 3}
+        labels_db.submit_annotation(lcon, instance_key=new_key, annotator="alice",
+                                    outcome="labeled", choices=[_SHADED],
+                                    provenance=new_prov)
+        labels_db.submit_mask_edit(lcon, instance_key=new_key, annotator="alice",
+                                   kind="ok", seeded_from="model", provenance=new_prov)
+
+        before = {t: lcon.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                  for t in ("annotations", "mask_edits")}
+        rep = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+        check("the re-key completes without a constraint violation",
+              rep["states"]["aliased"] == 1, str(rep["states"]))
+        check("nothing inserted, nothing deleted — only a column moved",
+              {t: lcon.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+               for t in ("annotations", "mask_edits")} == before, str(before))
+        for t in ("annotations", "mask_edits"):
+            dupes = lcon.execute(
+                f"SELECT count(*) FROM (SELECT instance_key, annotator, version "
+                f"FROM {t} GROUP BY 1, 2, 3 HAVING count(*) > 1)").fetchone()[0]
+            check(f"UNIQUE (instance_key, annotator, version) still holds on {t}",
+                  dupes == 0, str(dupes))
+        check("all of alice's history, both keys and both tables, is on the live key",
+              lcon.execute("SELECT count(*) FROM mask_edits WHERE effective_key <> ?",
+                           [new_key]).fetchone()[0] == 0
+              and lcon.execute("SELECT count(*) FROM annotations WHERE effective_key <> ?",
+                               [new_key]).fetchone()[0] == 0)
+        check("both instance_keys survive: the audit trail is not collapsed",
+              {r[0] for r in lcon.execute(
+                  "SELECT DISTINCT instance_key FROM mask_edits").fetchall()}
+              == {old_key, new_key})
+        again = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+        check("re-running moves nothing and does not re-report the same move",
+              again["rekeyed"] == {"annotations": 0, "mask_edits": 0},
+              str(again["rekeyed"]))
+        mcon.close(); lcon.close()
+
+
 def test_mask_survives_clip_restore_on_a_deployed_shape_db():
     """The persisted outline must survive the same round trip the key does — and
     on the schema an ALREADY-DEPLOYED database actually has.
@@ -540,6 +710,9 @@ def main():
     test_python_and_sql_keys_agree()
     test_ordinal_is_dense_and_total()
     test_key_survives_clip_and_restore()
+    test_a_false_positive_stays_removed_across_a_rekey()
+    test_an_outline_correction_follows_its_instance()
+    test_rekey_collides_with_nothing_when_one_annotator_has_rows_in_both_tables()
     test_mask_survives_clip_restore_on_a_deployed_shape_db()
     test_mask_columns_are_last_so_the_archive_stays_aligned()
     test_schema_is_idempotent_and_seeded()

@@ -32,6 +32,7 @@ import { PANEL_H, QuestionPanel } from "../components/QuestionPanel";
 import { TILE_GAP, TILE_H, TILE_W } from "../components/OptionTile";
 import { LabelProgress } from "../components/LabelProgress";
 import { approxIou, rectSeed, type Point } from "../lib/polygon";
+import type { CropLevel } from "../lib/types";
 
 /* The labeling screen (docs/roadmap/M3_labeling_ux.md; data model in
  * docs/roadmap/M3_labeling.md §5).
@@ -290,6 +291,11 @@ export default function Label() {
   // chose to open. `draft` is null exactly when the mode is Classify.
   const [draft, setDraft] = useState<Point[] | null>(null);
   const [maskSaving, setMaskSaving] = useState(false);
+  // Where the annotator is on the zoom ladder, or null to use the item's own
+  // default. Held here rather than in MaskEditor so leaving the editor and
+  // coming back to the same animal keeps the view they had chosen — and reset
+  // per item below, because a zoom chosen for one cow means nothing on the next.
+  const [zoom, setZoom] = useState<number | null>(null);
   // Which instances have PASSED the geometry step. Keyed by instance_key for the
   // same reason the answers are (see the header's point 3): a shared boolean is
   // how a confirmation given for one cow ends up gating a different one. It also
@@ -389,8 +395,11 @@ export default function Label() {
   // ------------------------------------------------------------ outline seeds
   // What the editor opens with, and what Revert returns to. Both read the ITEM,
   // never the draft, so they are stable across an edit.
+  // FULL-FRAME px — the space the editor works in, so that zooming changes the
+  // visible crop and nothing else. `mask` (crop-local) is still what the
+  // read-only preview on the classify view draws.
   const servedMask = useMemo<Point[] | null>(() => {
-    const m = current?.mask;
+    const m = current?.mask_frame;
     // A server that predates M4a sends nothing; one that has no stored mask for
     // this instance sends null. Both mean "seed from the ring" (§4.1), and a
     // polygon too short to be a shape is treated the same way rather than
@@ -400,7 +409,10 @@ export default function Label() {
   }, [current]);
   const seed = useMemo<Point[] | null>(() => {
     if (current === null) return null;
-    return servedMask ?? rectSeed(current.ring);
+    // The fallback rectangle is the BBOX, in the same full-frame space — not the
+    // crop-local ring, which would put the seed in a different coordinate system
+    // from everything else the editor touches.
+    return servedMask ?? rectSeed(current.bbox);
   }, [current, servedMask]);
   const outlineOpen = draft !== null;
   // The editor is offered even with no stored mask (decision 2: sculpting from
@@ -439,6 +451,22 @@ export default function Label() {
   // asking used to overwrite their own correction.
   const geomDone =
     currentKey === null ? false : (geomByKey[currentKey] ?? current?.geom_done ?? false);
+
+  // The zoom ladder, with a single-rung fallback so a server that predates it
+  // still yields a working editor at the crop it did send.
+  const cropLevels = useMemo<CropLevel[]>(() => {
+    if (current === null) return [];
+    if (current.crop_levels && current.crop_levels.length > 0) return current.crop_levels;
+    return [{
+      pad: 0,
+      url: current.crop_url,
+      // Without a served source box the crop's own pixel grid is the only space
+      // available; the ring is in exactly that space.
+      src: [0, 0, current.crop_w, current.crop_h],
+      out: current.crop_w,
+    }];
+  }, [current]);
+  const zoomIndex = zoom ?? current?.crop_level ?? 0;
   const inGeometry = current !== null && !geomDone && !cropFailed;
 
   useEffect(() => {
@@ -896,9 +924,11 @@ export default function Label() {
         instance_key: current.instance_key,
         anchor: anchorOf(current),
         kind,
-        // Crop-local px, exactly as served (§4.1): the server owns the
-        // conversion to full-frame storage, in one place, so the two spaces can
-        // never disagree about where the annotator put a node.
+        // FULL-FRAME px, which is the space the editor already works in — so
+        // there is no conversion on this path at all, and no basis for the
+        // stored outline to disagree with the pixels it was drawn on, whatever
+        // zoom level it was drawn at.
+        space: "frame",
         polygon: kind === "polygon" && draft !== null ? draft.map(([x, y]): [number, number] => [x, y]) : null,
         mask_rev: current.mask_rev ?? null,
         // What this correction was actually drawn over, straight from the item —
@@ -1049,6 +1079,7 @@ export default function Label() {
     setClean(false);
     setDraft(null);
     setMaskSaving(false);
+    setZoom(null);
     // A popover must not survive the advance: the same class_key exists in the
     // next item, so it would silently reappear anchored to a cow nobody opened
     // it for.
@@ -1402,6 +1433,9 @@ export default function Label() {
                 item={current}
                 polygon={draft}
                 onChange={setDraft}
+                levels={cropLevels}
+                levelIndex={zoomIndex}
+                onLevelChange={setZoom}
                 hidden={clean || inspect}
                 onRefusedDelete={() => {
                   shake();

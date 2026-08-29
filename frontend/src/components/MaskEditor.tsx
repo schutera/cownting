@@ -1,37 +1,41 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { LabelItem } from "../lib/types";
+import type { CropLevel, LabelItem } from "../lib/types";
 
 /* The instance-outline editor (docs/roadmap/M4a_instance_mask_fixup.md §5.2):
  * the model's mask drawn over the crop as a polygon whose nodes the annotator
  * drags onto the animal's real edge.
  *
- * IT IS THE SAME STRETCH CONTRACT AS InstanceCrop, deliberately. The image and
- * the SVG are both stretched into one absolutely-positioned box — the image by
- * `object-fit: fill`, the SVG by `preserveAspectRatio="none"` over a
- * `crop_w x crop_h` viewBox — so source px map to box px identically and the
- * polygon tracks the animal at any rendered size, even if a caller squeezes the
- * box out of the crop's aspect ratio. A `meet`-fitted SVG over a filled image is
- * where that silently shears, which on THIS component would mean a saved
- * polygon that does not match what the annotator drew.
+ * IT WORKS IN FULL-FRAME PIXELS, and that is the design decision everything else
+ * follows from. The crop on screen is a VIEWPORT, not a coordinate system: its
+ * source square is the SVG viewBox, so zooming to a wider crop changes which
+ * pixels are visible and leaves every stored coordinate untouched. A point
+ * dragged at one zoom is the same point at another, the polygon needs no
+ * conversion when the level changes, and the submit needs none either — which
+ * removes the whole class of bug where an outline drawn in one crop basis is
+ * stored against a different one and lands, sheared, somewhere near the animal.
  *
- * WHY HIT-TESTING IS IN SCREEN PX, NOT CROP PX. A 40px-wide crop of a distant
- * cow blown up to a 420px box has a scale factor of ~10: a grab radius of 8
- * crop px would be 80px on screen (every node grabs everything) and on a 3000px
- * crop it would be under a pixel (nothing is grabbable at all). So the pointer
- * position is converted to crop space, and the RADII are converted the other
- * way — the node markers are counter-scaled for exactly the same reason, which
- * is the vertex idiom ImageClicker already proved on the count-area editor.
+ * The zoom LADDER is computed server-side (labeling.zoom_levels) and rides on
+ * the item. That is what keeps crop_geometry out of TypeScript: the client can
+ * only occupy viewports the server has already described, so it can never
+ * invent a basis the server cannot invert.
  *
- * WHAT THIS DELIBERATELY DOES NOT DO: zoom, pan, multi-polygon, freehand. The
- * crop IS the zoom (hold-Space still shows the whole frame), one instance has
- * one outline, and a freehand trace produces the 4000-vertex blob the plan's
- * server-side simplification exists to reject. M4's full-frame MaskCanvas is
- * where those belong.
+ * WHY HIT-TESTING IS IN SCREEN PX, NOT SOURCE PX. A distant cow in a tight crop
+ * and the same cow in a 2.5-pad crop differ by an order of magnitude in scale.
+ * A grab radius fixed in source px would be unusably large in one and
+ * untouchable in the other. So the pointer is converted into source space and
+ * the RADII are converted the other way — the node markers are counter-scaled
+ * for the same reason, which is the vertex idiom ImageClicker proved on the
+ * count-area editor.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO: pan, multi-polygon, freehand. Zoom is
+ * bounded by the ladder and always centred on the animal, so there is nothing to
+ * pan to; one instance has one outline; and a freehand trace produces the
+ * thousand-vertex blob the server's simplification exists to reject.
  */
 
-// Node marker radius and the grab radius around it, in SCREEN px (see header).
-// The grab radius is deliberately larger than the dot: a node you can see but
-// not catch reads as a broken drag.
+// Node marker radius and the grab radius around it, in SCREEN px. The grab
+// radius is deliberately larger than the dot: a node you can see but not catch
+// reads as a broken drag.
 const NODE_R = 5;
 const GRAB_R = 11;
 // How near a segment a click has to land to insert a node there, screen px.
@@ -50,10 +54,15 @@ const NODE_FILL = "#F2F0EC";
 
 export interface MaskEditorProps {
   item: LabelItem;
-  /** The polygon being edited, crop-local px. Owned by the page so Revert,
+  /** The polygon being edited, FULL-FRAME px. Owned by the page so Revert,
       dirty-tracking and the save payload all read one array. */
   polygon: [number, number][];
   onChange: (next: [number, number][]) => void;
+  /** The zoom ladder and where we are on it. Lifted to the page so the level
+      survives leaving and re-entering the editor on the same animal. */
+  levels: CropLevel[];
+  levelIndex: number;
+  onLevelChange: (next: number) => void;
   /** Hold-H: hide the overlay so the bare pixels can be judged mid-edit — the
       same affordance the ring has, and the only honest way to check whether the
       outline is actually on the animal. */
@@ -68,7 +77,7 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
-/** Distance from p to segment ab, and where along ab the foot lands. */
+/** Distance from p to segment ab. */
 function distToSegment(
   px: number,
   py: number,
@@ -83,32 +92,35 @@ function distToSegment(
   // A degenerate segment (two coincident nodes) would divide by zero; the
   // distance to it is just the distance to the point.
   const t = len2 === 0 ? 0 : clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1);
-  const fx = ax + t * dx;
-  const fy = ay + t * dy;
-  return Math.hypot(px - fx, py - fy);
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
 
 export function MaskEditor({
   item,
   polygon,
   onChange,
+  levels,
+  levelIndex,
+  onLevelChange,
   hidden = false,
   onRefusedDelete,
   className,
 }: MaskEditorProps) {
-  const w = Math.max(item.crop_w, 1);
-  const h = Math.max(item.crop_h, 1);
+  const level = levels[clamp(levelIndex, 0, Math.max(0, levels.length - 1))];
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
-  /* CROP px per SCREEN px, measured. The markers are drawn in viewBox units, so
-     this is what keeps a node the same size on screen whether the crop is 40px
-     of a distant animal blown up to 420, or a 3000px close-up scaled down —
-     `vectorEffect` fixes strokes but has no say over a radius. The two axes are
-     tracked separately because `preserveAspectRatio="none"` lets them differ,
-     which is why the markers are ellipses: one radius would render an egg the
-     moment a caller squeezes the box. */
+  // The viewport, in full-frame px: the square the server cut this crop from.
+  const [vx0, vy0, vx1, vy1] = level?.src ?? [0, 0, 1, 1];
+  const vw = Math.max(vx1 - vx0, 1);
+  const vh = Math.max(vy1 - vy0, 1);
+
+  /* SOURCE px per SCREEN px, measured. Markers are drawn in viewBox units, so
+     this is what keeps a node the same size on screen at every zoom level —
+     `vectorEffect` fixes strokes but has no say over a radius. Tracked per axis
+     because `preserveAspectRatio="none"` lets them differ, which is why the
+     markers are ellipses. */
   const [scale, setScale] = useState<{ x: number; y: number }>({ x: 1, y: 1 });
   useEffect(() => {
     const svg = svgRef.current;
@@ -116,48 +128,37 @@ export function MaskEditor({
     const measure = () => {
       const rect = svg.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return;
-      setScale({ x: w / rect.width, y: h / rect.height });
+      setScale({ x: vw / rect.width, y: vh / rect.height });
     };
     measure();
-    // The crop box is sized by viewport arithmetic (Label's CROP_CHROME), so it
-    // changes without this component re-rendering. ResizeObserver catches that;
-    // a window listener alone would miss a panel opening beside it.
+    // The crop box is sized by viewport arithmetic (Label's CROP_CHROME) and the
+    // viewBox changes on every zoom, so both need re-measuring.
     const ro = new ResizeObserver(measure);
     ro.observe(svg);
     return () => ro.disconnect();
-  }, [h, w]);
+  }, [vw, vh]);
 
-  /** Client px -> crop px, plus the scale needed to convert the screen-space
-      radii into crop space. One measurement per gesture, read from the live
-      element so a resized window cannot leave a stale factor behind. */
-  const geometry = useCallback((): { sx: number; sy: number; rect: DOMRect } | null => {
-    const svg = svgRef.current;
-    if (svg === null) return null;
-    const rect = svg.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return null;
-    return { sx: w / rect.width, sy: h / rect.height, rect };
-  }, [h, w]);
-
-  const toCrop = useCallback(
+  /** Client px -> full-frame px. */
+  const toFrame = useCallback(
     (e: { clientX: number; clientY: number }): [number, number] | null => {
-      const g = geometry();
-      if (g === null) return null;
+      const svg = svgRef.current;
+      if (svg === null) return null;
+      const rect = svg.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return null;
       return [
-        clamp((e.clientX - g.rect.left) * g.sx, 0, w),
-        clamp((e.clientY - g.rect.top) * g.sy, 0, h),
+        vx0 + ((e.clientX - rect.left) / rect.width) * vw,
+        vy0 + ((e.clientY - rect.top) / rect.height) * vh,
       ];
     },
-    [geometry, h, w],
+    [vh, vw, vx0, vy0],
   );
 
-  /** The node under the pointer, or null. Radii are screen px converted into
-      crop space via the mean scale — the two axes differ only when a caller
+  /** The node under the pointer, or null. `radiusPx` is screen px converted into
+      source space via the mean scale — the two axes differ only when a caller
       squeezes the box, and picking one keeps the grab zone a circle on screen. */
   const nodeAt = useCallback(
     (cx: number, cy: number, radiusPx: number): number | null => {
-      const g = geometry();
-      if (g === null) return null;
-      const r = radiusPx * ((g.sx + g.sy) / 2);
+      const r = radiusPx * ((scale.x + scale.y) / 2);
       let best: number | null = null;
       let bestD = Infinity;
       for (let i = 0; i < polygon.length; i += 1) {
@@ -169,33 +170,31 @@ export function MaskEditor({
       }
       return best;
     },
-    [geometry, polygon],
+    [polygon, scale],
   );
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
       if (hidden) return;
-      const pt = toCrop(e);
+      const pt = toFrame(e);
       if (pt === null) return;
       const [cx, cy] = pt;
 
       const hit = nodeAt(cx, cy, GRAB_R);
       if (hit !== null) {
-        // Pointer capture on the SVG, not the circle: a fast drag leaves the
-        // 10px node behind within one frame, and without capture the pointerup
+        // Pointer capture on the SVG, not the node: a fast drag leaves a 10px
+        // circle behind within one frame, and without capture the pointerup
         // lands on the page and the node sticks to the cursor.
         e.currentTarget.setPointerCapture(e.pointerId);
         setDragIndex(hit);
         return;
       }
 
-      // Not on a node: is it near an edge? Insert there. The polygon is closed,
-      // so the last segment wraps to node 0 — an outline is most often wrong at
-      // exactly one end, and without the wrap that seam is the one place a node
-      // cannot be added.
-      const g = geometry();
-      if (g === null) return;
-      const edgeR = EDGE_R * ((g.sx + g.sy) / 2);
+      // Not on a node: near an edge? Insert there. The polygon is closed, so the
+      // last segment wraps to node 0 — an outline is most often wrong at exactly
+      // one end, and without the wrap that seam is the one place a node cannot
+      // be added.
+      const edgeR = EDGE_R * ((scale.x + scale.y) / 2);
       let bestAt = -1;
       let bestD = Infinity;
       for (let i = 0; i < polygon.length; i += 1) {
@@ -215,12 +214,12 @@ export function MaskEditor({
         setDragIndex(bestAt + 1); // drag the new node straight away
       }
     },
-    [geometry, hidden, nodeAt, onChange, polygon, toCrop],
+    [hidden, nodeAt, onChange, polygon, scale, toFrame],
   );
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
-      const pt = toCrop(e);
+      const pt = toFrame(e);
       if (pt === null) return;
       const [cx, cy] = pt;
       if (dragIndex === null) {
@@ -228,13 +227,18 @@ export function MaskEditor({
         return;
       }
       const next: [number, number][] = [...polygon];
-      // Clamped to the crop box: a vertex dragged off the image is out of the
-      // frame the server will validate against, and the annotator cannot see
-      // where it went.
-      next[dragIndex] = [cx, cy];
+      // Clamped to the FRAME, not to the current viewport: a node dragged to the
+      // edge of a tight crop is still a legitimate point of the animal, and
+      // zooming out must be able to reach it again.
+      const fw = item.frame_w ?? 0;
+      const fh = item.frame_h ?? 0;
+      next[dragIndex] = [
+        fw > 0 ? clamp(cx, 0, fw) : cx,
+        fh > 0 ? clamp(cy, 0, fh) : cy,
+      ];
       onChange(next);
     },
-    [dragIndex, hidden, nodeAt, onChange, polygon, toCrop],
+    [dragIndex, hidden, item.frame_h, item.frame_w, nodeAt, onChange, polygon, toFrame],
   );
 
   const endDrag = useCallback((e: React.PointerEvent<SVGSVGElement>) => {
@@ -247,7 +251,7 @@ export function MaskEditor({
   const onDoubleClick = useCallback(
     (e: React.MouseEvent<SVGSVGElement>) => {
       if (hidden) return;
-      const pt = toCrop(e);
+      const pt = toFrame(e);
       if (pt === null) return;
       const hit = nodeAt(pt[0], pt[1], GRAB_R);
       if (hit === null) return;
@@ -259,8 +263,33 @@ export function MaskEditor({
       }
       onChange(polygon.filter((_, i) => i !== hit));
     },
-    [hidden, nodeAt, onChange, onRefusedDelete, polygon, toCrop],
+    [hidden, nodeAt, onChange, onRefusedDelete, polygon, toFrame],
   );
+
+  /* THE WHEEL IS THE ZOOM, because that is what a wheel means over an image
+     everywhere else. It steps the server's ladder — up for a tighter crop, down
+     for more surroundings — so an outline that needs to reach past the animal
+     has somewhere to reach from.
+
+     preventDefault matters: without it the page scrolls under the annotator
+     while they are trying to zoom, which is the single most common way a
+     wheel-zoom feels broken. React's synthetic wheel listener is passive, so the
+     handler is attached natively with { passive: false }. */
+  const wheelRef = useRef<(e: WheelEvent) => void>(() => {});
+  wheelRef.current = (e: WheelEvent) => {
+    if (hidden || levels.length < 2) return;
+    e.preventDefault();
+    const dir = e.deltaY < 0 ? -1 : 1; // wheel up = zoom in = a tighter pad
+    const next = clamp(levelIndex + dir, 0, levels.length - 1);
+    if (next !== levelIndex) onLevelChange(next);
+  };
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (svg === null) return;
+    const handler = (e: WheelEvent) => wheelRef.current(e);
+    svg.addEventListener("wheel", handler, { passive: false });
+    return () => svg.removeEventListener("wheel", handler);
+  }, []);
 
   const d =
     polygon.length === 0
@@ -273,11 +302,13 @@ export function MaskEditor({
         "relative overflow-hidden rounded-xl border border-border bg-surface-sunk" +
         (className ? " " + className : "")
       }
-      style={{ aspectRatio: `${w} / ${h}` }}
     >
       <img
-        key={item.crop_url}
-        src={item.crop_url}
+        // Keyed by URL so a zoom mounts a fresh element rather than holding the
+        // previous crop on screen until the next decode finishes — a stale crop
+        // under a live viewBox is an outline drawn over the wrong pixels.
+        key={level?.url}
+        src={level?.url}
         alt={`the cow whose outline you are correcting — ${item.camera_id}`}
         className="absolute inset-0 w-full h-full"
         decoding="async"
@@ -286,7 +317,7 @@ export function MaskEditor({
       <svg
         ref={svgRef}
         className="absolute inset-0 w-full h-full"
-        viewBox={`0 0 ${w} ${h}`}
+        viewBox={`${vx0} ${vy0} ${vw} ${vh}`}
         preserveAspectRatio="none"
         style={{
           opacity: hidden ? 0 : 1,
@@ -299,8 +330,8 @@ export function MaskEditor({
         onPointerCancel={endDrag}
         onDoubleClick={onDoubleClick}
       >
-        {/* Two strokes, dark under light, for the reason InstanceCrop's ring
-            has two: one colour vanishes against either a sunlit flank or panel
+        {/* Two strokes, dark under light, for the reason InstanceCrop's ring has
+            two: one colour vanishes against either a sunlit flank or panel
             shade, and an outline you cannot see is an outline you cannot fix. */}
         <path d={d} fill={FILL} stroke={STROKE_HALO} strokeWidth={4} vectorEffect="non-scaling-stroke" />
         <path d={d} fill="none" stroke={STROKE} strokeWidth={2} vectorEffect="non-scaling-stroke" />
@@ -309,8 +340,7 @@ export function MaskEditor({
             key={i}
             cx={x}
             cy={y}
-            // Counter-scaled: NODE_R screen px expressed in viewBox units, per
-            // axis (see the `scale` comment above).
+            // NODE_R screen px expressed in viewBox units, per axis.
             rx={NODE_R * scale.x}
             ry={NODE_R * scale.y}
             fill={i === dragIndex || i === hoverIndex ? STROKE : NODE_FILL}

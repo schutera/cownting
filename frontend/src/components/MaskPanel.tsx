@@ -73,6 +73,9 @@ export function MaskPanel({
         {seededFromBbox
           ? "No outline was stored for this animal — drag the corners onto its edge, and click an edge to add a point."
           : "Drag a point onto the animal's edge · click an edge to add a point · double-click a point to remove it"}
+        {" · "}
+        <span style={{ color: INK }}>scroll to zoom</span> for a closer look or more
+        room around the animal
       </p>
 
       <div className="flex items-center gap-2 mt-auto">
@@ -95,7 +98,7 @@ export function MaskPanel({
 
       <div className="text-[11px] mt-2" style={{ color: INK_DIM }}>
         <Kbd>Enter</Kbd> save · <Kbd>R</Kbd> revert · <Kbd>H</Kbd> hold to hide ·{" "}
-        <Kbd>Esc</Kbd> back to the questions
+        <Kbd>scroll</Kbd> zoom · <Kbd>Esc</Kbd> back to the questions
       </div>
     </div>
   );

@@ -1708,6 +1708,94 @@ def _insert_event(
 
 # ----------------------------------------------------------------- reconciliation
 
+# Every table keyed by (instance_key, effective_key). BOTH have to be walked by
+# BOTH identity-repair paths, and the case that makes it load-bearing is the
+# verdict: 'not a cow' retires the instance for everyone and writes NO
+# `annotations` row at all, so a repair that enumerates only `annotations` never
+# sees that key — no alias, no reconciliation row, no move. After a re-ingest the
+# removal is stranded on a dead key, the queue's anti-join misses, and a
+# detection a human declared not to be an animal walks back into everybody's
+# queue while the answers around it re-attach correctly.
+KEYED_TABLES: tuple[tuple[str, str], ...] = (
+    ("annotations", "annotation_id"),
+    ("mask_edits", "edit_id"),
+)
+
+
+def _keyed_instances(lcon: duckdb.DuckDBPyConnection, where: str = "",
+                     params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+    """One row per `instance_key` carrying ANY human work, merged over the keyed
+    tables.
+
+    Merged in Python rather than by a UNION because `annotation_id` and `edit_id`
+    come from two independent sequences: a single `arg_max(..., id)` over the
+    union would rank one table's row counter against the other's and pick
+    provenance essentially at random. Per-table `arg_max` first, then
+    `annotations` wins every field it has and `mask_edits` fills in only what is
+    missing — which is what makes an outline-only or verdict-only instance
+    reconcilable at all."""
+    prov = ("dataset_id", "camera_id", "frame_basename", "frame_path", "ordinal",
+            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "frame_sig")
+    merged: dict[str, dict[str, Any]] = {}
+    for table, id_col in KEYED_TABLES:
+        rows = _rows(lcon.execute(
+            "SELECT instance_key, "
+            f"       arg_max(effective_key, {id_col}) AS effective_key, "
+            + "".join(f"arg_max({c}, {id_col}) AS {c}, " for c in prov[:-1])
+            + f"arg_max(frame_sig, {id_col}) FILTER (WHERE frame_sig IS NOT NULL) "
+              "AS frame_sig, "
+            f"       count(*) AS n_rows FROM {table}{where} GROUP BY instance_key",
+            list(params),
+        ))
+        for r in rows:
+            cur = merged.setdefault(str(r["instance_key"]), {
+                "instance_key": r["instance_key"],
+                **{f"n_{t}": 0 for t, _ in KEYED_TABLES},
+            })
+            cur[f"n_{table}"] = int(r["n_rows"])
+            # `effective_key` is deliberately NOT coalesced across tables: on a
+            # store damaged by the annotations-only repair the two disagree, and
+            # taking either as the truth would freeze that disagreement in. The
+            # resolver below re-derives it from what is LIVE and `_reattach`
+            # converges both tables onto that.
+            for c in ("effective_key", *prov):
+                if cur.get(c) is None:
+                    cur[c] = r[c]
+    return list(merged.values())
+
+
+def _reattach(lcon: duckdb.DuckDBPyConnection, *, old_key: str, new_key: str,
+              dry_run: bool) -> dict[str, int]:
+    """Point every keyed table's `effective_key` at `new_key`; return rows MOVED
+    per table.
+
+    Cannot raise a constraint error: `effective_key` is in no UNIQUE and no
+    primary key on either table — both are `UNIQUE (instance_key, annotator,
+    version)` — so an annotator holding rows in both tables AND under both keys
+    still has disjoint tuples. `instance_key` is never touched; it is the record
+    of what the annotator actually hashed.
+
+    `superseded_at` is deliberately absent from the WHERE. Superseded rows are
+    the lineage and must travel with the current one, or an export shows one
+    annotator's history split across two identities.
+
+    Counted with a SELECT rather than from the UPDATE, so a dry run reports
+    exactly what the real run will do."""
+    moved: dict[str, int] = {}
+    for table, _id in KEYED_TABLES:
+        n = int(lcon.execute(
+            f"SELECT count(*) FROM {table} WHERE instance_key = ? "
+            "AND effective_key IS DISTINCT FROM ?", [old_key, new_key],
+        ).fetchone()[0])
+        if n and not dry_run:
+            lcon.execute(
+                f"UPDATE {table} SET effective_key = ? WHERE instance_key = ? "
+                "AND effective_key IS DISTINCT FROM ?", [new_key, old_key, new_key],
+            )
+        moved[table] = n
+    return moved
+
+
 def reconcile_dataset(
     lcon: duckdb.DuckDBPyConnection,
     mcon: duckdb.DuckDBPyConnection,
@@ -1750,26 +1838,22 @@ def reconcile_dataset(
     run_id = run_id or uuid.uuid4().hex
     scope = "" if dataset_id is None else " WHERE dataset_id IS NOT DISTINCT FROM ?"
     params: list[Any] = [] if dataset_id is None else [dataset_id]
-    labels = _rows(lcon.execute(
-        "SELECT instance_key, "
-        "       arg_max(effective_key, annotation_id)  AS effective_key, "
-        "       arg_max(dataset_id, annotation_id)     AS dataset_id, "
-        "       arg_max(camera_id, annotation_id)      AS camera_id, "
-        "       arg_max(frame_basename, annotation_id) AS frame_basename, "
-        "       arg_max(bbox_x1, annotation_id) AS bbox_x1, "
-        "       arg_max(bbox_y1, annotation_id) AS bbox_y1, "
-        "       arg_max(bbox_x2, annotation_id) AS bbox_x2, "
-        "       arg_max(bbox_y2, annotation_id) AS bbox_y2, "
-        "       arg_max(frame_sig, annotation_id) FILTER (WHERE frame_sig IS NOT NULL) AS frame_sig, "
-        "       count(*) AS n_annotations "
-        f"FROM annotations{scope} GROUP BY instance_key",
-        params,
-    ))
+    labels = _keyed_instances(lcon, scope, params)
     report: dict[str, Any] = {
         "run_id": run_id, "dataset_id": dataset_id, "dry_run": bool(dry_run),
         "instances": len(labels),
         "annotations": sum(int(r["n_annotations"]) for r in labels),
+        "mask_edits": sum(int(r["n_mask_edits"]) for r in labels),
+        # The population an annotations-only reconciler was structurally blind
+        # to: an instance whose ONLY human work is a corrected outline or a 'not
+        # a cow' verdict. On the first run after this fix a non-zero value here
+        # is the count of previously-stranded removals.
+        "outline_only_instances": sum(1 for r in labels if not int(r["n_annotations"])),
         "states": {s: 0 for s in RECONCILE_STATES},
+        # Decisions are counted in `states`; this counts EFFECTS, which is what
+        # separates "this instance aliased" from "this instance aliased and its
+        # removal came with it".
+        "rekeyed": {t: 0 for t, _ in KEYED_TABLES},
     }
     if not labels:
         return report
@@ -1793,8 +1877,20 @@ def reconcile_dataset(
         hit = live["by_key"].get(eff) or live["by_key"].get(key)
         if hit is not None:
             state = _verify_sig(row["frame_sig"], hit["frame_path"])
+            # CONVERGE, don't just report. A store repaired by the
+            # annotations-only version of this function has its answers on the
+            # new key and its outline edits still on the old one; that instance
+            # now matches exactly (via `eff`) and would `continue` here forever,
+            # leaving the removal detached with no state that says so.
+            # `_reattach` writes only rows that actually disagree, so on a
+            # healthy store this is a no-op. Never on 'hijacked': that is a
+            # wrong-cow match made with full confidence, and moving anything onto
+            # it is the damage the guard exists to prevent.
+            moved = ({t: 0 for t, _ in KEYED_TABLES} if state == "hijacked" else
+                     _reattach(lcon, old_key=key, new_key=str(hit["instance_key"]),
+                               dry_run=dry_run))
             outcomes.append({"instance_key": key, "state": state,
-                             "new_key": hit["instance_key"], "iou": None,
+                             "new_key": hit["instance_key"], "iou": None, "moved": moved,
                              "detail": None if state == "attached" else hit["frame_path"]})
             continue
         frame = (str(row["camera_id"]), str(row["frame_basename"]))
@@ -1829,19 +1925,22 @@ def reconcile_dataset(
             })
             continue
         outcomes.append({"instance_key": old_key, "state": "aliased", "new_key": new_key,
-                         "iou": cand["iou"], "detail": None})
+                         "iou": cand["iou"], "detail": None,
+                         "moved": {t: 0 for t, _ in KEYED_TABLES}})
         if not dry_run:
             _write_alias(lcon, old_key=old_key, new_key=new_key, reason="reingest_iou",
                          iou=cand["iou"], dataset_id=cand["dataset_id"],
                          camera_id=cand["camera_id"], frame_basename=cand["frame_basename"],
                          actor=actor)
-            lcon.execute(
-                "UPDATE annotations SET effective_key = ? WHERE instance_key = ?",
-                [new_key, old_key],
-            )
+        # Outside the dry-run guard: _reattach takes it itself, so a dry run still
+        # reports how many rows of each table the real run would move.
+        outcomes[-1]["moved"] = _reattach(lcon, old_key=old_key, new_key=new_key,
+                                          dry_run=dry_run)
 
     for o in outcomes:
         report["states"][o["state"]] = report["states"].get(o["state"], 0) + 1
+        for t, n in (o.get("moved") or {}).items():
+            report["rekeyed"][t] = report["rekeyed"].get(t, 0) + int(n)
         if not dry_run:
             lcon.execute(
                 "INSERT OR REPLACE INTO reconciliations (run_id, \"at\", dataset_id, "
@@ -1859,7 +1958,8 @@ def rekey_after_migrate(
     actor: str = "system",
 ) -> int:
     """Re-attach the NULL-dataset partition after `cownting migrate`. Returns the
-    number of annotations moved.
+    number of INSTANCES moved — answers and outline edits alike, since both hang
+    off the same key.
 
     `migrate` stamps a derived `dataset_id` onto every frame and detection that had
     NULL, and `dataset_id` is the first component of the key — so every label on that
@@ -1874,19 +1974,7 @@ def rekey_after_migrate(
     key was hashed from; rewriting it would make `instance_key` un-reproducible from
     the row that carries it, which is the one invariant the reconciler's step 1
     depends on."""
-    rows = _rows(lcon.execute(
-        "SELECT instance_key, "
-        "       arg_max(effective_key, annotation_id)  AS effective_key, "
-        "       arg_max(camera_id, annotation_id)      AS camera_id, "
-        "       arg_max(frame_basename, annotation_id) AS frame_basename, "
-        "       arg_max(frame_path, annotation_id)     AS frame_path, "
-        "       arg_max(bbox_x1, annotation_id) AS bbox_x1, "
-        "       arg_max(bbox_y1, annotation_id) AS bbox_y1, "
-        "       arg_max(bbox_x2, annotation_id) AS bbox_x2, "
-        "       arg_max(bbox_y2, annotation_id) AS bbox_y2, "
-        "       arg_max(ordinal, annotation_id) AS ordinal "
-        "FROM annotations WHERE dataset_id IS NULL GROUP BY instance_key"
-    ))
+    rows = _keyed_instances(lcon, " WHERE dataset_id IS NULL")
     moved = 0
     for r in rows:
         base = str(r["frame_basename"] or r["frame_path"] or "")
@@ -1899,18 +1987,24 @@ def rekey_after_migrate(
         except (TypeError, ValueError):
             continue  # provenance too thin to re-key; the reconciler reports it
         old_key = str(r["instance_key"])
-        # `dataset_id` deliberately stays NULL on the row (see above), so a second
-        # run re-derives the same new_key — skip on the already-moved effective_key
-        # rather than re-issuing the UPDATE and over-reporting the move.
-        if new_key == old_key or new_key == str(r["effective_key"] or ""):
+        # The `effective_key` short-circuit that used to live here is GONE. It
+        # read a merged effective_key, which on a store half-repaired by the
+        # annotations-only version is ALREADY the new key while `mask_edits` is
+        # still on the old one — so the skip fired and the outline edits were
+        # stranded for good. Idempotency now comes from where it belongs:
+        # `_write_alias` returns False for an alias already owned, and `_reattach`
+        # rewrites only rows that actually disagree, so a second run moves
+        # nothing and reports nothing.
+        if new_key == old_key:
             continue
         if not _write_alias(lcon, old_key=old_key, new_key=new_key, reason="migrate",
                             iou=None, dataset_id=dataset_id, camera_id=r["camera_id"],
                             frame_basename=base, actor=actor):
             continue
-        lcon.execute("UPDATE annotations SET effective_key = ? WHERE instance_key = ?",
-                     [new_key, old_key])
-        moved += 1
+        # BOTH keyed tables, or a migrate strands every outline correction and
+        # every 'not a cow' verdict on the pre-migration key.
+        if any(_reattach(lcon, old_key=old_key, new_key=new_key, dry_run=False).values()):
+            moved += 1
     return moved
 
 
@@ -1931,7 +2025,12 @@ def annotation_count(
         clauses.append("camera_id = ?")
         params.append(camera_id)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    return int(con.execute(f"SELECT count(*) FROM annotations{where}", params).fetchone()[0])
+    # BOTH keyed tables. An instance whose only human work is a corrected outline
+    # or a 'not a cow' verdict has no `annotations` row at all, so an
+    # annotations-only count reports ZERO for precisely the rows a purge is about
+    # to strand — which is the one thing this function exists to prevent.
+    return sum(int(con.execute(f"SELECT count(*) FROM {t}{where}", list(params))
+                   .fetchone()[0]) for t, _ in KEYED_TABLES)
 
 
 def _live_index(

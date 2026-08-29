@@ -74,6 +74,7 @@ _ITEM_FIELDS = (
     # M4a: the outline in both spaces, plus the frame's ORIGINAL dimensions the
     # hold-Space peek needs to place full-frame coordinates on a DOWNSCALED image.
     "mask", "mask_frame", "mask_seed", "frame_w", "frame_h", "geom_done",
+    "crop_levels", "crop_level",
 )
 
 
@@ -848,6 +849,85 @@ def test_false_positive_retires_the_instance_for_everyone():
               item["instance_key"] not in {i["instance_key"] for i in allq["items"]})
 
 
+def test_zoom_ladder_and_frame_space_submit():
+    """The outline editor edits in FULL-FRAME px and zooms by swapping which crop
+    is on screen. Two things have to hold for that to be safe: every rung of the
+    ladder must describe a real crop of THIS animal, and a polygon submitted in
+    frame space must be stored verbatim — no conversion, so no basis to shear
+    against, whatever zoom it was drawn at."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        item = client.get("/api/label/queue").json()["items"][0]
+        levels = item["crop_levels"]
+        check("the item carries a zoom ladder", len(levels) >= 2, str(len(levels)))
+        check("the default level is on the ladder",
+              0 <= item["crop_level"] < len(levels), str(item["crop_level"]))
+        check("the default level is the configured crop_pad",
+              abs(levels[item["crop_level"]]["pad"] - config.annotation.crop_pad) < 1e-6,
+              str(levels[item["crop_level"]]["pad"]))
+        pads = [lv["pad"] for lv in levels]
+        check("the ladder is sorted tight -> wide", pads == sorted(pads), str(pads))
+
+        # Every rung must agree with the geometry the crop endpoint renders with,
+        # or the editor's viewBox describes a square the image is not a picture of.
+        for lv in levels:
+            src, out, _ring = labeling.crop_geometry(
+                item["bbox"], lv["pad"], config.annotation.crop_max_width)
+            check(f"level pad={lv['pad']} src box matches crop_geometry",
+                  [float(v) for v in src] == lv["src"] and out == lv["out"],
+                  f"{lv['src']} vs {list(src)}")
+            check(f"level pad={lv['pad']} url carries its own pad",
+                  f"pad={lv['pad']!r}".replace("pad=", "pad=") and "pad=" in lv["url"],
+                  lv["url"][:80])
+        widest = levels[-1]["src"]
+        tightest = levels[0]["src"]
+        check("zooming out really does show more of the frame",
+              (widest[2] - widest[0]) > (tightest[2] - tightest[0]),
+              f"{tightest} -> {widest}")
+
+        # A polygon drawn at the WIDEST zoom — i.e. one that would fall outside
+        # the default crop — must still store, because the annotator could see it.
+        wx0, wy0, wx1, wy1 = widest
+        poly = [[wx0 + 3.0, wy0 + 3.0], [wx1 - 3.0, wy0 + 4.0], [wx0 + 9.0, wy1 - 3.0]]
+        r = client.post("/api/label/mask-fix", json={
+            "instance_key": item["instance_key"], "anchor": _anchor(item),
+            "kind": "polygon", "space": "frame", "polygon": poly, "seeded_from": "model"})
+        check("a frame-space outline from the widest zoom -> 200",
+              r.status_code == 200, r.text[:160])
+
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            stored = json.loads(lc.execute(
+                "SELECT polygon FROM mask_edits WHERE instance_key = ? "
+                "AND superseded_at IS NULL", [item["instance_key"]]).fetchone()[0])
+        finally:
+            lc.close()
+        drift = max(abs(a - b) for p, q in zip(stored, poly) for a, b in zip(p, q))
+        check("...is stored VERBATIM — frame space needs no conversion",
+              drift < 1e-9, f"max drift {drift}")
+
+        # And it comes back on the item in the same space, ready to re-edit.
+        again = [i for i in client.get("/api/label/queue").json()["items"]
+                 if i["instance_key"] == item["instance_key"]][0]
+        back = max(abs(a - b) for p, q in zip(again["mask_frame"], poly)
+                   for a, b in zip(p, q))
+        check("...and rides back as mask_frame unchanged", back < 1e-9, f"{back}")
+
+        # Beyond the widest crop is refused: the annotator cannot have seen it.
+        far = [[wx1 + 500.0, wy1 + 500.0], [wx1 + 600.0, wy1 + 500.0],
+               [wx1 + 550.0, wy1 + 600.0]]
+        check("a point beyond the widest zoom is a 400",
+              client.post("/api/label/mask-fix", json={
+                  "instance_key": item["instance_key"], "anchor": _anchor(item),
+                  "kind": "polygon", "space": "frame", "polygon": far,
+                  "seeded_from": "model"}).status_code == 400)
+        check("an unknown space is a 400",
+              client.post("/api/label/mask-fix", json={
+                  "instance_key": item["instance_key"], "anchor": _anchor(item),
+                  "kind": "polygon", "space": "galactic", "polygon": poly,
+                  "seeded_from": "model"}).status_code == 400)
+
+
 def test_ok_verdict_is_a_measurement_not_a_noop():
     """The mandatory geometry step's fast path. Confirming an outline stores an
     'ok' verdict — that is what turns "the annotator looked" into a
@@ -1077,6 +1157,7 @@ def main():
     test_undo_is_scoped_to_me()
     test_mask_fix_roundtrip_and_validation()
     test_false_positive_retires_the_instance_for_everyone()
+    test_zoom_ladder_and_frame_space_submit()
     test_ok_verdict_is_a_measurement_not_a_noop()
     test_ok_never_destroys_my_own_correction()
     test_crop_frame_coordinate_roundtrip()

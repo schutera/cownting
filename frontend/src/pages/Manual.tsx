@@ -313,9 +313,11 @@ export default function Manual() {
           </li>
         </Steps>
         <Callout>
-          Until Cownting starts storing outlines with each detection, step 1 shows
-          the <B>detection box</B> as four corners you can drag — so it reads “is the
-          box on the right animal?” rather than “is the outline right?”.
+          <B>Scroll to zoom</B> while editing — in for a close look at an edge, out
+          for room around the animal when the outline needs to reach further than
+          the crop shows. On footage processed before outlines were stored, step 1
+          shows the <B>detection box</B> as four draggable corners instead; that
+          clears day by day as the outlines are filled in.
         </Callout>
       </Section>
 
