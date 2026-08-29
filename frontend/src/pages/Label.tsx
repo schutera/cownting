@@ -407,6 +407,19 @@ export default function Label() {
     if (m === undefined || m === null || m.length < 3) return null;
     return m.map(([x, y]): Point => [x, y]);
   }, [current]);
+  /* The SAME outline, CROP-LOCAL, for the read-only overlay on the crop.
+     InstanceCrop draws into a `0 0 crop_w crop_h` viewBox, so it cannot be fed
+     `servedMask`: that is full-frame px now, and a point at (1168, 534) inside a
+     59x59 viewBox is simply off the canvas — the overlay vanishes rather than
+     misdraws, which is why it looked like "no overlay" instead of "wrong
+     overlay". The server sends both projections precisely so neither side has to
+     convert. */
+  const servedMaskCrop = useMemo<Point[] | null>(() => {
+    const m = current?.mask;
+    if (m === undefined || m === null || m.length < 3) return null;
+    return m.map(([x, y]): Point => [x, y]);
+  }, [current]);
+
   const seed = useMemo<Point[] | null>(() => {
     if (current === null) return null;
     // The fallback rectangle is the BBOX, in the same full-frame space — not the
@@ -1452,7 +1465,7 @@ export default function Label() {
                 // is a judgement about the shape the model drew). It is NOT
                 // drawn while answering: the question is about the animal, and a
                 // polygon competing with the ring on every item is clutter.
-                maskPreview={flag.open || inGeometry ? servedMask : null}
+                maskPreview={flag.open || inGeometry ? servedMaskCrop : null}
                 hideRing={clean || inspect}
                 onError={(k) => {
                   // A late error from an item already advanced past must not blank

@@ -1131,6 +1131,23 @@ def test_saved_outline_comes_back_on_the_queue_item():
         check("mask and mask_frame are the same polygon in two spaces",
               agree < 0.75, f"max disagreement {agree}")
 
+        # REGRESSION: each projection must be IN the space its consumer draws in.
+        # `mask` is drawn by InstanceCrop into a `0 0 crop_w crop_h` viewBox — feed
+        # it full-frame coordinates and the overlay does not misdraw, it lands off
+        # the canvas entirely and simply disappears, which reads as "the feature
+        # is gone" rather than as a bug.
+        check("mask is CROP-LOCAL — inside the served crop box",
+              all(-1 <= v <= it["crop_w"] + 1 for p in it["mask"] for v in p),
+              str(it["mask"][:2]))
+        src, _out, _ring = labeling.crop_geometry(
+            it["bbox"], config.annotation.crop_pad, config.annotation.crop_max_width)
+        check("mask_frame is FULL-FRAME — inside the crop's source square",
+              all(src[0] - 1 <= p[0] <= src[2] + 1 and src[1] - 1 <= p[1] <= src[3] + 1
+                  for p in it["mask_frame"]), str(it["mask_frame"][:2]))
+        check("...and the two are genuinely different numbers, not one space twice",
+              it["mask"] != it["mask_frame"],
+              "both projections are identical — one of them is in the wrong space")
+
         # Another annotator's outline must never leak into my item: the same
         # independence rule that keeps n_annotators from carrying WHAT was said.
         lc = duckdb.connect(config.paths.labels_db_path)
