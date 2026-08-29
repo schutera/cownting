@@ -20,6 +20,18 @@ const RING_STROKE = 1.75;
 const MASK_STROKE = "#F0B460";
 const MASK_FILL = "rgba(240,180,96,0.16)";
 
+/** The ring to draw, crop-local: the annotator's corrected outline's extent once
+    they have made one, otherwise the detector's box as served. Exported so the
+    full-frame peek can ask the same question of the same data and the two views
+    cannot disagree about where the animal is. */
+export function ringFor(item: LabelItem): [number, number, number, number] {
+  const m = item.mask;
+  if (item.mask_seed !== "edit" || !m || m.length < 3) return item.ring;
+  const xs = m.map((p) => p[0]);
+  const ys = m.map((p) => p[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
 function maskPath(poly: readonly [number, number][]): string {
   return `M${poly.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join("L")}Z`;
 }
@@ -85,7 +97,19 @@ export function InstanceCrop({
 
   const w = Math.max(item.crop_w, 1);
   const h = Math.max(item.crop_h, 1);
-  const [rx0, ry0, rx1, ry1] = item.ring;
+  // THE RING FOLLOWS A CORRECTION. Once the annotator has re-traced the outline,
+  // the detector's box is no longer the best statement of where the animal is —
+  // theirs is — so the ring and its scrim are drawn to the extent of what they
+  // drew, and the questions that follow are asked about the shape they just
+  // fixed rather than the one they rejected.
+  //
+  // DISPLAY ONLY. `detections.bbox_*` is hashed into `instance_key`, so the
+  // stored box cannot move without detaching every label on this instance; the
+  // correction lives in `mask_edits` and this is the crop-local extent of it.
+  // Only an EDIT re-draws the ring: with the model's own outline the two agree
+  // to within a pixel anyway (YOLO crops its mask to its box), and redrawing
+  // from it would quietly change what the ring MEANS on every item.
+  const [rx0, ry0, rx1, ry1] = ringFor(item);
   const rx = clamp(rx0, 0, w);
   const ry = clamp(ry0, 0, h);
   const rw = Math.max(clamp(rx1, 0, w) - rx, 1);

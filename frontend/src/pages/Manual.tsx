@@ -308,8 +308,9 @@ export default function Manual() {
           </li>
           <li>
             <B>Save outline</B> (<Kbd>Enter</Kbd>) stores your correction and hands
-            you the questions for the same animal. <Kbd>Esc</Kbd> goes back without
-            saving.
+            you the questions for the same animal — with the <B>box redrawn to fit
+            the shape you just traced</B>, so you answer about the animal as you
+            corrected it. <Kbd>Esc</Kbd> goes back without saving.
           </li>
         </Steps>
         <Callout>

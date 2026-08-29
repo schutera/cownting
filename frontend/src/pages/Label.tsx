@@ -1925,7 +1925,19 @@ function FramePeek({ item, hideMarks }: { item: LabelItem; hideMarks: boolean })
   // No dimensions (an older server, or the JPEG has gone) -> the photo alone.
   // Guessing would be worse than not drawing.
   const canMark = fw > 0 && fh > 0;
-  const [x1, y1, x2, y2] = item.bbox;
+  // Same rule as the crop's ring (InstanceCrop.ringFor): once the annotator has
+  // corrected the outline, the box drawn is the extent of THEIR shape, not the
+  // detector's. Display only — the stored bbox is key material and never moves.
+  const poly0 = item.mask_seed === "edit" ? item.mask_frame : null;
+  const [x1, y1, x2, y2] =
+    poly0 && poly0.length >= 3
+      ? [
+          Math.min(...poly0.map((p) => p[0])),
+          Math.min(...poly0.map((p) => p[1])),
+          Math.max(...poly0.map((p) => p[0])),
+          Math.max(...poly0.map((p) => p[1])),
+        ]
+      : item.bbox;
   const bw = Math.max(x2 - x1, 1);
   const bh = Math.max(y2 - y1, 1);
   const poly = item.mask_frame ?? null;
