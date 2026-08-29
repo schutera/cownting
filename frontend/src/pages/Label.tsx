@@ -18,6 +18,7 @@ import { getLabelProgress, getLabelQueue, getTaxonomy, postLabelEvent } from "..
 import {
   isTypingTarget,
   LABEL_ACTIONS,
+  OPTION_KEYS,
   resolveLabelKey,
   visibleClasses,
   visibleGroups,
@@ -127,9 +128,6 @@ const RECENT_CAP = 100;
 // was never really about the strip: it is the retention depth that decides how
 // far back the undo reaches, and it outlived the thumbnails.
 const MAX_RECENT = 10;
-// Mirrors AnnotationCfg.max_note_chars (config §3.6): the server truncates
-// anyway; matching it here just keeps the annotator from typing past the cap.
-const MAX_NOTE_CHARS = 500;
 // A pool query per answered item would be one GET every ~3s of an eight-hour
 // shift. The panel's numbers are feedback, not state, so they can lag.
 const STATS_MIN_INTERVAL_MS = 5_000;
@@ -199,10 +197,12 @@ interface Tape {
   frontier: number;
 }
 
+/* The flag row is now a single step, so the draft is just "is it open". The
+   `reason` and `explanation` fields are gone with the two-step flow: picking a
+   reason commits immediately, so there is no intermediate state to hold and
+   nothing that can be half-filled when the annotator navigates away. */
 interface FlagDraft {
   open: boolean;
-  reason: LabelSkipReason | null;
-  explanation: string;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -267,7 +267,7 @@ export default function Label() {
   const [flaggedByKey, setFlaggedByKey] = useState<Record<string, LabelSkipReason>>({});
 
   const [step, setStep] = useState(0);
-  const [flag, setFlag] = useState<FlagDraft>({ open: false, reason: null, explanation: "" });
+  const [flag, setFlag] = useState<FlagDraft>({ open: false });
   const [openDefinitionKey, setOpenDefinitionKey] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [shakeNonce, setShakeNonce] = useState(0);
@@ -733,7 +733,7 @@ export default function Label() {
       const clamped = clamp(index, 0, t.items.length - 1);
       setTape({ ...t, cursor: clamped });
       setStep(0);
-      setFlag({ open: false, reason: null, explanation: "" });
+      setFlag({ open: false });
       setSavedChip(false);
       setHint(null);
     },
@@ -771,7 +771,7 @@ export default function Label() {
       setTape({ items: t.items, cursor, frontier });
     }
     setStep(0);
-    setFlag({ open: false, reason: null, explanation: "" });
+    setFlag({ open: false });
   }, [setTape]);
 
   const commitAnswers = useCallback(
@@ -904,20 +904,19 @@ export default function Label() {
     ],
   );
 
-  const submitFlag = useCallback(() => {
+  // The reason IS the flag. The written explanation it used to demand is gone:
+  // the six codes carry the signal the prose stood in for, and once instance
+  // masks land a defective crop is inspectable rather than describable. So this
+  // takes the reason directly instead of reading it back off the draft — the
+  // pick and the submit are now one gesture, and routing a two-keystroke flag
+  // through a state round trip is how you drop the second keystroke.
+  const submitFlag = useCallback((picked: LabelSkipReason) => {
     if (current === null || currentKey === null) return;
-    const reason = flag.reason;
-    const explanation = flag.explanation.trim();
-    // Decision 6: a reason AND a written explanation. The button is disabled
-    // without both and the server 400s a blank one, so neither side is
-    // load-bearing alone — an escape hatch nobody has to justify gets pulled
-    // whenever the work gets hard.
-    if (reason === null || explanation === "") return;
+    const reason = picked;
     const req: LabelFlagReq = {
       instance_key: current.instance_key,
       anchor: anchorOf(current),
       reason,
-      explanation: explanation.slice(0, MAX_NOTE_CHARS),
       serve_event_id: current.serve_event_id,
       session_id: sessionId,
       client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
@@ -933,7 +932,7 @@ export default function Label() {
     } else {
       advance();
     }
-  }, [activeNow, advance, current, currentKey, flag, goTo, markWritten, queue, reviewing, sessionId]);
+  }, [activeNow, advance, current, currentKey, goTo, markWritten, queue, reviewing, sessionId]);
 
   // ------------------------------------------------------ outline mode (M4a)
 
@@ -945,7 +944,7 @@ export default function Label() {
       return;
     }
     setDraft(seed);
-    setFlag({ open: false, reason: null, explanation: "" });
+    setFlag({ open: false });
     setOpenDefinitionKey(null);
     setHint(null);
   }, [cropFailed, current, seed, shake, showHint]);
@@ -1078,12 +1077,12 @@ export default function Label() {
 
   const openFlag = useCallback(() => {
     if (current === null) return;
-    setFlag({ open: true, reason: null, explanation: "" });
+    setFlag({ open: true });
     setHint(null);
   }, [current]);
 
   const closeFlag = useCallback(() => {
-    setFlag({ open: false, reason: null, explanation: "" });
+    setFlag({ open: false });
   }, []);
 
   const onOpenDefinition = useCallback(
@@ -1276,21 +1275,23 @@ export default function Label() {
     }
 
     // How many digits are live right now. In the flag row it is the five
-    // reasons; on the explanation step it is none (and the textarea has focus
-    // anyway); otherwise it is the ACTIVE question's options, and only that
-    // question's — nothing else listens, which is the whole point of the
-    // sequential flow.
-    const optionCount = flag.open
-      ? flag.reason === null
-        ? FLAG_REASONS.length
-        : 0
-      : activeOptions.length;
+    // reasons (the flag row is one step now, so there is no state in which it
+    // is open and listening to nothing); otherwise it is the ACTIVE question's
+    // options, and only that question's — nothing else listens, which is the
+    // whole point of the sequential flow.
+    const optionCount = flag.open ? FLAG_REASONS.length : activeOptions.length;
     const hitKey = resolveLabelKey(e, optionCount);
 
     if (hitKey === null) {
-      if (/^[1-9]$/.test(e.key)) {
+      if (/^[a-z]$/i.test(e.key)) {
         shake();
-        showHint(`that key isn't bound here — ${optionCount > 0 ? `use 1–${optionCount}` : "nothing is listening"}`);
+        showHint(
+          `that key isn't bound here — ${
+            optionCount > 0
+              ? `use ${OPTION_KEYS.slice(0, optionCount).map((k) => k.letter).join(" ")}`
+              : "nothing is listening"
+          }`,
+        );
       }
       return;
     }
@@ -1323,7 +1324,9 @@ export default function Label() {
 
     if (e.repeat) return;
     if (flag.open) {
-      setFlag((f) => ({ ...f, reason: FLAG_REASONS[hitKey.index].reason }));
+      // Two keystrokes total: F, then the reason. There is no third step any
+      // more, so the pick commits rather than arming a Submit button.
+      submitFlag(FLAG_REASONS[hitKey.index].reason);
       return;
     }
     const cls = activeOptions[hitKey.index];
@@ -1529,7 +1532,7 @@ export default function Label() {
                   ? "release Space"
                   : clean
                     ? "release H"
-                    : "hold Space full frame · H clean"}
+                    : "hold Space full frame · H clean · F flag"}
               </div>
             ) : null}
           </div>
@@ -1603,28 +1606,24 @@ export default function Label() {
             />
           ) : flag.open ? (
             <FlagRow
-              draft={flag}
-              onPick={(reason) => setFlag((f) => ({ ...f, reason }))}
-              onExplain={(text) => setFlag((f) => ({ ...f, explanation: text }))}
-              onSubmit={submitFlag}
+              onPick={submitFlag}
               onCancel={closeFlag}
               // The two repair actions (M4a §5.4). They lead the row because a
               // detection that is merely mis-outlined is repairable, and a flag
               // is the outcome for what cannot be repaired — offering the
-              // structured verdicts first is what keeps prose flags for the
-              // cases that genuinely need prose.
+              // structured verdicts first is what keeps flags for the cases that
+              // genuinely cannot be judged.
               onFixOutline={openOutline}
               onRemoveInstance={() => commitMask("false_positive")}
               canRepair={outlineAvailable}
-              // Whether there is actually an amber shape on the crop to point
-              // at. Until masks are persisted (M4 phase 0) there is not, and a
-              // legend for a thing that is not drawn is worse than no legend —
+              // Whether there is actually an amber shape on the crop to point at.
+              // A legend for something that is not drawn is worse than no legend:
               // the annotator hunts the image for it.
-              hasMask={servedMask !== null}
+              hasMask={servedMaskCrop !== null}
             />
           ) : inGeometry ? (
             <GeometryPanel
-              hasMask={servedMask !== null}
+              hasMask={servedMaskCrop !== null}
               saving={maskSaving}
               stepCount={steps.length + 1}
               onConfirm={confirmGeometry}
@@ -1782,14 +1781,18 @@ export default function Label() {
           <LabelProgress
             groups={groups}
             stream={{
-              doneToday: tape.frontier,
-              // What today can still yield: what this session has answered plus
-              // what the queue says is still servable to ME. A corpus-coverage
-              // bar was removed on purpose (§7) — it is a number the annotator
+              // The SERVER's count, not the tape's. `tape.frontier` is how many
+              // items this MOUNT has answered, so it is 0 after every reload —
+              // which showed an annotator who had genuinely labeled work a flat
+              // 0, next to a store that still held it. The tape is the right
+              // thing for navigation and the wrong thing for a scoreboard.
+              done: stats?.my_labeled ?? 0,
+              // ...plus what the queue can still serve ME. A corpus-coverage bar
+              // was removed on purpose (§7) — it is a number the annotator
               // cannot move.
-              targetToday: tape.frontier + (stats?.remaining ?? 0),
+              target: (stats?.my_labeled ?? 0) + (stats?.remaining ?? 0),
               recentMs,
-              flags: flagCount,
+              flags: stats?.my_skipped ?? flagCount,
               // Always zero: decision 6 makes the written explanation mandatory
               // at flag time, so there is no deferred-notes queue to owe.
               pendingNotes: 0,
@@ -2254,11 +2257,12 @@ function Shimmer() {
     have been advertised under the wrong name. */
 function KeyLegend() {
   // "close" has never been listed: Escape is discoverable from the thing it
-  // closes. "inspect" and "clean" are not listed EITHER, because the crop
-  // already carries them — the chip sits on the photograph, which is where the
-  // eye is when either hold is worth reaching for, and printing them again two
-  // rows down was the same sentence twice on one card.
-  const HELD_ON_CROP = new Set(["inspect", "clean"]);
+  // closes. "inspect", "clean" and "flag" are not listed EITHER, because the
+  // crop already carries them — the chip sits on the photograph, which is where
+  // the eye is when any of the three is worth reaching for, and printing them
+  // again two rows down was the same sentence twice on one card. What is left
+  // here is exactly the tape: back and next.
+  const HELD_ON_CROP = new Set(["inspect", "clean", "flag"]);
   const shown = LABEL_ACTIONS.filter(
     (a) => a.action !== "close" && !HELD_ON_CROP.has(a.action),
   );
@@ -2387,41 +2391,34 @@ function FlaggedOverlay({ size }: { size: number }) {
   );
 }
 
-/* FLAG, §3.9. The five reasons replace the TILE ROW IN PLACE — same rectangle,
-   same badges, same rhythm — rather than opening a modal over the crop: a
+/* FLAG, §3.9. The reasons replace the TILE ROW IN PLACE — same rectangle, same
+   badges, same rhythm — rather than opening a modal over the crop: a
    558-participant AMT study found sequences of distinct task types measurably
    hurt classification engagement, and a dialog over the animal is exactly such a
    switch. The reason is asked at the pixels, where `multiple_cows` versus
    `occluded` is still visible.
 
-   The written explanation is required here rather than deferred to an
-   end-of-session queue, because decision 6 makes it mandatory and the flag route
-   400s a blank one — so a two-keystroke flag would have nothing to post. Enter
-   submits, Esc cancels, and the whole thing stays inside PANEL_H so nothing
-   below it moves. */
+   ONE STEP. The mandatory written explanation is gone, so picking a reason IS
+   flagging: F then a letter, two keystrokes, no Submit button and no textarea.
+   What that costs is a crop broken in a way the six codes do not cover — it now
+   arrives as `other` with nothing attached. What bought it is that the codes are
+   countable where prose was not, and that an inspectable mask will answer
+   "what was wrong with it" better than a sentence typed at 3s/item ever did. */
 function FlagRow({
-  draft,
   onPick,
-  onExplain,
-  onSubmit,
   onCancel,
   onFixOutline,
   onRemoveInstance,
   canRepair,
   hasMask,
 }: {
-  draft: FlagDraft;
   onPick: (reason: LabelSkipReason) => void;
-  onExplain: (text: string) => void;
-  onSubmit: () => void;
   onCancel: () => void;
   onFixOutline: () => void;
   onRemoveInstance: () => void;
   canRepair: boolean;
   hasMask: boolean;
 }) {
-  const chosen = FLAG_REASONS.find((r) => r.reason === draft.reason) ?? null;
-  const ready = chosen !== null && draft.explanation.trim() !== "";
   return (
     <div
       className="box-border w-full"
@@ -2446,101 +2443,81 @@ function FlagRow({
           leaving. */}
       <div className="flex items-center gap-2" style={{ height: 24 }}>
         <span className="text-[13px] font-semibold uppercase tracking-[0.08em] leading-none">
-          ⚑ Flag — {chosen === null ? "why?" : chosen.label}
+          ⚑ Flag — why?
         </span>
-        {chosen === null && canRepair ? (
+        {canRepair ? (
           <span className="flex items-center gap-1.5 ml-2">
             <RepairChip onClick={onFixOutline}>✎ Fix outline</RepairChip>
             <RepairChip onClick={onRemoveInstance}>✕ Not a cow</RepairChip>
           </span>
         ) : null}
-        <span className="ml-auto text-[11px] shrink-0" style={{ color: INK_DIM }}>
-          {chosen === null
-            ? canRepair && hasMask
-              ? "amber = what the model found · 1–6"
-              : "1–6 · Esc cancels"
-            : "Enter flags · Esc cancels"}
+        <span className="ml-auto flex items-center gap-2 text-[11px] shrink-0"
+              style={{ color: INK_DIM }}>
+          {hasMask ? <span>amber = what the model found</span> : null}
+          {OPTION_KEYS.slice(0, FLAG_REASONS.length).map((k) => k.letter).join(" ")}
+          {/* A SIBLING of the reason tiles, never a child of one: a button inside
+              a button is invalid HTML, and here it would also mean that clicking
+              "cancel" flagged the instance. */}
+          <button
+            type="button"
+            onClick={onCancel}
+            className="underline underline-offset-2 cursor-pointer"
+            style={{ color: INK_DIM }}
+          >
+            Esc cancels
+          </button>
         </span>
       </div>
-
-      {chosen === null ? (
-        <div
-          className="grid"
-          style={{
-            marginTop: 8,
-            gridAutoFlow: "column",
-            gridAutoColumns: `${TILE_W}px`,
-            gap: TILE_GAP,
-            justifyContent: "start",
-            height: TILE_H,
-          }}
-        >
-          {FLAG_REASONS.map((r, i) => (
-            <button
-              key={r.reason}
-              type="button"
-              onClick={() => onPick(r.reason)}
-              className="flex flex-col items-center rounded-lg border box-border cursor-pointer
-                         focus-visible:outline-2 focus-visible:outline-offset-2"
-              style={{
-                width: TILE_W,
-                height: TILE_H,
-                padding: 7,
-                background: "var(--lbl-card, #1E2124)",
-                borderColor: HAIRLINE,
-                color: INK,
-                outlineColor: INK,
-              }}
-            >
-              <span className="flex w-full items-center" style={{ height: 20 }}>
-                <span
-                  className="grid place-items-center rounded-md font-mono text-[12px] font-bold leading-none"
-                  style={{ width: 20, height: 20, color: ALARM, background: HAIRLINE }}
-                >
-                  {i + 1}
-                </span>
-              </span>
-              <span className="grid w-full flex-1 place-items-center">
-                <ClassIcon name={r.icon} />
-              </span>
-              <span
-                className="w-full text-center text-[12px] leading-[14px] break-words"
-                style={{ height: 28 }}
-              >
-                {r.label}
-              </span>
-            </button>
-          ))}
-        </div>
-      ) : (
-        <div className="flex items-start gap-2" style={{ marginTop: 8, height: TILE_H }}>
-          <textarea
-            autoFocus
-            rows={3}
-            value={draft.explanation}
-            maxLength={MAX_NOTE_CHARS}
-            placeholder="What is wrong with this one? (required — whoever reviews the queue reads this)"
-            onChange={(e) => onExplain(e.target.value)}
-            onKeyDown={(e) => {
-              // Enter submits; the window handler never sees keys typed in here
-              // (isTypingTarget), and Escape is handled before that guard.
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                if (ready) onSubmit();
-              }
+      <div
+        className="grid"
+        style={{
+          marginTop: 8,
+          gridAutoFlow: "column",
+          gridAutoColumns: `${TILE_W}px`,
+          gap: TILE_GAP,
+          justifyContent: "start",
+          height: TILE_H,
+        }}
+      >
+        {FLAG_REASONS.map((r, i) => (
+          <button
+            key={r.reason}
+            type="button"
+            onClick={() => onPick(r.reason)}
+            className="flex flex-col items-center rounded-lg border box-border cursor-pointer
+                       focus-visible:outline-2 focus-visible:outline-offset-2"
+            style={{
+              width: TILE_W,
+              height: TILE_H,
+              padding: 7,
+              background: "var(--lbl-card, #1E2124)",
+              borderColor: HAIRLINE,
+              color: INK,
+              outlineColor: INK,
             }}
-            className="grow h-full rounded-lg border box-border px-2.5 py-2 text-[13px] resize-none
-                       focus:outline-none"
-            style={{ background: "var(--lbl-card, #1E2124)", borderColor: HAIRLINE, color: INK }}
-          />
-          <div className="flex flex-col gap-2 shrink-0">
-            <DarkButton onClick={onSubmit} disabled={!ready}>
-              Flag &amp; next
-            </DarkButton>
-            <DarkButton onClick={onCancel}>Cancel</DarkButton>
-          </div>
-        </div>
-      )}
+          >
+            <span className="flex w-full items-center" style={{ height: 20 }}>
+              <span
+                className="grid place-items-center rounded-md font-mono text-[12px] font-bold leading-none"
+                style={{ width: 20, height: 20, color: ALARM, background: HAIRLINE }}
+              >
+                {/* The SAME letter table the answers use — the row is modal, so
+                    reusing them costs nothing and keeps one set of keys to learn. */}
+                {OPTION_KEYS[i]?.letter ?? ""}
+              </span>
+            </span>
+            <span className="grid w-full flex-1 place-items-center">
+              <ClassIcon name={r.icon} />
+            </span>
+            <span
+              className="w-full text-center text-[12px] leading-[14px] break-words"
+              style={{ height: 28 }}
+            >
+              {r.label}
+            </span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

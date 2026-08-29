@@ -60,9 +60,11 @@ const STORE_KEY = "cownting.label.pending";
 
 // The two write routes, needed literally for the unload beacon: fetch() is
 // cancelled when the document goes away, and sendBeacon is the only transport
-// that survives it. flagLabel() also sends `note` alongside `explanation` while
-// the backend rename is in flight, so the beacon has to mirror that or a flag
-// posted at unload would lose its prose.
+// that survives it. flagLabel() sends `note` alongside `explanation` while the
+// backend rename is in flight, so the beacon mirrors that. Both are now usually
+// absent — the explanation is optional and this page stops collecting one — and
+// that is fine on the wire: an undefined field is simply not serialised, and the
+// route treats a missing note as NULL.
 const SUBMIT_URL = "/api/label/submit";
 const FLAG_URL = "/api/label/skip";
 const MASK_URL = "/api/label/mask-fix";
@@ -165,32 +167,25 @@ function parseMode(v: unknown): LabelInputMode | null {
   return v === "key" || v === "mouse" ? v : null;
 }
 
-/* Every LabelSkipReason, and it has to STAY every one: a reason missing here
-   parses to null on replay, which drops that flag from the sessionStorage
-   mirror IN SILENCE — the exact failure this parsing block exists to prevent.
-   The list was typed `readonly LabelSkipReason[]`, which happily accepts a
-   SUBSET, so `low_resolution` joined the union and never reached this array.
-   The mutual-assignability check below closes that hole: the list must cover the
-   union AND the union must cover the list, so either half drifting is a compile
-   error rather than a flag that vanishes on reload. */
-const FLAG_REASON_VALUES = [
-  "bad_crop",
-  "no_cow",
-  "multiple_cows",
-  "occluded",
-  "low_resolution",
-  "other",
-] as const;
-type ListedReason = (typeof FLAG_REASON_VALUES)[number];
-const _REASONS_EXHAUSTIVE: LabelSkipReason extends ListedReason
-  ? ListedReason extends LabelSkipReason
-    ? true
-    : never
-  : never = true;
-void _REASONS_EXHAUSTIVE;
+// KEYED BY THE UNION, not listed as an array. `readonly LabelSkipReason[]` makes
+// an INCOMPLETE list type-legal, and that is exactly what happened:
+// `low_resolution` was added to the union, to the server vocabulary and to the
+// flag row in one commit, and silently missed here — so a "Resolution too low"
+// flag replayed out of sessionStorage was dropped on the floor. A Record over the
+// union turns the next omission into a compile error instead of a lost write.
+const FLAG_REASON_SET: Record<LabelSkipReason, true> = {
+  bad_crop: true,
+  no_cow: true,
+  multiple_cows: true,
+  occluded: true,
+  low_resolution: true,
+  other: true,
+};
 
 function parseReason(v: unknown): LabelSkipReason | null {
-  return FLAG_REASON_VALUES.find((r) => r === v) ?? null;
+  return typeof v === "string" && Object.prototype.hasOwnProperty.call(FLAG_REASON_SET, v)
+    ? (v as LabelSkipReason)
+    : null;
 }
 
 function optNum(v: unknown): number | null {
@@ -245,19 +240,25 @@ function parseWrite(v: unknown): LabelWrite | null {
   }
   if (v.kind === "flag") {
     const reason = parseReason(req.reason);
-    // A blank explanation is a 400 server-side and is the whole point of
-    // replacing skip with flag — a stored flag with no justification is
-    // indistinguishable from a genuinely unjudgeable crop.
-    if (reason === null || typeof req.explanation !== "string" || req.explanation.trim() === "") {
-      return null;
-    }
+    // The REASON is the flag. This used to also demand a non-empty explanation,
+    // matching a server-side 400 that no longer exists — so once the written
+    // justification became optional, EVERY flag this page enqueues failed to
+    // parse on replay and was discarded in silence: no counter, no error, and a
+    // sync dot reading zero pending. That is the precise failure the offline
+    // queue exists to prevent, so the rule is now "a reason, and nothing else
+    // required".
+    if (reason === null) return null;
+    const explanation =
+      typeof req.explanation === "string" && req.explanation.trim() !== ""
+        ? req.explanation
+        : undefined;
     return {
       kind: "flag",
       req: {
         instance_key: req.instance_key,
         anchor,
         reason,
-        explanation: req.explanation,
+        explanation,
         serve_event_id: optNum(req.serve_event_id),
         session_id,
         client_elapsed_ms: optNum(req.client_elapsed_ms),

@@ -299,21 +299,54 @@ def test_queue_policy():
         # Flagging removes it from MY queue but leaves it for others (mine=all
         # shows the pool another annotator would still be offered).
         #
-        # An UNEXPLAINED escape is refused: skipping as a bare action was removed
-        # deliberately, so this route now demands a written justification as well
-        # as a reason code. An instance nobody could answer is a finding about the
-        # data, and a finding with no explanation attached is not usable later.
+        # A REASON IS ENOUGH. The written justification was mandatory for one
+        # release and is now optional: the reason codes carry the signal it stood
+        # in for. What must still hold is that a blank note is stored as NULL
+        # rather than as "", so "no note" and "an empty note" stay distinguishable
+        # to anything reading the column later.
         skipped = after[0]
         bare = {"instance_key": skipped["instance_key"], "anchor": _anchor(skipped),
                 "reason": "occluded"}
         r = client.post("/api/label/skip", json=bare)
-        check("flag with no explanation -> 400", r.status_code == 400, str(r.status_code))
-        r = client.post("/api/label/skip", json={**bare, "note": "   "})
-        check("flag with a whitespace-only explanation -> 400",
-              r.status_code == 400, str(r.status_code))
+        check("flag with a reason and NO explanation -> 200", r.status_code == 200,
+              f"{r.status_code} {r.text[:120]}")
+        lc = db.connect(config.paths.labels_db_path)
+        try:
+            stored_note = lc.execute(
+                "SELECT flag_note FROM annotations WHERE instance_key = ? "
+                "AND outcome = 'skipped' AND superseded_at IS NULL",
+                [skipped["instance_key"]]).fetchone()
+        finally:
+            lc.close()
+        check("an absent explanation is stored as NULL, not as an empty string",
+              stored_note is not None and stored_note[0] is None, str(stored_note))
 
-        r = client.post("/api/label/skip", json={**bare, "note": "panel leg hides the whole body"})
-        check("flag with reason + explanation -> 200", r.status_code == 200, str(r.status_code))
+        # A reason is still mandatory, and still has to be one of the known codes.
+        noreason = {"instance_key": after[1]["instance_key"], "anchor": _anchor(after[1])}
+        r = client.post("/api/label/skip", json=noreason)
+        check("flag with NO reason is still refused", r.status_code in (400, 422),
+              str(r.status_code))
+        r = client.post("/api/label/skip",
+                        json={**noreason, "reason": "not_a_code", "note": "x"})
+        check("flag with an unknown reason is still refused", r.status_code == 400,
+              str(r.status_code))
+
+        r = client.post("/api/label/skip", json={"instance_key": after[1]["instance_key"],
+                                                 "anchor": _anchor(after[1]),
+                                                 "reason": "occluded",
+                                                 "note": "panel leg hides the whole body"})
+        check("an explanation is still ACCEPTED when given -> 200",
+              r.status_code == 200, str(r.status_code))
+        lc = db.connect(config.paths.labels_db_path)
+        try:
+            kept = lc.execute(
+                "SELECT flag_note FROM annotations WHERE instance_key = ? "
+                "AND outcome = 'skipped' AND superseded_at IS NULL",
+                [after[1]["instance_key"]]).fetchone()
+        finally:
+            lc.close()
+        check("...and is stored verbatim",
+              kept is not None and kept[0] == "panel leg hides the whole body", str(kept))
         after_skip = client.get("/api/label/queue").json()["items"]
         check("a flagged instance leaves my queue",
               all(it["instance_key"] != skipped["instance_key"] for it in after_skip))

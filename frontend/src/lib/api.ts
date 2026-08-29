@@ -651,10 +651,11 @@ export function submitLabel(req: LabelSubmitReq): Promise<LabelWriteResult> {
 }
 
 // Flag an instance that cannot be answered. This REPLACES the old bare skip:
-// there is no longer a call that declines an instance without saying why, because
-// an escape hatch nobody has to justify gets pulled whenever the work gets hard.
-// The server 400s a missing or whitespace-only explanation, so a caller that
-// forgets to validate gets a hard error rather than a mystery row.
+// there is no longer a bare skip: declining an instance always carries a REASON
+// code. The written explanation beside it is optional — it was mandatory for one
+// release, and the server no longer 400s a blank one; it stores it as NULL. So a
+// flag with a reason and no prose is a valid write, and callers must not add a
+// validation of their own that the server does not have.
 //
 // The URL and the stored outcome are unchanged ('skipped', meaning "not
 // answered"): only the annotator-facing concept was renamed and stored rows are
