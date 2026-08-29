@@ -1955,13 +1955,50 @@ def create_app(config: Config) -> FastAPI:
         # everything else is: the crop<->frame arithmetic lives in exactly one
         # place. Without this the editor and the hold-Space peek disagree about
         # the same instance for the rest of the session.
+        #
+        # It also hands back a crop RE-CENTRED on the corrected shape. The crop
+        # the annotator was served is cut around the DETECTOR'S box, so after a
+        # correction that shrinks or shifts the animal, the questions are asked
+        # over a tile with the cow off to one side and dead space around it. The
+        # crop is a server render, so re-framing it is the server's job — and
+        # doing it here rather than letting the client rebuild the URL keeps
+        # crop_geometry in one place, which is the same rule the zoom ladder
+        # follows.
+        #
+        # `bbox` is deliberately NOT part of this. It is hashed into
+        # `instance_key`, so the item keeps the box it was served and every
+        # later submit still echoes the anchor the queue signed. What changes is
+        # only what is DRAWN: the crop, its ring, and the polygon expressed in
+        # that new crop's pixels.
         mask_crop = None
+        recentred: dict = {}
         if polygon is not None:
+            xs = [p[0] for p in polygon]
+            ys = [p[1] for p in polygon]
+            fixed = [min(xs), min(ys), max(xs), max(ys)]
+            _src, out, ring = labeling.crop_geometry(
+                fixed, cfg.crop_pad, cfg.crop_max_width)
+            # Crop-local against the NEW crop, because that is the image the
+            # client is about to draw it over. Converting against the old one
+            # here is exactly how the outline would end up offset from the cow.
             mask_crop = [[round(v, 2) for v in p] for p in labeling.frame_to_crop(
-                polygon, a.bbox, pad=cfg.crop_pad, max_width=cfg.crop_max_width)]
+                polygon, fixed, pad=cfg.crop_pad, max_width=cfg.crop_max_width)]
+            levels, level = labeling.zoom_levels(
+                fixed, camera_id=a.camera_id, frame_file=a.frame_file,
+                dataset_id=a.dataset_id, pad=cfg.crop_pad,
+                max_width=cfg.crop_max_width)
+            recentred = {
+                "crop_url": labeling.crop_url(
+                    camera_id=a.camera_id, frame_file=a.frame_file, bbox=fixed,
+                    dataset_id=a.dataset_id, pad=cfg.crop_pad,
+                    max_width=cfg.crop_max_width),
+                "crop_w": out, "crop_h": out,
+                "ring": [round(v, 2) for v in ring],
+                "crop_levels": levels, "crop_level": level,
+            }
         return {"ok": True, "annotation_id": int(edit_id),
                 "version": int(row[0]) if row else 1,
-                "mask": mask_crop, "mask_frame": polygon}
+                "mask": mask_crop, "mask_frame": polygon, **recentred}
 
     @app.post("/api/label/undo", dependencies=[Depends(require_labeler)])
     def label_undo(body: LabelUndoReq, request: Request):

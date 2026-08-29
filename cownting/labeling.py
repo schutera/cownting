@@ -571,9 +571,28 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
     by `instance_key`, which the flag payload carries.
     """
     frame_file = labels_db.frame_basename(row["frame_path"])
+    # THE ANCHOR BOX. Hashed into `instance_key`, echoed on every submit, and
+    # never moved by anything the annotator does.
     bbox = [float(row["bbox_x1"]), float(row["bbox_y1"]),
             float(row["bbox_x2"]), float(row["bbox_y2"])]
-    _src, out, ring = crop_geometry(bbox, cfg.crop_pad, cfg.crop_max_width)
+    # THE DISPLAY BOX, which is a different question: what should the tile be cut
+    # around? Once this annotator has corrected the outline, the detector's box is
+    # no longer the best answer — a correction that shrinks or shifts the animal
+    # leaves it off to one side of a crop framed around the shape they rejected.
+    # So the crop, its ring and the zoom ladder are all built from the extent of
+    # THEIR outline, while `bbox` above stays exactly what the queue signed.
+    display_bbox = bbox
+    mine_raw = row.get("my_mask_poly")
+    if mine_raw:
+        try:
+            mine_pts = json.loads(mine_raw)
+        except (TypeError, ValueError):
+            mine_pts = None
+        if isinstance(mine_pts, list) and len(mine_pts) >= 3:
+            xs = [float(p[0]) for p in mine_pts]
+            ys = [float(p[1]) for p in mine_pts]
+            display_bbox = [min(xs), min(ys), max(xs), max(ys)]
+    _src, out, ring = crop_geometry(display_bbox, cfg.crop_pad, cfg.crop_max_width)
     day = row["day"]
 
     # The outline, in BOTH spaces, both derived server-side from the one stored
@@ -611,14 +630,15 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
             # Clamping at the edge is honest: it is the shape as far as this crop
             # can show it.
             mask_crop = [[round(min(max(v, 0.0), float(out)), 2) for v in p]
-                         for p in frame_to_crop(mask_frame, bbox, pad=cfg.crop_pad,
+                         for p in frame_to_crop(mask_frame, display_bbox,
+                                                pad=cfg.crop_pad,
                                                 max_width=cfg.crop_max_width)]
     # Original dimensions, for the peek overlay's viewBox. One lazy header open
     # per item, the same cost class as the frame_sig read below, and the only way
     # the client can place a full-frame coordinate on a DOWNSCALED frame image.
     frame_w, frame_h = frame_size(row["frame_path"])
     levels, default_level = zoom_levels(
-        bbox, camera_id=row["camera_id"], frame_file=frame_file,
+        display_bbox, camera_id=row["camera_id"], frame_file=frame_file,
         dataset_id=row["dataset_id"], pad=cfg.crop_pad, max_width=cfg.crop_max_width)
     return {
         "instance_key": row["instance_key"],
@@ -633,8 +653,9 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         # read: a stat plus 64 KiB per item, against a crop the annotator is about
         # to wait on a full JPEG decode for.
         "frame_sig": labels_db.frame_sig(row["frame_path"]),
+        # Cut around the DISPLAY box (see above), not the anchor box.
         "crop_url": crop_url(camera_id=row["camera_id"], frame_file=frame_file,
-                             bbox=bbox, dataset_id=row["dataset_id"],
+                             bbox=display_bbox, dataset_id=row["dataset_id"],
                              pad=cfg.crop_pad, max_width=cfg.crop_max_width),
         # The uncropped frame behind the same instance, for hold-to-peek. Built
         # here for crop_url's reason, which is not a style preference: a

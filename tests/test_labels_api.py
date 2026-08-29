@@ -1118,13 +1118,32 @@ def test_saved_outline_comes_back_on_the_queue_item():
         check("...and the same outline in full-frame px",
               it.get("mask_frame") is not None and len(it["mask_frame"]) == 3,
               str(it.get("mask_frame")))
-        # The crop-local copy must land back where the annotator drew it.
-        drift = max(abs(a - b) for p, q in zip(it.get("mask") or [], tri)
-                    for a, b in zip(p, q)) if it.get("mask") else 999
-        check("the returned crop-local outline matches what was drawn",
-              drift < 0.75, f"max drift {drift}")
-        # The two projections must be projections of ONE polygon.
-        back = labeling.frame_to_crop(it["mask_frame"], it["bbox"],
+        # THE CROP IS RE-FRAMED around the corrected shape, so the crop-local copy
+        # is deliberately NOT the numbers that were sent: those were relative to
+        # the crop cut around the DETECTOR's box, and this one is relative to a
+        # crop cut around the annotator's own outline. What must not move is the
+        # full-frame copy, which is the stored truth.
+        check("the crop is re-cut around the correction, not the rejected box",
+              it["crop_url"] != item["crop_url"], it["crop_url"][:70])
+        check("...so the outline sits CENTRED in it rather than off to one side",
+              abs(((min(p[0] for p in it["mask"]) + max(p[0] for p in it["mask"])) / 2)
+                  - it["crop_w"] / 2) < it["crop_w"] * 0.1,
+              f"centre {(min(p[0] for p in it['mask']) + max(p[0] for p in it['mask'])) / 2}"
+              f" of {it['crop_w']}")
+        check("...and the ring is redrawn to the corrected extent",
+              abs(it["ring"][0] - min(p[0] for p in it["mask"])) < 1.5
+              and abs(it["ring"][2] - max(p[0] for p in it["mask"])) < 1.5,
+              f"{it['ring']} vs {it['mask']}")
+        # The anchor is untouched: identity does not move when the framing does.
+        check("the ANCHOR box is unchanged — identity never follows the display",
+              it["bbox"] == item["bbox"] and it["instance_key"] == item["instance_key"],
+              f"{it['bbox']} vs {item['bbox']}")
+
+        # The two projections must be projections of ONE polygon — against the
+        # box the crop is now cut around, which is the corrected extent.
+        display = [min(p[0] for p in it["mask_frame"]), min(p[1] for p in it["mask_frame"]),
+                   max(p[0] for p in it["mask_frame"]), max(p[1] for p in it["mask_frame"])]
+        back = labeling.frame_to_crop(it["mask_frame"], display,
                                       pad=config.annotation.crop_pad,
                                       max_width=config.annotation.crop_max_width)
         agree = max(abs(a - b) for p, q in zip(back, it["mask"]) for a, b in zip(p, q))
@@ -1140,7 +1159,7 @@ def test_saved_outline_comes_back_on_the_queue_item():
               all(-1 <= v <= it["crop_w"] + 1 for p in it["mask"] for v in p),
               str(it["mask"][:2]))
         src, _out, _ring = labeling.crop_geometry(
-            it["bbox"], config.annotation.crop_pad, config.annotation.crop_max_width)
+            display, config.annotation.crop_pad, config.annotation.crop_max_width)
         check("mask_frame is FULL-FRAME — inside the crop's source square",
               all(src[0] - 1 <= p[0] <= src[2] + 1 and src[1] - 1 <= p[1] <= src[3] + 1
                   for p in it["mask_frame"]), str(it["mask_frame"][:2]))

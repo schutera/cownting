@@ -653,12 +653,41 @@ export default function Label() {
       const mask = asPoly(r.mask);
       const maskFrame = asPoly(r.mask_frame);
       if (mask === null && maskFrame === null) return; // a removal carries no geometry
+      // The re-framed crop, when the server sent one: after a correction the tile
+      // is re-cut around the shape the annotator drew, so the questions are asked
+      // over a centred animal instead of one sitting off to one side of a crop
+      // cut around the box they just rejected. `bbox` is deliberately NOT patched
+      // — it is identity, and every later submit still echoes the anchor the
+      // queue signed.
+      const r2 = result as {
+        crop_url?: unknown; crop_w?: unknown; crop_h?: unknown; ring?: unknown;
+        crop_levels?: unknown; crop_level?: unknown;
+      };
+      const framed =
+        typeof r2.crop_url === "string" &&
+        typeof r2.crop_w === "number" &&
+        typeof r2.crop_h === "number" &&
+        Array.isArray(r2.ring) &&
+        r2.ring.length === 4
+          ? {
+              crop_url: r2.crop_url,
+              crop_w: r2.crop_w,
+              crop_h: r2.crop_h,
+              ring: r2.ring as [number, number, number, number],
+              ...(Array.isArray(r2.crop_levels) && typeof r2.crop_level === "number"
+                ? {
+                    crop_levels: r2.crop_levels as CropLevel[],
+                    crop_level: r2.crop_level,
+                  }
+                : {}),
+            }
+          : {};
       const t = tapeRef.current;
       setTape({
         ...t,
         items: t.items.map((it) =>
           it.instance_key === key
-            ? { ...it, mask, mask_frame: maskFrame, mask_seed: "edit" }
+            ? { ...it, mask, mask_frame: maskFrame, mask_seed: "edit", ...framed }
             : it,
         ),
       });
