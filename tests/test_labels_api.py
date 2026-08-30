@@ -882,6 +882,77 @@ def test_false_positive_retires_the_instance_for_everyone():
               item["instance_key"] not in {i["instance_key"] for i in allq["items"]})
 
 
+def test_spread_draws_from_every_day_and_camera():
+    """The Label page asks for `order=spread` so a session samples the whole
+    corpus instead of draining the newest day first.
+
+    Why it matters is a sampling argument, not a UI one: consecutive items from
+    one day share weather, herd position and sun angle, so a day-ordered session
+    produces answers far more correlated than their count suggests, and a model
+    trained on the first N labels sees one afternoon rather than a season.
+
+    Cameras were never restricted in either mode — the queue applies no camera
+    filter — so what actually changes is the DAY term."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        # A second camera on both days, so "every camera" is a real claim and not
+        # a vacuous one on a single-camera fixture.
+        con = db.connect(config.paths.db_path)
+        try:
+            for ds in ("2026-07-03", "2026-07-04"):
+                fp = os.path.join(config.paths.artifacts_dir, ds, "frames",
+                                  "camera_02", "00000001.jpg")
+                day = date(int(ds[:4]), int(ds[5:7]), int(ds[8:]))
+                db.insert_frames(con, pd.DataFrame([
+                    {"dataset_id": ds, "camera_id": "camera_02", "frame_idx": 1,
+                     "ts": datetime(day.year, day.month, day.day, 7, 0),
+                     "frame_path": fp}]))
+                db.insert_detections(con, pd.DataFrame([
+                    {"dataset_id": ds, "camera_id": "camera_02", "frame_path": fp,
+                     "score": 0.5 + i / 10,
+                     "ts": datetime(day.year, day.month, day.day, 7, 0),
+                     "bbox_x1": 10.0 * i, "bbox_y1": 20.0, "bbox_x2": 60.0 + 10 * i,
+                     "bbox_y2": 120.0} for i in range(3)]))
+        finally:
+            con.close()
+
+        def served(order: str):
+            body = client.get(
+                f"/api/label/queue?order={order}&mine=all&limit=200").json()
+            return body, [i["day"] for i in body["items"]]
+
+        fresh, fresh_days = served("fresh")
+        spread, spread_days = served("spread")
+
+        check("both orders draw from the SAME pool — spread restricts nothing",
+              fresh["matching"] == spread["matching"] and fresh["matching"] == 12,
+              f"fresh {fresh['matching']} / spread {spread['matching']}")
+        check("the applied order is echoed back",
+              fresh["filters"]["order"] == "fresh"
+              and spread["filters"]["order"] == "spread",
+              f"{fresh['filters']['order']} / {spread['filters']['order']}")
+        check("no camera filter is applied in either mode",
+              fresh["filters"]["camera"] is None and spread["filters"]["camera"] is None)
+        check("...and no dataset filter, so the queue really is cross-day",
+              fresh["filters"]["dataset"] is None and spread["filters"]["dataset"] is None)
+
+        cams = {i["camera_id"] for i in spread["items"]}
+        days = {i["day"] for i in spread["items"]}
+        check("spread reaches every camera", cams == {"camera_01", "camera_02"}, str(cams))
+        check("...and every day", len(days) == 2, str(days))
+
+        # THE ordering property. `fresh` is day-ordered by construction: every
+        # item of the newest day precedes every item of an older one.
+        check("fresh serves the newest day first, exhaustively",
+              fresh_days == sorted(fresh_days, reverse=True), str(fresh_days))
+        # `spread` drops that term, so the days interleave. Not a coin flip: the
+        # order is md5(annotator ‖ instance_key) and the annotator is fixed
+        # ('local', auth is off in these tests), so this sequence is the same on
+        # every run — a change to the ordering SQL is what would move it.
+        check("spread interleaves the days rather than draining one at a time",
+              spread_days != sorted(spread_days, reverse=True), str(spread_days))
+
+
 def test_zoom_ladder_and_frame_space_submit():
     """The outline editor edits in FULL-FRAME px and zooms by swapping which crop
     is on screen. Two things have to hold for that to be safe: every rung of the
@@ -1226,6 +1297,7 @@ def main():
     test_undo_is_scoped_to_me()
     test_mask_fix_roundtrip_and_validation()
     test_false_positive_retires_the_instance_for_everyone()
+    test_spread_draws_from_every_day_and_camera()
     test_zoom_ladder_and_frame_space_submit()
     test_ok_verdict_is_a_measurement_not_a_noop()
     test_ok_never_destroys_my_own_correction()

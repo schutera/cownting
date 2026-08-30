@@ -544,7 +544,25 @@ export default function Label() {
       // Tape keys first: api.ts slices `exclude` to the server's 200 cap, and
       // losing a recently-written key to the cap is survivable while losing a
       // tape key would serve us a duplicate of what is already on screen.
-      const q = await getLabelQueue({ exclude: [...have, ...recentWrittenRef.current] });
+      // SPREAD, not the server's `fresh` default: draw from the WHOLE corpus —
+      // every day and every camera interleaved — rather than draining the newest
+      // day first.
+      //
+      // It is a sampling decision, not a preference. Labelling a day at a time
+      // means consecutive items share weather, herd position and sun angle, so a
+      // session's worth of answers is far more correlated than its count
+      // suggests, and any model trained on the first N labels sees one afternoon
+      // rather than a season. The ordering is still the same stable
+      // per-annotator md5 permutation, so two annotators walk the pool in
+      // different orders and meet in the middle instead of racing down one list.
+      //
+      // What this trades away: a freshly uploaded day no longer appears at the
+      // head of the queue — its cows are scattered through the permutation like
+      // everything else. Pass `order: "fresh"` here to get that back.
+      const q = await getLabelQueue({
+        exclude: [...have, ...recentWrittenRef.current],
+        order: "spread",
+      });
       const known = new Set([...have, ...recentWrittenRef.current]);
       const fresh = q.items.filter((i) => !known.has(i.instance_key));
       if (fresh.length === 0) {
