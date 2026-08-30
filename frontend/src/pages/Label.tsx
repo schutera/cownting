@@ -209,6 +209,23 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
+/** What ArrowLeft means right now. Extracted from the component because it is the
+    rule, not the plumbing: the ordering of its three cases is the whole
+    behaviour, and it is the part worth pinning in a test. */
+export function backTarget(s: {
+  step: number;
+  cursor: number;
+  inGeometry: boolean;
+  outlineOpen: boolean;
+}): "question" | "item" | "none" {
+  // The geometry step precedes every question, so there is no earlier question
+  // to step back to; and the outline editor owns its own keys, so ← never
+  // reaches here from inside it.
+  if (!s.inGeometry && !s.outlineOpen && s.step > 0) return "question";
+  if (s.cursor > 0) return "item";
+  return "none";
+}
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -1062,13 +1079,26 @@ export default function Label() {
 
   const goPrev = useCallback(() => {
     const t = tapeRef.current;
-    if (t.cursor <= 0) {
-      shake();
-      showHint("this is as far back as the tape goes");
-      return;
+    switch (backTarget({ step, cursor: t.cursor, inGeometry, outlineOpen })) {
+      case "question":
+        // WITHIN the item first. A mis-click on question 1 is corrected by
+        // stepping back to it, not by abandoning the animal — and until this
+        // existed there was no way back at all: answering handed off to question
+        // 2, and ← moved the tape, so on the first item of a session it only
+        // shook and said the tape went no further. The tile still shows what was
+        // chosen, so pressing a different letter replaces it and pressing the
+        // same one clears it.
+        setStep(step - 1);
+        setHint(null);
+        return;
+      case "item":
+        goTo(t.cursor - 1);
+        return;
+      case "none":
+        shake();
+        showHint("this is as far back as the tape goes");
     }
-    goTo(t.cursor - 1);
-  }, [goTo, shake, showHint]);
+  }, [goTo, inGeometry, outlineOpen, shake, showHint, step]);
 
   const goNext = useCallback(() => {
     const t = tapeRef.current;
