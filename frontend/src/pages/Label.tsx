@@ -209,21 +209,56 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
-/** What ArrowLeft means right now. Extracted from the component because it is the
-    rule, not the plumbing: the ordering of its three cases is the whole
-    behaviour, and it is the part worth pinning in a test. */
-export function backTarget(s: {
+/** What the arrows mean right now.
+ *
+ * The item is a sequence of steps — [1/3] outline, then one per question — and
+ * the arrows WALK IT. That is the whole model, and both directions have to obey
+ * it or the pair is a trap: for a while ArrowLeft moved the tape while
+ * ArrowRight either jumped out of review or committed the item outright, so a
+ * mis-answered question could be reached from one side and not the other.
+ *
+ * Extracted from the component because the ORDER of the cases is the behaviour,
+ * and that ordering is what regressed by omission. */
+export interface FlowState {
   step: number;
+  stepCount: number;      // questions only; the geometry step is counted apart
   cursor: number;
+  frontier: number;
   inGeometry: boolean;
+  geomDone: boolean;
   outlineOpen: boolean;
-}): "question" | "item" | "none" {
-  // The geometry step precedes every question, so there is no earlier question
-  // to step back to; and the outline editor owns its own keys, so ← never
-  // reaches here from inside it.
-  if (!s.inGeometry && !s.outlineOpen && s.step > 0) return "question";
+  complete: boolean;      // every REQUIRED question answered
+}
+
+export function backTarget(
+  s: FlowState,
+): "question" | "geometry" | "item" | "none" {
+  // The editor owns its own keys; an arrow never reaches here from inside it.
+  if (s.outlineOpen) return s.cursor > 0 ? "item" : "none";
+  if (!s.inGeometry && s.step > 0) return "question";
+  // From the FIRST question, back is the outline step — it is step 1 of the
+  // item, not a different animal. Only reachable once it has been passed;
+  // before that we are already standing on it.
+  if (!s.inGeometry && s.geomDone) return "geometry";
   if (s.cursor > 0) return "item";
   return "none";
+}
+
+export function forwardTarget(
+  s: FlowState,
+): "question" | "commit" | "frontier" | "blocked" {
+  if (s.outlineOpen) return "blocked";
+  if (s.inGeometry) {
+    // Stepping forward OUT of the outline step is only allowed once it has been
+    // judged — that gate is the point of the step, and an arrow must not be the
+    // hole in it. Passing it writes a verdict; returning to look does not.
+    return s.geomDone ? "question" : "blocked";
+  }
+  if (s.step < s.stepCount - 1) return "question";
+  // On the last question: leaving review returns to the head of the tape, and
+  // otherwise the item commits — but only once it can be.
+  if (s.cursor < s.frontier) return "frontier";
+  return s.complete ? "commit" : "blocked";
 }
 
 function errMsg(e: unknown): string {
@@ -319,6 +354,10 @@ export default function Label() {
   // makes going back along the tape behave — a revisited item keeps its verdict
   // and does not ask again.
   const [geomByKey, setGeomByKey] = useState<Record<string, boolean>>({});
+  // Walked BACK into the outline step with the arrow. Per-item and reset on
+  // advance, like every other mode on this screen — a view the annotator chose
+  // for one cow must not greet them on the next.
+  const [revisitGeom, setRevisitGeom] = useState(false);
 
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -497,7 +536,9 @@ export default function Label() {
     }];
   }, [current]);
   const zoomIndex = zoom ?? current?.crop_level ?? 0;
-  const inGeometry = current !== null && !geomDone && !cropFailed;
+  // Standing on the outline step: either it has not been judged yet, or the
+  // annotator walked BACK into it with the arrow to look again.
+  const inGeometry = current !== null && !cropFailed && (!geomDone || revisitGeom);
 
   useEffect(() => {
     const onResize = () => setViewportH(window.innerHeight);
@@ -1077,51 +1118,79 @@ export default function Label() {
     setStep(0);
   }, [commitMask, current, currentKey, maskSaving]);
 
+  const flow = useCallback(
+    (): FlowState => ({
+      step,
+      stepCount: steps.length,
+      cursor: tapeRef.current.cursor,
+      frontier: tapeRef.current.frontier,
+      inGeometry,
+      geomDone,
+      outlineOpen,
+      complete: isComplete(answers),
+    }),
+    [answers, geomDone, inGeometry, isComplete, outlineOpen, step, steps.length],
+  );
+
   const goPrev = useCallback(() => {
-    const t = tapeRef.current;
-    switch (backTarget({ step, cursor: t.cursor, inGeometry, outlineOpen })) {
+    switch (backTarget(flow())) {
       case "question":
-        // WITHIN the item first. A mis-click on question 1 is corrected by
-        // stepping back to it, not by abandoning the animal — and until this
-        // existed there was no way back at all: answering handed off to question
-        // 2, and ← moved the tape, so on the first item of a session it only
-        // shook and said the tape went no further. The tile still shows what was
-        // chosen, so pressing a different letter replaces it and pressing the
-        // same one clears it.
+        // WITHIN the item first. A mis-click is corrected by stepping back to
+        // the question, not by abandoning the animal; the tile still shows what
+        // was chosen, so another letter replaces it and the same one clears it.
         setStep(step - 1);
         setHint(null);
         return;
+      case "geometry":
+        // Back onto step 1. The verdict already given is not undone by looking
+        // at it again — only by giving a different one.
+        setRevisitGeom(true);
+        setHint(null);
+        return;
       case "item":
-        goTo(t.cursor - 1);
+        goTo(tapeRef.current.cursor - 1);
         return;
       case "none":
         shake();
         showHint("this is as far back as the tape goes");
     }
-  }, [goTo, inGeometry, outlineOpen, shake, showHint, step]);
+  }, [flow, goTo, shake, showHint, step]);
 
   const goNext = useCallback(() => {
-    const t = tapeRef.current;
-    // §3.7: on a revisited item ArrowRight LEAVES review and returns to the head
-    // of the tape, rather than walking forward one answered item at a time.
-    if (t.cursor < t.frontier) {
-      goTo(t.frontier);
-      return;
+    switch (forwardTarget(flow())) {
+      case "question":
+        // Forward one step, the mirror of goPrev. Leaving the outline step this
+        // way does NOT re-write its verdict: looking is not judging.
+        setRevisitGeom(false);
+        setStep(inGeometry ? 0 : step + 1);
+        setHint(null);
+        return;
+      case "frontier":
+        // On a revisited item the far end is the head of the tape, not the next
+        // answered cow — walking forward one at a time through work already done
+        // is not what the annotator meant.
+        goTo(tapeRef.current.frontier);
+        return;
+      case "commit":
+        if (current === null) return;
+        commitAnswers(current, answers, "key");
+        setRecentMs((prev) =>
+          [Math.max(0, Math.round(activeNow() - itemMarkRef.current)), ...prev].slice(0, 200),
+        );
+        advance();
+        return;
+      case "blocked":
+        // Never a silent no-op: a dead key reads as a slow save, and the
+        // annotator presses again — onto the next cow.
+        shake();
+        showHint(
+          inGeometry
+            ? "check the outline first — Enter accepts it, E fixes it"
+            : "answer both questions, or press F to flag",
+        );
     }
-    if (current === null) return;
-    if (!isComplete(answers)) {
-      // There is no skipping. The only ways off an item are answering it and
-      // flagging it, and a silent no-op here would read as a broken key.
-      shake();
-      showHint("answer both questions, or press F to flag");
-      return;
-    }
-    commitAnswers(current, answers, "key");
-    setRecentMs((prev) =>
-      [Math.max(0, Math.round(activeNow() - itemMarkRef.current)), ...prev].slice(0, 200),
-    );
-    advance();
-  }, [activeNow, advance, answers, commitAnswers, current, goTo, isComplete, shake, showHint]);
+  }, [activeNow, advance, answers, commitAnswers, current, flow, goTo, inGeometry,
+      shake, showHint, step]);
 
   const openFlag = useCallback(() => {
     if (current === null) return;
@@ -1169,6 +1238,7 @@ export default function Label() {
     setDraft(null);
     setMaskSaving(false);
     setZoom(null);
+    setRevisitGeom(false);
     // A popover must not survive the advance: the same class_key exists in the
     // next item, so it would silently reappear anchored to a cow nobody opened
     // it for.
@@ -1265,6 +1335,12 @@ export default function Label() {
     // no-op on this screen is indistinguishable from a slow save.
     // F (flag) and the two holds keep working: looking harder, and giving up on
     // an unjudgeable crop, are both legitimate at this point.
+    //
+    // THE ARROWS ARE NOT HANDLED HERE. They belong to goPrev/goNext, which walk
+    // the item's steps and already refuse to leave this one unjudged. Catching
+    // ArrowRight here as well meant the gate stayed shut even AFTER the outline
+    // had been accepted and the annotator had merely walked back to look at it —
+    // two rules for one key, and the older one won.
     if (inGeometry && !flag.open && !outlineOpen) {
       if (!plain || e.repeat) {
         // fall through to the action table for F/Escape only
@@ -1279,10 +1355,6 @@ export default function Label() {
       } else if (e.key === "x" || e.key === "X") {
         e.preventDefault();
         commitMask("false_positive");
-        return;
-      } else if (e.key === "ArrowRight") {
-        shake();
-        showHint("check the outline first — Enter accepts it, E fixes it");
         return;
       } else if (resolveLabelKey(e, activeOptions.length)?.kind === "option") {
         shake();
