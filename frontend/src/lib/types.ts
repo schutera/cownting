@@ -353,6 +353,52 @@ export interface LabelStats {
   annotators: number;
   auth_disabled: boolean;
   filters: { dataset: string | null; camera: string | null };
+  /** Corpus-wide instance counts per class — everyone's answers, not the
+      caller's. Every class the taxonomy knows about is present, archived and
+      never-picked ones included, because a zero is the most informative row this
+      carries. Optional so a page talking to an older server renders the rest of
+      the panel instead of throwing. */
+  classes?: LabelClassCount[];
+  /** What the class rows roll up to, per question. Carries the one number that
+      cannot live on a class row: a contested instance belongs to no single
+      class. */
+  class_groups?: LabelGroupConsensus[];
+}
+
+/** One class's share of the labeled corpus, counted in INSTANCES.
+
+    The unit matters: with `targets_per_instance = 2` a per-answer count would
+    drift away from the word "instances" precisely as coverage improves. An
+    instance counts under a class when every annotator who answered it chose that
+    class — one annotator is trivially unanimous, and instances the annotators
+    disagree about are counted under NO class and surfaced as
+    `LabelGroupConsensus.contested` instead of being quietly filed under one. */
+export interface LabelClassCount {
+  class_key: string;
+  group_key: string;
+  /** The name AS STORED IN THE TAXONOMY, so an archived class still has one.
+      The panel renders `LabelClass.name` from the live taxonomy where it can;
+      this is the fallback for classes the taxonomy no longer offers. */
+  class_name: string;
+  active: boolean;
+  /** Instances where every annotator who answered agreed on this class. */
+  instances: number;
+  /** ...of which this many were agreed by TWO OR MORE annotators. The rest rest
+      on a single opinion. Zero across the board is the honest reading of a
+      corpus nobody has double-labeled yet, and is why `instances` is not
+      presented as if it were confirmed. */
+  confirmed: number;
+}
+
+/** One question's totals over the same population the class rows are drawn from.
+    `agreed + contested === instances` by construction, which is what lets the
+    panel prove its class bars are not quietly short of the work done. */
+export interface LabelGroupConsensus {
+  group_key: string;
+  instances: number;
+  agreed: number;
+  contested: number;
+  confirmed: number;
 }
 
 // Why an instance could not be answered. There is no silent skip: an instance

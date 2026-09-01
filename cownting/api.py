@@ -1469,6 +1469,13 @@ def create_app(config: Config) -> FastAPI:
         lc = _labels_con()
         try:
             effort = _dict_rows(lc.execute(labels_db.SQL_EFFORT_BY_ANNOTATOR))
+            # Corpus-wide, not per-annotator: "how many instances of which class
+            # exist" is a question about the DATASET, and scoping it to the caller
+            # would answer a different one. Served from this same connection and
+            # this same route because the panel that draws it is the panel that
+            # already draws `my_labeled` — a second endpoint would double the
+            # Label page's poll for one extra GROUP BY.
+            dist = labels_db.class_distribution(lc)
         finally:
             lc.close()
         me = next((r for r in effort if r["annotator"] == annotator), {})
@@ -1490,6 +1497,25 @@ def create_app(config: Config) -> FastAPI:
             "annotations_labeled": pool.get("annotations_labeled", 0),
             "targets_total": pool.get("targets_total", 0),
             "policy": pool.get("policy", {}),
+            # Every class in the taxonomy, archived and never-picked ones included —
+            # a zero is the point of the block that renders this, so the filtering
+            # to what an annotator can currently pick is the frontend's, done with
+            # the same lib/labelKeys ordering the tiles use.
+            "classes": [
+                {"class_key": r["class_key"], "group_key": r["group_key"],
+                 "class_name": r["class_name"], "active": bool(r["active"]),
+                 "instances": int(r["instances"] or 0),
+                 "confirmed": int(r["confirmed"] or 0)}
+                for r in dist["classes"]
+            ],
+            "class_groups": [
+                {"group_key": r["group_key"],
+                 "instances": int(r["instances"] or 0),
+                 "agreed": int(r["agreed"] or 0),
+                 "contested": int(r["contested"] or 0),
+                 "confirmed": int(r["confirmed"] or 0)}
+                for r in dist["groups"]
+            ],
         }
 
     @app.get("/api/label/mine")

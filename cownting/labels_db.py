@@ -2341,6 +2341,106 @@ LEFT JOIN annotations a ON a.serve_event_id = s.event_id
 GROUP BY 1 ORDER BY served DESC, s.annotator
 """
 
+# ------------------------------------------------------------------ distribution
+
+# How many INSTANCES carry each class — the corpus's shape, which is the one thing
+# neither effort nor agreement can say. A class with two examples is a class no
+# model will ever learn, and today that is only visible by opening the store.
+#
+# The unit is the INSTANCE, not the answer row: with targets_per_instance = 2 a
+# per-answer count would drift away from the word "instances" exactly as coverage
+# improves, which is the wrong direction for a number people plan a dataset from.
+#
+# The counting rule is UNANIMITY AMONG THE RATERS WHO ANSWERED, and it is the whole
+# design of this query:
+#   - `n_sets = 1` — every rater who answered this instance gave the same answer, so
+#     there is one class to count it under. An instance two raters disagree about is
+#     NOT silently filed under one of them; it is excluded, and surfaced separately
+#     as `contested` so the exclusion is visible rather than a quiet shortfall.
+#   - a single rater is trivially unanimous and counts. The alternative (demand two
+#     agreeing raters) renders every bar zero until double coverage arrives, which is
+#     a panel that shows nothing on the day it ships.
+#   - `n_raters >= 2` is carried alongside as `confirmed`, so the same row says both
+#     "this many instances" and "this many are double-checked". That is what keeps
+#     the single-rater allowance honest: the display can show the weaker number
+#     without pretending it is the stronger one, and nothing has to change when the
+#     corpus fills in.
+#
+# The per-annotator SET, not the per-annotator class_key, is what unanimity is
+# tested on — `list_sort(list(DISTINCT class_key))`. For a single-select group that
+# is a one-element list and the test is an equality on the class. For a multi_select
+# group the naive `count(DISTINCT class_key) = 1` would read one rater's two
+# legitimate picks as a disagreement with themselves, so a multi-select group would
+# report zeros for everything. Same trick as SQL_MULTISELECT_JACCARD, same reason.
+#
+# `acting_preview` rows are dropped (a poweruser previewing the annotator role is
+# not corpus content). `auth_disabled` rows are KEPT, unlike every agreement query:
+# with auth off, agreement is undefined because every row is annotator='local', but
+# a class that was chosen was still chosen, and excluding them would show an empty
+# panel on exactly the deployments that have no other way to see this.
+_DISTRIBUTION_CTE = """
+WITH sets AS (
+    SELECT effective_key, group_key, annotator,
+           list_sort(list(DISTINCT class_key)) AS classes
+    FROM v_current_answers
+    WHERE NOT coalesce(acting_preview, FALSE)
+    GROUP BY 1, 2, 3
+),
+per_instance AS (
+    SELECT effective_key, group_key,
+           count(*)                AS n_raters,
+           count(DISTINCT classes) AS n_sets,
+           -- Safe precisely because the consumers below filter to n_sets = 1: with
+           -- one distinct set, any_value IS the set. min() is not defined over
+           -- LIST in DuckDB, so this is also the only spelling available.
+           any_value(classes)      AS classes
+    FROM sets GROUP BY 1, 2
+)"""
+
+# One row per class in the taxonomy, INCLUDING archived ones and ones nobody has
+# ever picked. A LEFT JOIN off `label_classes` rather than a GROUP BY over the
+# answers, because a zero is the most important number this query returns — an
+# inner join would omit exactly the starved class the panel exists to expose, and
+# the caller cannot tell a missing row from a class it forgot to ask about.
+SQL_CLASS_DISTRIBUTION = _DISTRIBUTION_CTE + """,
+agreed AS (
+    SELECT effective_key, group_key, n_raters, unnest(classes) AS class_key
+    FROM per_instance WHERE n_sets = 1
+)
+SELECT c.class_key, c.group_key, c.name AS class_name, c.active,
+       count(a.effective_key)                                AS instances,
+       count(a.effective_key) FILTER (WHERE a.n_raters >= 2) AS confirmed
+FROM label_classes c
+LEFT JOIN agreed a ON a.class_key = c.class_key AND a.group_key = c.group_key
+GROUP BY 1, 2, 3, 4
+ORDER BY c.group_key, instances DESC, c.class_key
+"""
+
+# The same population summed per QUESTION, so a caller can show what the class rows
+# leave out. `agreed + contested = instances` by construction, which is the check
+# that the class bars below a group header are not quietly missing work.
+SQL_GROUP_CONSENSUS = _DISTRIBUTION_CTE + """
+SELECT group_key,
+       count(*)                                             AS instances,
+       count(*) FILTER (WHERE n_sets = 1)                   AS agreed,
+       count(*) FILTER (WHERE n_sets > 1)                   AS contested,
+       count(*) FILTER (WHERE n_sets = 1 AND n_raters >= 2) AS confirmed
+FROM per_instance GROUP BY 1 ORDER BY group_key
+"""
+
+
+def class_distribution(con: duckdb.DuckDBPyConnection) -> dict[str, list[dict[str, Any]]]:
+    """Per-class instance counts plus the per-question totals they roll up to.
+
+    Two queries rather than one shape, because they answer two different questions
+    and only one of them can be asked per class: a contested instance belongs to no
+    class row at all, so `contested` has nowhere to live except on the group.
+    """
+    return {
+        "classes": _rows(con.execute(SQL_CLASS_DISTRIBUTION)),
+        "groups": _rows(con.execute(SQL_GROUP_CONSENSUS)),
+    }
+
 
 def agreement(
     con: duckdb.DuckDBPyConnection,

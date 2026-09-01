@@ -141,6 +141,18 @@ class BackupCfg(BaseModel):
     keep: int = 8
     max_upload_bytes: int = 9_500_000   # Discord's unboosted cap, with headroom
 
+    # --- Label-count milestones -------------------------------------------
+    # A ping every time the labeled-instance count crosses a multiple of
+    # `milestone_step`: 500, then 1000, then 1500. Deliberately NOT gated on
+    # `enabled` above — that switch governs whether annotator names and timings
+    # leave the box in a zip, and a milestone is one integer. A deployment that
+    # wants the nudge without shipping the corpus off-box gets it.
+    #
+    # On by default for the same reason: with no webhook configured it prints one
+    # line and posts nothing, which is a supported state rather than a failure.
+    milestones: bool = True
+    milestone_step: int = 500
+
 
 class FinetuneCfg(BaseModel):
     """Stage 1b: YOLO11-seg fine-tune on the corrected masks."""

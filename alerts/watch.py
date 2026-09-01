@@ -12,6 +12,11 @@ def send(content):
     except Exception as e:
         print("discord send failed:", e, file=sys.stderr)
 LOGIN_RE = re.compile(r'\[cownting\.alert\] LOGIN user=(\S+)')
+# Label-count milestones. The app prints this line exactly once per level, so it
+# is forwarded verbatim and NOT put through rate_ok() -- a rate limiter would
+# swallow the one message the app promises to emit, and the milestone would be
+# lost for good rather than merely delayed.
+MILESTONE_RE = re.compile(r'\[cownting\.alert\] LABEL-MILESTONE (\d+) labeled=(\d+)')
 _last = {}
 def rate_ok(key, window=120):
     now = time.time()
@@ -30,6 +35,11 @@ def run():
         m = LOGIN_RE.search(line)
         if m:
             send(f"\U0001F510 cownting login: **{m.group(1)}**"); continue
+        m = MILESTONE_RE.search(line)
+        if m:
+            level, labeled = int(m.group(1)), int(m.group(2))
+            send(f"\U0001F404 cownting label milestone: **{level:,} instances labeled** "
+                 f"({labeled:,} in the store)"); continue
         if 'Traceback (most recent call last)' in line:
             tb = [line]; continue
         if tb:

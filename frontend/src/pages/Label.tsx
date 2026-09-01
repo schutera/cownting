@@ -1900,6 +1900,8 @@ export default function Label() {
         <div className="w-[320px] shrink-0 grow-0">
           <LabelProgress
             groups={groups}
+            classes={stats?.classes}
+            classGroups={stats?.class_groups}
             stream={{
               // The SERVER's count, not the tape's. `tape.frontier` is how many
               // items this MOUNT has answered, so it is 0 after every reload —

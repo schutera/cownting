@@ -1,6 +1,11 @@
 import type { ReactNode } from "react";
-import type { LabelGroup } from "../lib/types";
-import { LABEL_ACTIONS, optionKeysFor, visibleGroups } from "../lib/labelKeys";
+import type { LabelClassCount, LabelGroup, LabelGroupConsensus } from "../lib/types";
+import {
+  LABEL_ACTIONS,
+  optionKeysFor,
+  visibleClasses,
+  visibleGroups,
+} from "../lib/labelKeys";
 import { SplitBar } from "./ui";
 
 /* The Label route's side panel (UX §2.5).
@@ -47,6 +52,12 @@ const CARD = "var(--lbl-card, #1E2124)";
 const TILE = "var(--lbl-tile, #262A2E)";
 const INK = "var(--lbl-ink, #E8EAEC)";
 const INK_DIM = "var(--lbl-ink-dim, #9AA1A7)";
+// Two tones the palette did not need until there were bars to draw. INK_BAR is
+// the unconfirmed mass — present, but visibly not the same claim as the INK
+// segment nested inside it. INK_FAINT is for a row that is real but inert: a
+// class sitting at zero, or one the taxonomy has retired.
+const INK_BAR = "var(--lbl-ink-bar, rgba(232, 234, 236, 0.30))";
+const INK_FAINT = "var(--lbl-ink-faint, #6B7278)";
 const HAIRLINE = "var(--lbl-line, rgba(255, 255, 255, 0.09))";
 
 /** Today's numbers for the annotator's own stream. Deliberately not LabelStats:
@@ -82,6 +93,13 @@ export interface LabelProgressProps {
       flight — the keys block says so rather than rendering nothing. */
   groups: LabelGroup[];
   stream: LabelStream;
+  /** Corpus-wide per-class instance counts (LabelStats.classes). Undefined while
+      the first stats fetch is in flight, or against a server predating the
+      field; the block says so rather than rendering zeros, which would be
+      indistinguishable from a corpus nobody has labeled yet. */
+  classes?: LabelClassCount[];
+  /** Per-question totals over the same population (LabelStats.class_groups). */
+  classGroups?: LabelGroupConsensus[];
   /** Opens the pending-notes queue (§3.9.3). Omitted -> the count is plain
       text, so the panel still renders before that page exists. */
   onOpenPendingNotes?: () => void;
@@ -100,6 +118,178 @@ function itemsPerMinute(recentMs: readonly number[]): number | null {
 
 function pct(fraction: number): string {
   return `${Math.round(fraction * 100)}%`;
+}
+
+/* ------------------------------------------------- the class-distribution block
+
+   What the corpus is MADE OF, corpus-wide, counted in instances. This is the one
+   figure on the page that is not about the annotator: My stream says how the
+   shift is going, this says what the shift is producing — that Head probing has
+   two examples and nothing will ever learn it from them.
+
+   It survives the §7 objection that killed the old coverage hero bar ("a
+   progress bar you cannot move is just a reminder that the work is long")
+   because it is not a progress bar. There is no denominator to fill and no
+   completion to fall short of; it is a shape. An annotator who sees one class
+   starving is looking at something a poweruser can act on — reweight the queue,
+   split a class, or rewrite a definition nobody is picking.
+
+   The counting rule lives in the SQL (labels_db.SQL_CLASS_DISTRIBUTION) and is
+   restated here only where the DISPLAY has to honour it: `instances` counts an
+   instance every answering annotator agreed on, which today is overwhelmingly
+   single-opinion instances, so `confirmed` is drawn INSIDE the same bar rather
+   than given a row of its own. One bar, two truths, and no way to read the
+   weaker number as if it were the stronger one. */
+
+export interface ClassBarRow {
+  class_key: string;
+  name: string;
+  instances: number;
+  confirmed: number;
+  archived: boolean;
+  /** 0..1 against the group's LARGEST class, not against the group total: the
+      question this block answers is "which class is starved", and that is a
+      comparison between classes. Normalising to the total would hand a
+      six-class group a 39% winner and squash every rare class into the same
+      invisible sliver. */
+  fraction: number;
+  /** 0..1 of THIS class's own instances — the bar within the bar. */
+  confirmedFraction: number;
+}
+
+export interface ClassBlockGroup {
+  group_key: string;
+  name: string;
+  rows: ClassBarRow[];
+  /** Instances answered for this question, taken from the server's roll-up
+      rather than summed over `rows`: a multi-select instance appears on several
+      rows, so a sum would over-count it. */
+  instances: number;
+  contested: number;
+  confirmed: number;
+}
+
+/** Join the live taxonomy to the corpus counts.
+
+    Rendered rows are the VISIBLE classes plus any archived class that still
+    holds instances. Dropping archived classes outright would silently delete
+    real work from the picture the moment a poweruser tidies the taxonomy;
+    keeping archived-but-empty ones would pad every group with rows that only
+    ever say zero. Ordering is by instances descending — the starved class is
+    then always the bottom row, which is the row this block exists for — with
+    the taxonomy's own display order as the tiebreak, so equal counts sit in the
+    same order as the tiles instead of shuffling between renders. */
+export function classBlocks(
+  groups: LabelGroup[],
+  counts: readonly LabelClassCount[],
+  groupTotals: readonly LabelGroupConsensus[],
+): ClassBlockGroup[] {
+  const byClass = new Map(counts.map((c) => [c.class_key, c]));
+  const byGroup = new Map(groupTotals.map((g) => [g.group_key, g]));
+  return visibleGroups(groups).map((g) => {
+    const live = visibleClasses(g);
+    const order = new Map(live.map((c, i) => [c.class_key, i]));
+    const merged = [
+      ...live.map((c) => ({
+        class_key: c.class_key,
+        name: c.name,
+        archived: false,
+        count: byClass.get(c.class_key),
+      })),
+      ...counts
+        .filter(
+          (c) =>
+            c.group_key === g.group_key &&
+            !c.active &&
+            c.instances > 0 &&
+            !order.has(c.class_key),
+        )
+        .map((c) => ({
+          class_key: c.class_key,
+          name: c.class_name,
+          archived: true,
+          count: c,
+        })),
+    ].map((r) => ({
+      class_key: r.class_key,
+      name: r.name,
+      archived: r.archived,
+      instances: r.count?.instances ?? 0,
+      confirmed: r.count?.confirmed ?? 0,
+    }));
+    // Against the largest CLASS, taken after the merge so an archived class that
+    // is still the biggest one scales its group honestly.
+    const max = merged.reduce((m, r) => Math.max(m, r.instances), 0);
+    const rows: ClassBarRow[] = merged
+      .map((r) => ({
+        ...r,
+        fraction: max > 0 ? r.instances / max : 0,
+        confirmedFraction: r.instances > 0 ? r.confirmed / r.instances : 0,
+      }))
+      .sort((a, b) => {
+        if (a.instances !== b.instances) return b.instances - a.instances;
+        // Archived rows have no display order of their own; park them after the
+        // live ones rather than at whatever index the map happens not to hold.
+        const oa = order.get(a.class_key) ?? Number.MAX_SAFE_INTEGER;
+        const ob = order.get(b.class_key) ?? Number.MAX_SAFE_INTEGER;
+        if (oa !== ob) return oa - ob;
+        return a.class_key < b.class_key ? -1 : a.class_key > b.class_key ? 1 : 0;
+      });
+    const total = byGroup.get(g.group_key);
+    return {
+      group_key: g.group_key,
+      name: g.name,
+      rows,
+      instances: total?.instances ?? 0,
+      contested: total?.contested ?? 0,
+      confirmed: total?.confirmed ?? 0,
+    };
+  });
+}
+
+/* The bar within the bar. The outer segment is this class against the group's
+   largest; the brighter inner segment is the part of it two or more annotators
+   agreed on. With targets_per_instance = 2 still unmet across the corpus that
+   inner segment is empty everywhere — which is the message, not a rendering
+   bug, and it fills in on its own as coverage arrives. */
+function ClassBar({ row }: { row: ClassBarRow }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        className="text-[11.5px] leading-snug truncate min-w-0 grow"
+        style={{ color: row.archived ? INK_FAINT : INK_DIM }}
+        title={row.archived ? `${row.name} — archived class` : row.name}
+      >
+        {row.name}
+        {row.archived ? (
+          <span className="text-[10px]" style={{ color: INK_FAINT }}>
+            {" · archived"}
+          </span>
+        ) : null}
+      </span>
+      <span
+        className="h-1.5 w-[64px] shrink-0 rounded-full overflow-hidden flex"
+        style={{ background: TILE }}
+        aria-hidden="true"
+      >
+        <span
+          className="h-full rounded-full flex"
+          style={{ width: `${row.fraction * 100}%`, background: INK_BAR }}
+        >
+          <span
+            className="h-full rounded-full"
+            style={{ width: `${row.confirmedFraction * 100}%`, background: INK }}
+          />
+        </span>
+      </span>
+      <span
+        className="font-mono text-[11px] tabular-nums text-right w-[30px] shrink-0"
+        style={{ color: row.instances === 0 ? INK_FAINT : INK }}
+      >
+        {row.instances.toLocaleString()}
+      </span>
+    </div>
+  );
 }
 
 function BlockHeading({ children }: { children: ReactNode }) {
@@ -159,10 +349,19 @@ function LegendRow({ label, badges }: { label: string; badges: readonly string[]
 export function LabelProgress({
   groups,
   stream,
+  classes,
+  classGroups,
   onOpenPendingNotes,
   className,
 }: LabelProgressProps) {
   const shown = visibleGroups(groups);
+  // Undefined (not yet fetched, or an older server) is NOT the same as empty,
+  // and the block below says so instead of drawing a row of honest-looking
+  // zeros. Only once both arrays have arrived is a zero a real zero.
+  const blocks =
+    classes === undefined || classGroups === undefined
+      ? null
+      : classBlocks(groups, classes, classGroups);
   const rate = itemsPerMinute(stream.recentMs);
   const fraction = stream.target > 0 ? stream.done / stream.target : 0;
   // Space is a HOLD, not an action with a class binding, so LABEL_ACTIONS does
@@ -241,7 +440,57 @@ export function LabelProgress({
         </p>
       </Block>
 
-
+      <Block title="Classes labeled">
+        {blocks === null ? (
+          <p className="text-[11.5px]" style={{ color: INK_DIM }}>
+            counting the corpus…
+          </p>
+        ) : blocks.length === 0 ? (
+          <p className="text-[11.5px]" style={{ color: INK_DIM }}>
+            waiting for the taxonomy…
+          </p>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {blocks.map((b) => (
+              <div key={b.group_key} className="flex flex-col gap-1">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-[11.5px] font-medium" style={{ color: INK }}>
+                    {b.name}
+                  </span>
+                  <span
+                    className="font-mono text-[11px] tabular-nums"
+                    style={{ color: INK_DIM }}
+                  >
+                    {b.instances.toLocaleString()}
+                  </span>
+                </div>
+                {b.rows.map((r) => (
+                  <ClassBar key={r.class_key} row={r} />
+                ))}
+                {/* Contested instances belong to no class row, so without this
+                    line the bars would simply come up short of the header and
+                    look like a bug. It is absent at zero rather than printing
+                    "0 contested", which reads as a warning that isn't one. */}
+                {b.contested > 0 ? (
+                  <p className="text-[10.5px] leading-snug" style={{ color: INK_FAINT }}>
+                    {b.contested.toLocaleString()} contested — annotators disagree, counted
+                    under no class
+                  </p>
+                ) : null}
+              </div>
+            ))}
+            {/* What the bars mean, once, at the bottom — and specifically what
+                the INNER segment means, since today it is empty everywhere and
+                an unexplained empty segment reads as a broken bar rather than
+                as "nobody has second-labeled anything yet". */}
+            <p className="text-[10.5px] leading-snug" style={{ color: INK_FAINT }}>
+              {blocks.some((b) => b.confirmed > 0)
+                ? "Instances everyone who answered agreed on; the brighter part had two or more annotators."
+                : "Instances everyone who answered agreed on — none has a second annotator yet."}
+            </p>
+          </div>
+        )}
+      </Block>
 
       <Block title="Keys">
         <div className="flex flex-col gap-1.5">

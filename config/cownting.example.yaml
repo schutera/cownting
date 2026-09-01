@@ -97,6 +97,24 @@ backup:
   # budget the run degrades: full zip -> CSV-only zip -> a message naming the file it
   # kept on disk. All three still count as a run.
   max_upload_bytes: 9500000
+  # --- Label-count milestones ---
+  # A ping each time the labeled-instance count crosses a multiple of
+  # `milestone_step`: 500, then 1000, then 1500. Announced once per level, and
+  # only the highest is announced when several are crossed between two ticks.
+  #
+  # NOT gated on `enabled` above, and on by default: that switch governs whether
+  # annotator names and timings leave the box inside a zip, while a milestone is
+  # one integer, so a deployment can take the nudge without shipping the corpus.
+  # Delivery is two-legged — an ASCII line on stdout that alerts/watch.py forwards
+  # through the webhook it already holds, plus a direct post when
+  # COWNTING_DISCORD_WEBHOOK is set. With neither configured it logs and posts
+  # nothing, which is a supported state rather than a failure.
+  #
+  # The count is INSTANCES, not answers: targets_per_instance = 2 labels the same
+  # animal twice on purpose, and counting rows would announce 1000 at 500 animals.
+  # It is the same number the Label page's "Classes labeled" block totals to.
+  milestones: true
+  milestone_step: 500
 
 finetune:                          # `cownting train` + `eval-detect`
   dataset_dir: data/finetune/dataset

@@ -25,7 +25,8 @@ import pandas as pd
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cownting import db, labels_db  # noqa: E402
+from cownting import config as config_mod  # noqa: E402
+from cownting import db, labels_backup, labels_db  # noqa: E402
 
 _FAILED = 0
 
@@ -645,6 +646,152 @@ def test_skip_does_not_count_as_coverage():
         con.close()
 
 
+def test_class_distribution_counts_instances_not_answers():
+    """The block on the Label panel and the milestone ping both read this.
+
+    The distinction it pins: with targets_per_instance = 2 the same cow is
+    deliberately labeled twice, so a per-ANSWER count would report double the
+    corpus that exists. Two annotators agreeing is ONE instance, and it is the
+    only case that also counts as `confirmed`.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        agreed = labels_db.instance_key("2026-07-03", "camera_01", "00000001.jpg", _BBOX, 0)
+        alone = labels_db.instance_key("2026-07-03", "camera_01", "00000002.jpg", _BBOX, 0)
+        split = labels_db.instance_key("2026-07-03", "camera_01", "00000003.jpg", _BBOX, 0)
+        # Two annotators, same answer -> one instance, and a confirmed one.
+        for who in ("alice", "bob"):
+            labels_db.submit_annotation(con, instance_key=agreed, annotator=who,
+                                        choices=[_SHADED])
+        # One annotator -> counted (trivially unanimous), NOT confirmed.
+        labels_db.submit_annotation(con, instance_key=alone, annotator="alice",
+                                    choices=[_SHADED])
+        # Two annotators, different answers -> counted under NEITHER class.
+        labels_db.submit_annotation(con, instance_key=split, annotator="alice",
+                                    choices=[_SHADED])
+        labels_db.submit_annotation(con, instance_key=split, annotator="bob",
+                                    choices=[_SUN])
+
+        dist = labels_db.class_distribution(con)
+        by_class = {r["class_key"]: r for r in dist["classes"]}
+        shaded = by_class["sun_exposure.shaded"]
+        check("two annotators agreeing are ONE instance, not two answers",
+              int(shaded["instances"]) == 2, f"instances={shaded['instances']}")
+        check("...of which only the double-labeled one is confirmed",
+              int(shaded["confirmed"]) == 1, f"confirmed={shaded['confirmed']}")
+        check("a contested instance is counted under NEITHER class",
+              int(by_class["sun_exposure.direct_sun"]["instances"]) == 0,
+              str(by_class["sun_exposure.direct_sun"]["instances"]))
+        # The row that an INNER join would have dropped — and it is the whole
+        # point of the block, which exists to show a starved class.
+        check("a class nobody ever picked still gets a row, at zero",
+              "sun_exposure.not_visible" in by_class
+              and int(by_class["sun_exposure.not_visible"]["instances"]) == 0,
+              str(sorted(by_class)))
+
+        groups = {r["group_key"]: r for r in dist["groups"]}
+        sun = groups["sun_exposure"]
+        check("agreed + contested accounts for every answered instance",
+              int(sun["agreed"]) + int(sun["contested"]) == int(sun["instances"])
+              and int(sun["instances"]) == 3, str(sun))
+        check("the contested instance is reported so the bars' shortfall is visible",
+              int(sun["contested"]) == 1, str(sun))
+        con.close()
+
+
+def test_class_distribution_ignores_skips_and_superseded_answers():
+    """A flag is a refusal to answer, and a corrected answer is one answer.
+
+    Both would otherwise inflate the very numbers the milestone ping fires on.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        k = labels_db.instance_key("2026-07-03", "camera_01", "00000001.jpg", _BBOX, 0)
+        flagged = labels_db.instance_key("2026-07-03", "camera_01", "00000009.jpg", _BBOX, 0)
+        labels_db.submit_annotation(con, instance_key=k, annotator="alice", choices=[_SHADED])
+        # Same annotator changes their mind: version 2 supersedes version 1.
+        labels_db.submit_annotation(con, instance_key=k, annotator="alice", choices=[_SUN])
+        labels_db.submit_annotation(con, instance_key=flagged, annotator="alice",
+                                    outcome="skipped", telemetry={"skip_reason": "occluded"})
+        by_class = {r["class_key"]: r for r in labels_db.class_distribution(con)["classes"]}
+        check("a superseded answer leaves its old class",
+              int(by_class["sun_exposure.shaded"]["instances"]) == 0,
+              str(by_class["sun_exposure.shaded"]["instances"]))
+        check("...and lands on the new one, once",
+              int(by_class["sun_exposure.direct_sun"]["instances"]) == 1,
+              str(by_class["sun_exposure.direct_sun"]["instances"]))
+        check("a flag is not a label",
+              labels_backup.labeled_instances(con) == 1,
+              str(labels_backup.labeled_instances(con)))
+        con.close()
+
+
+def test_milestone_announces_each_level_once():
+    """The ping's contract: one message per level, and never the same level twice.
+
+    A re-announcing milestone is worse than a missed one — it arrives every 15
+    minutes forever — so the watermark advance is what this pins, including
+    across the multi-level jump an import produces.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        # Built before the store is opened: a Config that fails validation while a
+        # connection is live leaves the handle open, and on Windows that surfaces
+        # as a TemporaryDirectory cleanup crash that hides the real error.
+        cfg = config_mod.Config(
+            cameras=[],
+            backup=config_mod.BackupCfg(milestone_step=5),
+            paths=config_mod.PathsCfg(labels_db_path=os.path.join(d, "labels.duckdb")),
+        )
+        con = _store(d)
+        posts: list[str] = []
+
+        def poster(webhook, content, path):
+            posts.append(content)
+
+        def label(n: int, start: int = 0) -> None:
+            for i in range(start, start + n):
+                labels_db.submit_annotation(
+                    con,
+                    instance_key=labels_db.instance_key(
+                        "2026-07-03", "camera_01", f"{i:08d}.jpg", _BBOX, 0),
+                    annotator="alice", choices=[_SHADED])
+
+        label(4)
+        con.close()
+        r = labels_backup.check_milestone(cfg, poster=poster)
+        check("below the first step nothing is announced",
+              r["status"] == "quiet" and r["labeled"] == 4, str(r))
+
+        con = db.connect(cfg.paths.labels_db_path)
+        label(1, start=4)
+        con.close()
+        r = labels_backup.check_milestone(cfg, poster=poster)
+        check("crossing the step announces it", r["status"] == "announced"
+              and r["level"] == 5, str(r))
+        r = labels_backup.check_milestone(cfg, poster=poster)
+        check("...and a second tick at the same count stays quiet",
+              r["status"] == "quiet", str(r))
+
+        # The import case: several levels at once. One message, the highest.
+        con = db.connect(cfg.paths.labels_db_path)
+        label(12, start=5)
+        con.close()
+        r = labels_backup.check_milestone(cfg, poster=poster)
+        check("a multi-level jump announces only the highest level reached",
+              r["status"] == "announced" and r["level"] == 15 and r["labeled"] == 17,
+              str(r))
+
+        # No webhook in the environment, so nothing posts — but the stdout line
+        # that alerts/watch.py forwards is emitted regardless, and the watermark
+        # advanced anyway, which is what stops the 15-minute repeat.
+        check("with no webhook configured the direct post is skipped, not failed",
+              r["discord"] == "skipped" and posts == [], str(posts))
+
+        cfg.backup.milestones = False
+        check("the switch turns it off",
+              labels_backup.check_milestone(cfg, poster=poster)["status"] == "disabled")
+
+
 def test_undo_supersedes_and_keeps_history():
     with tempfile.TemporaryDirectory() as d:
         con = _store(d)
@@ -719,6 +866,9 @@ def main():
     test_relabel_appends_and_double_submit_is_refused()
     test_archived_class_still_resolves()
     test_skip_does_not_count_as_coverage()
+    test_class_distribution_counts_instances_not_answers()
+    test_class_distribution_ignores_skips_and_superseded_answers()
+    test_milestone_announces_each_level_once()
     test_undo_supersedes_and_keeps_history()
     test_multiselect_dispatch()
     print("==========================")

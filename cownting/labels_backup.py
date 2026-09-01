@@ -66,6 +66,14 @@ WEBHOOK_ENV = "COWNTING_DISCORD_WEBHOOK"
 # — a restored backup knows what has already been posted.
 META_WATERMARK = "backup_watermark"
 
+# label_meta key: the highest milestone already announced, as an absolute count
+# ("1000"), not a multiplier. Stored beside the backup watermark and for the same
+# reason — a store restored from a snapshot must not re-announce the milestones
+# it already passed — and as the count rather than the level so a later change to
+# `milestone_step` is interpretable against it instead of silently meaning
+# something else.
+META_MILESTONE = "milestone_labeled"
+
 # First tick delay. LOAD-BEARING: longer than any test run, so the ~20 apps
 # tests/test_api.py and tests/test_auth.py build in temp dirs never fire a backup,
 # and the sleeping thread holds no file handle. Lowering it resurrects the Windows
@@ -83,6 +91,14 @@ _COOLDOWN_HOURS = 6
 _CLAIM_LEASE_HOURS = 1
 
 _ALERT = "[cownting.alert] LABEL-BACKUP"
+# A SECOND alert prefix, and the delivery path that works with no new secret.
+# alerts/watch.py tails this container's stdout on the host and forwards matching
+# lines to the webhook it already holds, so printing this line delivers the ping
+# even on a box where COWNTING_DISCORD_WEBHOOK was never set — which is every box
+# today. The direct post below is the belt to this line's braces; whichever is
+# configured fires, and the watermark advances once either way so a milestone is
+# announced exactly once.
+_MILESTONE_ALERT = "[cownting.alert] LABEL-MILESTONE"
 _UA = "cownting-labels-backup/1.0 (+https://cownting.schutera.com)"
 _ZIP_GLOB = "labels-*.zip"
 
@@ -798,6 +814,108 @@ def _stale_alert(con: duckdb.DuckDBPyConnection, backup: BackupCfg) -> None:
         print(f"{_ALERT} stale: last successful backup {row[0]} — over {2 * backup.every_days} days ago")
 
 
+# ------------------------------------------------------------------ milestones
+
+# Distinct instances somebody has actually answered — the same population the
+# Label panel's class bars are drawn from, so the ping and the panel it sends you
+# to can never disagree about how much work exists.
+#
+# DISTINCT effective_key, not a row count: `targets_per_instance = 2` means the
+# same cow is deliberately labeled twice, and counting rows would announce "1000
+# labeled" at 500 animals. Skips are excluded because a flag is a refusal to
+# answer, and superseded rows because a corrected answer is one answer.
+# `acting_preview` is excluded for the same reason it is excluded everywhere
+# else: a poweruser previewing the annotator role is not corpus content.
+SQL_LABELED_INSTANCES = """
+SELECT count(DISTINCT effective_key) FROM annotations
+WHERE superseded_at IS NULL
+  AND outcome = 'labeled'
+  AND NOT coalesce(acting_preview, FALSE)
+"""
+
+
+def labeled_instances(con: duckdb.DuckDBPyConnection) -> int:
+    row = con.execute(SQL_LABELED_INSTANCES).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _milestone_text(labeled: int, level: int, step: int) -> str:
+    return (
+        f"\U0001F404 cownting label milestone: **{level:,} instances labeled** "
+        f"({labeled:,} in the store). Next ping at {level + step:,}."
+    )
+
+
+def check_milestone(
+    config: Config,
+    *,
+    poster: Poster | None = None,
+    trigger: str = "schedule",
+) -> dict[str, Any]:
+    """Announce each `milestone_step` crossing of the labeled-instance count.
+
+    Fires ONCE per level. When several levels are crossed between two ticks —
+    an import, or a box that was off — only the highest is announced: three
+    messages arriving together say nothing the top one does not, and the
+    watermark stores the count so the skipped levels are still accounted for.
+
+    Delivery is deliberately two-legged (see `_MILESTONE_ALERT`): the stdout line
+    always happens and is what `alerts/watch.py` forwards on the host, the direct
+    webhook post happens only when COWNTING_DISCORD_WEBHOOK is set. The watermark
+    advances after the print, NOT after a successful post — a webhook that is
+    down would otherwise re-announce the same milestone every 15 minutes until it
+    came back, which is the failure mode this whole module already carries a
+    six-hour cooldown to avoid.
+
+    Never raises: it runs on the shared ticker thread, and a milestone is the
+    least important thing on it. Store contention comes back `skipped`.
+    """
+    step = int(config.backup.milestone_step)
+    if not config.backup.milestones or step <= 0:
+        return {"status": "disabled", "labeled": None, "level": None}
+    try:
+        con = _open_store(config)
+    except _StoreBusy:
+        # The submit path holds the store. Nothing to do; the next tick is 15
+        # minutes away and a milestone is not time-critical.
+        return {"status": "skipped", "labeled": None, "level": None}
+    try:
+        labeled = labeled_instances(con)
+        # Floor to the level, so 1499 announces 1000 and 1500 announces 1500.
+        level = (labeled // step) * step
+        raw = labels_db.get_meta(con, META_MILESTONE)
+        try:
+            last = int(raw) if raw else 0
+        except ValueError:
+            # A hand-edited or corrupted watermark must not wedge the feature
+            # forever. Treat it as "nothing announced" and re-announce once.
+            last = 0
+        if level <= last:
+            return {"status": "quiet", "labeled": labeled, "level": last,
+                    "next": last + step}
+        content = _milestone_text(labeled, level, step)
+        print(f"{_MILESTONE_ALERT} {level} labeled={labeled} trigger={trigger}")
+        labels_db.set_meta(con, META_MILESTONE, str(level))
+    finally:
+        con.close()
+
+    webhook = os.environ.get(WEBHOOK_ENV, "").strip()
+    posted = "skipped"
+    if webhook and _looks_like_webhook(webhook):
+        try:
+            (poster or _discord_poster)(webhook, content, None)
+            posted = "posted"
+        except Exception as e:  # noqa: BLE001 — a missed ping must not kill the ticker
+            posted = "failed"
+            print(f"{_MILESTONE_ALERT} post failed: {_redact(str(e) or repr(e))}")
+    elif webhook:
+        print(f"{_MILESTONE_ALERT} webhook refused: {WEBHOOK_ENV} is not a "
+              "discord.com/api/webhooks URL (value not logged)")
+        posted = "refused"
+    return {"status": "announced", "labeled": labeled, "level": level,
+            "next": level + step, "discord": posted}
+
+
 # ------------------------------------------------------------------- scheduler
 
 _LOCK = threading.Lock()
@@ -912,4 +1030,14 @@ def _ticker() -> None:
                 # Message only, no traceback: an exception chain can embed the
                 # webhook URL (urllib puts it in HTTPError attributes).
                 print(f"{_ALERT} tick crashed: {_redact(str(e) or repr(e))}")
+        # Outside the `backup.enabled` guard on purpose: a milestone is one
+        # integer and has its own switch, so a deployment can take the nudge
+        # without shipping the corpus off-box. Same 15-minute tick, same thread —
+        # a second ticker for one COUNT(DISTINCT) would be a thread that sleeps
+        # 99.99% of the time next to one that already exists.
+        if cfg is not None:
+            try:
+                check_milestone(cfg, trigger="schedule")
+            except Exception as e:  # noqa: BLE001 — never let a ping kill the ticker
+                print(f"{_MILESTONE_ALERT} tick crashed: {_redact(str(e) or repr(e))}")
         time.sleep(_TICK_S)
