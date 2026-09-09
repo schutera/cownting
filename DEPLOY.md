@@ -193,6 +193,61 @@ as a 500 (`PermissionError`) on some unrelated save. Two layers of defence:
   uid 10001). A root-owned stray at worst breaks things until the next
   `docker compose restart cownting`.
 
+## The instance attribute model (M5)
+
+A small crop classifier trained on the Label page's answers
+([design](docs/roadmap/M5_instance_attrs.md)). It gates the segmenter's false
+positives, fills the sun-exposure column `in_shade` never got, and predicts
+behaviour beyond what mask elongation can express.
+
+**Train off-box, serve on-box.** The two build steps hold a DuckDB write handle,
+and DuckDB allows one read-write process per file — running them against a live
+server takes the site off the air, it does not merely slow it. Scoring therefore
+has an API route that runs inside the server process, like `POST /api/remask`.
+
+```bash
+# 1. On the SERVER, with the container stopped (or against a copy of the store):
+docker compose stop cownting
+docker compose run --rm cownting python -m cownting.cli attrs build-dataset \
+    -c config/cownting.prod.yaml
+docker compose up -d cownting
+
+# 2. Anywhere with a GPU (the dataset is a few MB — copy it over and train):
+cownting attrs train -c config/cownting.yaml
+#    -> data/models/instance_attrs.pt  + .metrics.json with the per-head report
+
+# 3. Put the checkpoint on the box and score, through the API so it runs
+#    in-process on the upload queue:
+scp data/models/instance_attrs.pt <box>:/opt/cownting/data/models/
+curl -X POST 'https://<host>/api/attrs/score'          # whole corpus, resumable
+curl -X POST 'https://<host>/api/attrs/score?dataset=2025-07-03'   # or one day
+```
+
+Progress rides `GET /api/uploads` like every other job — there is no second
+status route. The pass yields to a waiting upload and re-queues itself, and
+scored rows carry the model's rev, so an interrupted pass resumes rather than
+restarts and re-running is free.
+
+`GET /api/attrs/status` reports how much of the corpus is scored and how many
+detections the gate is currently hiding.
+
+### Turning the gate on
+
+Scoring only ever *records* a verdict. Two things must both be true before a
+single number in the dashboard moves:
+
+1. the detections have been scored, and
+2. `instance_attrs.gate_enabled: true` in the config.
+
+Never-scored rows are counted regardless (`coalesce(attr_is_cow, TRUE)`), so a
+half-scored corpus is a safe state. **Enabling the gate changes historical
+counts** — every chart that counts detections will move. Look at the `Cow gate`
+pivot in the cross-filter first: it shows exactly what would be removed, broken
+down by camera or hour, while the gate is still off.
+
+To back out, set `gate_enabled: false` and restart. Nothing was deleted; the
+verdicts stay on the rows and the counts return.
+
 ## Notes & tuning
 
 - **CPU speed.** The default detector is `yolo11x-seg.pt` — accurate but slow on

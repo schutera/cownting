@@ -116,6 +116,49 @@ backup:
   milestones: true
   milestone_step: 500
 
+# --- M5: the instance attribute model (docs/roadmap/M5_instance_attrs.md) ---
+# A small crop classifier trained on the Label page's answers. Three heads:
+# is-this-a-cow (gates the segmenter's false positives), sun exposure, behaviour.
+#
+#   cownting attrs build-dataset     labels + frames -> crops + manifest
+#   cownting attrs train             fine-tune; prints the per-head val report
+#   POST /api/attrs/score            score `detections` IN THE SERVER PROCESS
+#
+# The two CLI steps are OFFLINE — they take a DuckDB write handle, and DuckDB
+# allows one read-write process per file, so running them against a live server
+# takes the site off the air rather than merely slowing it. Scoring has an API
+# route for exactly that reason; use it on a deployment.
+instance_attrs:
+  dataset_dir: data/instance_attrs/dataset
+  weights: data/models/instance_attrs.pt
+  device: auto                     # cuda > mps > cpu; train on a GPU box, serve on CPU
+  # Split. The unit is a contiguous run of frames from ONE camera on ONE day —
+  # at ingest.frame_interval_seconds = 60 these are minutes, so 30 is a
+  # half-hour block. Cows barely move minute-to-minute, so a per-instance split
+  # would put near-duplicate crops on both sides and score memorisation.
+  block_frames: 30
+  val_fraction: 0.2
+  split_seed: 1337
+  img_size: 224
+  epochs: 40
+  batch_size: 32
+  lr: 0.0003
+  weight_decay: 0.0001
+  patience: 8                      # early-stops on mean macro-F1, not accuracy
+  num_workers: 0
+  seed: 1337
+  # --- the gate ---
+  # Below this P(cow) a detection is flagged not-a-cow. High on purpose:
+  # wrongly dropping a real animal corrupts the count, which is the product,
+  # while keeping a false positive merely fails to improve it.
+  cow_threshold: 0.5
+  # Whether the REST OF THE APP filters on that flag. Scoring always records its
+  # verdict; this decides whether counts, charts, areas and the CSV act on it.
+  # Off by default because turning it on moves every historical count in the
+  # dashboard. Never-scored rows are counted either way, so both this flag AND a
+  # scoring pass have to happen before any number changes.
+  gate_enabled: false
+
 finetune:                          # `cownting train` + `eval-detect`
   dataset_dir: data/finetune/dataset
   runs_dir: runs/finetune
