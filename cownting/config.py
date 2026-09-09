@@ -154,6 +154,31 @@ class BackupCfg(BaseModel):
     milestone_step: int = 500
 
 
+class InstanceAttrsCfg(BaseModel):
+    """M5: the small classifier over instance crops
+    (docs/roadmap/M5_instance_attrs.md).
+
+    Distinct from FinetuneCfg below, which fine-tunes the SEGMENTER on corrected
+    masks via CVAT. This model consumes the Label page's class answers instead,
+    runs on the crop rather than the frame, and predicts attributes rather than
+    geometry.
+    """
+    # Crop geometry is deliberately NOT configured here: it comes from
+    # `annotation` (crop_pad, crop_max_width, mask_timestamp_banner) so training
+    # crops are necessarily the same pixels the annotator judged. A second,
+    # drifting copy of those numbers is the exact bug that arrangement forbids.
+    dataset_dir: str = "data/instance_attrs/dataset"
+    weights: str = "data/models/instance_attrs.pt"
+
+    # Split. The unit is a contiguous run of frames from one camera on one day —
+    # at ingest.frame_interval_seconds = 60 those are minutes, so 30 is a
+    # half-hour block. Instances from adjacent frames are near-duplicates, so a
+    # per-instance split would score memorisation rather than generalisation.
+    block_frames: int = 30
+    val_fraction: float = 0.2
+    split_seed: int = 1337
+
+
 class FinetuneCfg(BaseModel):
     """Stage 1b: YOLO11-seg fine-tune on the corrected masks."""
     dataset_dir: str = "data/finetune/dataset"    # generated YOLO-seg dataset root
@@ -212,6 +237,7 @@ class Config(BaseModel):
     label: LabelCfg = Field(default_factory=LabelCfg)
     annotation: AnnotationCfg = Field(default_factory=AnnotationCfg)
     backup: BackupCfg = Field(default_factory=BackupCfg)
+    instance_attrs: InstanceAttrsCfg = Field(default_factory=InstanceAttrsCfg)
     finetune: FinetuneCfg = Field(default_factory=FinetuneCfg)
     flags: FlagsCfg = Field(default_factory=FlagsCfg)
     paths: PathsCfg = Field(default_factory=PathsCfg)

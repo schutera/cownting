@@ -358,6 +358,56 @@ def user_delete(username: str, config: str = CONFIG_OPT):
     typer.secho(f"deleted {username!r}.", fg=typer.colors.GREEN)
 
 
+attrs_app = typer.Typer(
+    help="M5 instance attribute model: build the crop dataset, train, score. "
+         "Consumes the Label page's answers; unrelated to the Stage-1b CVAT loop."
+)
+app.add_typer(attrs_app, name="attrs")
+
+
+@attrs_app.command("build-dataset")
+def attrs_build_dataset(
+    config: str = CONFIG_OPT,
+    out: str = typer.Option(
+        "", "--out", help="Override instance_attrs.dataset_dir for this run."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Re-render crops that are already on disk."
+    ),
+):
+    """Render every labeled instance to a crop and write the manifest.
+
+    Reads data/labels.duckdb and the frame JPEGs; never opens the main DB.
+
+    NOT runnable while the server is up. DuckDB allows one read-write PROCESS
+    per file and `labeling.labels_connect` is read-write by necessity (a
+    read-only open of a store another process holds fails with an error that
+    matches none of db.connect's retry substrings). The server holds the label
+    store, so this is an OFFLINE step: stop the container, or point
+    `paths.labels_db_path` at a copy. Building a training set is occasional work
+    and does not justify the in-process machinery `POST /api/remask` needs.
+    """
+    from .instance_attrs import build_dataset
+
+    cfg = _load(config)
+    s = build_dataset(cfg, out_dir=out or None, force=force)
+    typer.secho(
+        f"{s['instances']} instances -> {s['train']} train / {s['val']} val "
+        f"({s['val_fraction_actual']:.0%} val over {s['blocks']} blocks)",
+        fg=typer.colors.GREEN,
+    )
+    if s["unrendered"]:
+        # Not a failure: a re-ingest rmtrees frames out from under labels that
+        # outlive them, and a crop sitting inside the masked banner is refused
+        # by design rather than served grey.
+        typer.secho(f"{s['unrendered']} instance(s) had no renderable crop.",
+                    fg=typer.colors.YELLOW)
+    for head, splits in s["per_head"].items():
+        tr = ", ".join(f"{c}={n}" for c, n in splits["train"].items())
+        va = ", ".join(f"{c}={n}" for c, n in splits["val"].items())
+        typer.echo(f"  {head}:\n    train  {tr}\n    val    {va}")
+
+
 labels_app = typer.Typer(
     help="In-app annotation store (Label page): backup, export, status, reconcile. "
          "Unrelated to the Stage-1b label-select/label-export CVAT loop."
