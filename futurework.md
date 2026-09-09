@@ -78,6 +78,40 @@ Since Cownting is calibration-free, the shade map lives in **image space** too �
 compute shadow footprints per camera (segmented or geometric) and test cow ground
 points against them, exactly like the panel footprints.
 
+### Stop serving unjudgeable crops
+
+**Status:** open. Blocks nothing, but it is the cheapest available quality win on
+the annotation corpus and [M5](docs/roadmap/M5_instance_attrs.md) is waiting on
+it.
+
+**The symptom.** Annotators are spending their time on crops nobody could
+answer. As of 2026-09-09, against 543 labeled instances:
+
+- `low_resolution` is the flag raised **556 times** — more than every other flag
+  combined (`multiple_cows` 23, `occluded` 7, `no_cow` 4, `other` 1, `bad_crop`
+  1). Alexandra alone flagged 571 instances against 412 she could answer, so
+  more than half of what the queue handed her was unanswerable.
+- `not_visible` — "too little of the body is visible" — is **136** of the sun
+  answers and **64** of the behaviour answers.
+
+**Target: `not_visible` below 10% of answers on each question.** That is the
+number to hold the fix to.
+
+**Approach.** The queue does not currently ask whether an instance is *worth*
+asking about. It should refuse to serve a detection whose crop cannot carry an
+answer, using signals already sitting on the row — `area_px` above all, and the
+bbox's short side in source pixels before `crop_max_width` upscales it into a
+convincing-looking but information-free tile. A floor on apparent size, tuned
+against the `low_resolution` flags already collected (they are, conveniently, a
+labeled dataset for exactly this decision), is the whole change. `skip_retire`
+already removes an instance after 3 flags; this stops it being served a first
+time.
+
+**Why it matters beyond annotator hours.** Every unjudgeable crop that reaches
+the queue costs an answer slot *and* teaches M5's classifier that `not_visible`
+is a common outcome. Fixing the sampling changes that head's class balance, so
+M5 gets retrained after this ships — retrained, not redesigned.
+
 ---
 
 ## Deferred (not current priorities)
