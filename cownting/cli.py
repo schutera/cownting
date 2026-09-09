@@ -408,6 +408,31 @@ def attrs_build_dataset(
         typer.echo(f"  {head}:\n    train  {tr}\n    val    {va}")
 
 
+@attrs_app.command("train")
+def attrs_train(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(
+        "", "--dataset", help="Override instance_attrs.dataset_dir for this run."
+    ),
+    out: str = typer.Option(
+        "", "--out", help="Override instance_attrs.weights (where the checkpoint lands)."
+    ),
+):
+    """Fine-tune the multi-head crop classifier and print the val report.
+
+    Reads only the built dataset directory — no database at all — so it is the
+    one step that can run anywhere, including a GPU box that has never seen the
+    corpus. The checkpoint is self-describing (heads, class order, crop
+    geometry), so scoring needs nothing but the file.
+    """
+    from .instance_attrs.train import train as _train, format_report
+
+    cfg = _load(config)
+    m = _train(cfg, dataset_dir=dataset or None, out=out or None)
+    typer.echo(format_report(m))
+    typer.secho(f"\nwrote {m['weights']} (rev {m['rev']})", fg=typer.colors.GREEN)
+
+
 labels_app = typer.Typer(
     help="In-app annotation store (Label page): backup, export, status, reconcile. "
          "Unrelated to the Stage-1b label-select/label-export CVAT loop."

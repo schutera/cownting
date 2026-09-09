@@ -178,6 +178,32 @@ class InstanceAttrsCfg(BaseModel):
     val_fraction: float = 0.2
     split_seed: int = 1337
 
+    # Training. `device: auto` resolves cuda > mps > cpu through the same
+    # `resolve_device` the detector uses, so the same config trains on the GPU
+    # box and scores on this CPU-only one.
+    device: str = "auto"
+    img_size: int = 224            # what the ImageNet backbone was trained at
+    epochs: int = 40
+    batch_size: int = 32
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    # Stop when mean macro-F1 across heads has not improved for this many
+    # epochs. Macro rather than accuracy because the classes that matter here
+    # are the rare ones — a gate that never predicts `not_cow` scores 89%
+    # accuracy and is useless.
+    patience: int = 8
+    num_workers: int = 0           # 628 crops; a worker pool costs more than it saves
+    seed: int = 1337
+
+    # Serving. Below this P(cow) a detection is flagged not-a-cow. Deliberately
+    # high: wrongly dropping a real animal corrupts the count, which is the
+    # product, while keeping a false positive merely fails to improve it.
+    cow_threshold: float = 0.5
+    # Master switch for the gate's EFFECT. Scoring always writes its verdict;
+    # this decides whether the rest of the app filters on it. Off by default
+    # because turning it on moves every historical count in the dashboard.
+    gate_enabled: bool = False
+
 
 class FinetuneCfg(BaseModel):
     """Stage 1b: YOLO11-seg fine-tune on the corrected masks."""
