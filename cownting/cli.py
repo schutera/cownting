@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import typer
 
+from . import db
 from .config import Config
 
 app = typer.Typer(add_completion=False, help="Offline cow / solar-field analysis pipeline.")
@@ -27,7 +28,13 @@ CONFIG_OPT = typer.Option("config/cownting.yaml", "--config", "-c", help="Path t
 
 
 def _load(config_path: str) -> Config:
-    return Config.load(config_path)
+    cfg = Config.load(config_path)
+    # Every CLI command funnels through here, which makes it the one place the
+    # gate policy can be applied without each command remembering to. Without
+    # it, a CSV exported from the CLI would disagree with the same export from
+    # the API about how many detections exist.
+    db.set_gate(cfg.instance_attrs.gate_enabled)
+    return cfg
 
 
 @app.command("init-db")

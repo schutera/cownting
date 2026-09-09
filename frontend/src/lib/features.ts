@@ -49,6 +49,50 @@ export const FEATURES: FeatureDef[] = [
     colorFor: (value) =>
       value === "shade" ? SHELTER_COLOR : value === "sun" ? OPEN_COLOR : CHART_MUTED,
   },
+  // --- M5: the crop classifier's judgements (docs/roadmap/M5_instance_attrs.md).
+  //
+  // `dropUnknown` is deliberately OFF on all three, unlike Posture/Shade above.
+  // Their unknown bucket is 'unscored', which is not a missing value but a
+  // statement about coverage: scoring is resumable and yields to uploads, so a
+  // half-scored corpus is an ordinary state. Hiding those rows would leave a
+  // pivot whose total silently disagrees with every other total on the page.
+  {
+    key: "sun",
+    label: "Sun exposure",
+    kind: "categorical",
+    colorFor: (value) =>
+      value === "shaded"
+        ? SHELTER_COLOR
+        : value === "direct_sun"
+          ? OPEN_COLOR
+          : CHART_MUTED,
+  },
+  {
+    key: "behaviour",
+    label: "Behaviour",
+    kind: "categorical",
+    // Shares Posture's colours where the classes mean the same thing, so the
+    // learned behaviour and the geometric posture read as comparable when
+    // pivoted against each other — which is exactly the comparison worth making
+    // while the elongation proxy is still in place.
+    colorFor: (value) =>
+      value === "standing"
+        ? ACTIVE_COLOR
+        : value === "lying"
+          ? REST_COLOR
+          : value === "feeding"
+            ? ACCENT_COLORS[0]
+            : value === "head_probing"
+              ? ACCENT_COLORS[1]
+              : CHART_MUTED,
+  },
+  {
+    key: "cow_gate",
+    label: "Cow gate",
+    kind: "categorical",
+    colorFor: (value) =>
+      value === "cow" ? ACTIVE_COLOR : value === "not a cow" ? REST_COLOR : CHART_MUTED,
+  },
   {
     key: "region",
     label: "Count area",

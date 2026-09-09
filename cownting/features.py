@@ -38,6 +38,37 @@ FEATURES: dict[str, FeatureSpec] = {
         "CASE WHEN d.in_shade THEN 'shade' "
         "WHEN d.in_shade = false THEN 'sun' ELSE 'unknown' END",
         "categorical", False, ("shade", "sun", "unknown"), "in_shade"),
+    # --- M5: what the crop classifier saw (docs/roadmap/M5_instance_attrs.md) ---
+    # `sun` is NOT the `shade` entry above. That one reads `in_shade`, which is
+    # M2's geometric-shadow column and has never been populated; overloading it
+    # would leave a pivot unable to say whether it was showing a computed shadow
+    # or a learned judgement. Two columns, two provenances, two features.
+    #
+    # 'unscored' is a real bucket rather than a dropped row: with scoring resumable
+    # and yielding to uploads, a partially-scored corpus is an ordinary state, and
+    # a pivot that silently omitted those rows would show a total that disagrees
+    # with every other total on the page.
+    "sun": FeatureSpec(
+        "sun",
+        "CASE WHEN d.attr_sun IS NULL THEN 'unscored' "
+        "ELSE replace(d.attr_sun, 'sun_exposure.', '') END",
+        "categorical", False,
+        ("shaded", "direct_sun", "not_visible", "unscored"), "attr_sun"),
+    "behaviour": FeatureSpec(
+        "behaviour",
+        "CASE WHEN d.attr_behaviour IS NULL THEN 'unscored' "
+        "ELSE replace(d.attr_behaviour, 'behaviour.', '') END",
+        "categorical", False,
+        ("feeding", "lying", "standing", "head_probing", "not_visible", "unscored"),
+        "attr_behaviour"),
+    # The gate's own verdict, pivotable so an operator can SEE what it is
+    # removing before turning `gate_enabled` on — and can cross it against camera
+    # or hour to find where the segmenter hallucinates.
+    "cow_gate": FeatureSpec(
+        "cow_gate",
+        "CASE WHEN d.attr_is_cow IS NULL THEN 'unscored' "
+        "WHEN d.attr_is_cow THEN 'cow' ELSE 'not a cow' END",
+        "categorical", False, ("cow", "not a cow", "unscored"), "attr_is_cow"),
     "region": FeatureSpec(
         "region", "d.region_id", "categorical", False, None, "region_id", drop_null=True),
     "camera": FeatureSpec(

@@ -383,6 +383,11 @@ def create_app(config: Config) -> FastAPI:
     # contention. Started unconditionally: `backup.enabled` is read on every
     # tick, and its 120 s first tick outlives any test run, so the ~20 apps the
     # test suite builds never fire a backup or hold a file handle.
+    # The false-positive gate is a deployment-wide policy, so it is set ONCE
+    # here rather than threaded through every db.py counting helper — see
+    # db.gate_clause for why a per-call argument would eventually be forgotten by
+    # one query and leave two surfaces of the same page disagreeing.
+    db.set_gate(config.instance_attrs.gate_enabled)
     labels_backup.start_scheduler(config)
     if auth_on:
         # Users live in the same DuckDB; guarantee one admin so a fresh install

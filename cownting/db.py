@@ -51,6 +51,49 @@ DET_COLS = [
 ]
 
 
+# --------------------------------------------------------------------- the gate
+#
+# M5's false-positive gate, as ONE predicate that every counting query pastes in.
+# Module state rather than a threaded argument, and that is a deliberate trade:
+# there are a dozen read paths that count detections, and a parameter every one of
+# them has to remember to pass is a parameter one of them will eventually forget —
+# leaving two surfaces of the same dashboard disagreeing about how many cows there
+# were, which is the one failure this feature must not introduce. The gate is a
+# deployment-wide policy, set once at boot from config, so it has no business
+# varying per call.
+#
+# Off unless `instance_attrs.gate_enabled`, and even then `coalesce(..., TRUE)`
+# keeps NULL — "never scored" — counted. So enabling the flag on a corpus nobody
+# has scored changes nothing, and scoring a corpus with the flag off changes
+# nothing; both halves have to be deliberate before a single number moves.
+_GATE_ENABLED = False
+
+
+def set_gate(enabled: bool) -> None:
+    """Set the deployment-wide gate policy. Called from `create_app` and the CLI."""
+    global _GATE_ENABLED
+    _GATE_ENABLED = bool(enabled)
+
+
+def gate_enabled() -> bool:
+    return _GATE_ENABLED
+
+
+def gate_clause(alias: str = "") -> str:
+    """The predicate, ready to AND into a WHERE — or into a LEFT JOIN's ON.
+
+    WHICH ONE MATTERS. Several of the queries below LEFT JOIN detections onto
+    frames precisely so that a frame with no cows still contributes a zero to the
+    series. Putting this in their WHERE would turn that into an inner join and
+    silently delete every empty frame from the day curve — a different and much
+    worse bug than the one the gate fixes. In those queries it goes in the ON.
+    """
+    if not _GATE_ENABLED:
+        return "1=1"
+    a = f"{alias}." if alias else ""
+    return f"coalesce({a}attr_is_cow, TRUE)"
+
+
 def is_transient_lock_error(exc: Exception) -> bool:
     """True when `exc` is DuckDB's momentary file-handle/lock collision.
 
@@ -556,8 +599,8 @@ def kpi_summary(con, dataset_id: str | None = None) -> dict:
     # `f` filters processed-frame subqueries, `d` filters detection subqueries;
     # each is empty (whole-DB) when dataset_id is None.
     f = " AND dataset_id = ?" if dataset_id is not None else ""
-    d = " WHERE dataset_id = ?" if dataset_id is not None else ""
     dp = " AND dataset_id = ?" if dataset_id is not None else ""
+    g = gate_clause()
     p = [dataset_id] if dataset_id is not None else []
     row = con.execute(
         f"""
@@ -565,10 +608,10 @@ def kpi_summary(con, dataset_id: str | None = None) -> dict:
             (SELECT count(*) FROM frames WHERE processed{f})                 AS frames,
             -- valid = any processed frame
             (SELECT count(*) FROM frames WHERE processed{f})                 AS valid_frames,
-            (SELECT count(*) FROM detections{d})                             AS detections,
-            (SELECT count(*) FROM detections WHERE posture = 'standing'{dp})  AS standing,
-            (SELECT count(*) FROM detections WHERE posture = 'lying'{dp})     AS lying,
-            (SELECT count(*) FROM detections WHERE under_panel{dp})            AS sheltering
+            (SELECT count(*) FROM detections WHERE {g}{dp})                  AS detections,
+            (SELECT count(*) FROM detections WHERE posture = 'standing'{dp} AND {g})  AS standing,
+            (SELECT count(*) FROM detections WHERE posture = 'lying'{dp} AND {g})     AS lying,
+            (SELECT count(*) FROM detections WHERE under_panel{dp} AND {g})            AS sheltering
         """,
         p + p + p + p + p + p,
     ).fetchone()
@@ -612,6 +655,7 @@ def day_series(con, dataset_id: str | None = None, bin_seconds: float = 60.0) ->
     where = "WHERE f.dataset_id = ?" if dataset_id is not None else ""
     params = [dataset_id] if dataset_id is not None else []
     inst = _instant_expr(bin_seconds)
+    gate = gate_clause("d")
     return con.execute(
         f"""
         SELECT {inst} AS instant,
@@ -624,6 +668,7 @@ def day_series(con, dataset_id: str | None = None, bin_seconds: float = 60.0) ->
         FROM frames f
         LEFT JOIN detections d
           ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path
+         AND {gate}
         {where}
         GROUP BY instant ORDER BY instant
         """,
@@ -637,12 +682,14 @@ def timeline_series(con, dataset_id: str | None = None, bin_seconds: float = 60.
     where = "WHERE f.dataset_id = ?" if dataset_id is not None else ""
     params = [dataset_id] if dataset_id is not None else []
     inst = _instant_expr(bin_seconds)
+    gate = gate_clause("d")
     return con.execute(
         f"""
         SELECT {inst} AS instant, min(f.ts) AS ts, count(d.detection_id) AS n
         FROM frames f
         LEFT JOIN detections d
           ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path
+         AND {gate}
         {where}
         GROUP BY instant ORDER BY instant
         """,
@@ -739,6 +786,7 @@ def area_summary(con, dataset_id: str | None = None) -> pd.DataFrame:
     per-area KPI list (cows spotted + standing/lying) on the right rail."""
     where = " AND dataset_id = ?" if dataset_id is not None else ""
     params = [dataset_id] if dataset_id is not None else []
+    gate = gate_clause()
     return con.execute(
         f"""
         SELECT region_id,
@@ -747,7 +795,7 @@ def area_summary(con, dataset_id: str | None = None) -> pd.DataFrame:
                count(*) FILTER (WHERE posture = 'lying')      AS lying,
                count(*) FILTER (WHERE under_panel)            AS sheltering
         FROM detections
-        WHERE region_id IS NOT NULL{where}
+        WHERE region_id IS NOT NULL{where} AND {gate}
         GROUP BY region_id
         ORDER BY total DESC
         """,
@@ -805,6 +853,7 @@ def counts_over_time(con, camera_id: str, trunc: str = "hour", dataset_id: str |
     # trunc is bound as a parameter (never string-interpolated) — it flows from an
     # unauthenticated-ish query string, so f-string interpolation here was a SQLi.
     params = [trunc, camera_id] + ([dataset_id] if dataset_id is not None else [])
+    gate = gate_clause("d")
     return con.execute(
         f"""
         SELECT date_trunc(?, f.ts)               AS t,
@@ -812,7 +861,7 @@ def counts_over_time(con, camera_id: str, trunc: str = "hour", dataset_id: str |
                count(d.detection_id)             AS detections,
                count(d.detection_id) * 1.0 / nullif(count(DISTINCT f.frame_idx), 0) AS cows_per_frame
         FROM frames f
-        LEFT JOIN detections d ON d.frame_path = f.frame_path
+        LEFT JOIN detections d ON d.frame_path = f.frame_path AND {gate}
         WHERE f.camera_id = ? AND f.processed{where}
         GROUP BY 1 ORDER BY 1
         """,
@@ -828,7 +877,7 @@ def shelter_over_time(con, camera_id: str | None, trunc: str = "hour", dataset_i
                count(*)                                 AS detections
         FROM detections
     """
-    clauses, params = [], [trunc]  # trunc bound first (SELECT ? precedes WHERE ?s)
+    clauses, params = [gate_clause()], [trunc]  # trunc bound first (SELECT ? precedes WHERE ?s)
     if camera_id is not None:
         clauses.append("camera_id = ?")
         params.append(camera_id)
@@ -870,12 +919,13 @@ def area_counts_over_time(con, camera: str | None = None, trunc: str = "hour", d
 def posture_over_time(con, camera_id: str, trunc: str = "hour", dataset_id: str | None = None) -> pd.DataFrame:
     where = " AND dataset_id = ?" if dataset_id is not None else ""
     params = [trunc, camera_id] + ([dataset_id] if dataset_id is not None else [])
+    gate = gate_clause()
     return con.execute(
         f"""
         SELECT date_trunc(?, ts) AS t,
                coalesce(posture, 'unknown') AS posture,
                count(*) AS n
-        FROM detections WHERE camera_id = ?{where}
+        FROM detections WHERE camera_id = ?{where} AND {gate}
         GROUP BY 1, 2 ORDER BY 1
         """,
         params,
@@ -912,7 +962,8 @@ def export_df(con, dataset_id: str | None = None) -> pd.DataFrame:
     one dataset when given, whole-DB when None. The frame join is against a
     DISTINCT subquery so duplicate frame rows (pre-idempotency ingest) can't fan
     out the detection rows."""
-    where = " WHERE d.dataset_id = ?" if dataset_id is not None else ""
+    where = (" WHERE d.dataset_id = ? AND " if dataset_id is not None else " WHERE ") \
+        + gate_clause("d")
     params = [dataset_id] if dataset_id is not None else []
     return con.execute(
         f"""
@@ -921,7 +972,15 @@ def export_df(con, dataset_id: str | None = None) -> pd.DataFrame:
                d.bbox_x1, d.bbox_y1, d.bbox_x2, d.bbox_y2,
                d.area_px, d.ground_px_x, d.ground_px_y,
                d.posture, d.region_id, d.under_panel, d.panel_id, d.in_shade,
-               d.track_id, d.global_id, d.motion, d.near_infra, d.cluster_size
+               d.track_id, d.global_id, d.motion, d.near_infra, d.cluster_size,
+               -- M5 predictions. Named `attr_*` in the CSV exactly as in the
+               -- table, so a reader who finds a column here can grep it in the
+               -- schema; and every one carries its probability beside it,
+               -- because a class without its confidence invites a downstream
+               -- analysis that treats a 0.34 guess as a fact.
+               d.attr_is_cow, d.attr_cow_p,
+               d.attr_sun, d.attr_sun_p,
+               d.attr_behaviour, d.attr_behaviour_p, d.attr_model_rev
         FROM detections d
         LEFT JOIN (SELECT DISTINCT dataset_id, camera_id, frame_path, frame_idx FROM frames) f
           ON d.dataset_id IS NOT DISTINCT FROM f.dataset_id
@@ -979,7 +1038,7 @@ def crosstab(con, primary: str, breakdown: str | None = None, *,
     if needs_frames:
         sql += " LEFT JOIN frames f ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path"
 
-    clauses, params = ["1=1"], []
+    clauses, params = [gate_clause("d")], []
     for spec in (p, b):
         if spec is not None and spec.drop_null:
             clauses.append(f"{spec.sql} IS NOT NULL")
