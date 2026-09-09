@@ -1116,6 +1116,46 @@ def create_app(config: Config) -> FastAPI:
                                            camera_id=camera, limit=limit)
         return uploads_mod.job_dict(job)
 
+    @app.post("/api/attrs/score", dependencies=[Depends(require_poweruser)])
+    def attrs_score(dataset: str | None = None, camera: str | None = None,
+                    limit: int | None = None, rescore: bool = False):
+        """Run the M5 attribute model over `detections` and store its verdicts.
+
+        In-process for the same hard reason as /api/remask: DuckDB allows one
+        read-write process per file, the server holds it, and a CLI pass against
+        a live deployment takes the site off the air rather than merely slowing
+        it. Returns the job immediately; progress rides `GET /api/uploads` like
+        every other job.
+
+        `rescore` re-scores rows already carrying the current model's rev. The
+        default skips them, which is what makes an interrupted pass resumable
+        and a repeated call free.
+        """
+        job = uploads_mod.start_attrs_score_job(config, dataset_id=dataset,
+                                                camera_id=camera, limit=limit,
+                                                rescore=rescore)
+        return uploads_mod.job_dict(job)
+
+    @app.get("/api/attrs/status")
+    def attrs_status(dataset: str | None = None):
+        """How much of the corpus is scored, and what the gate is doing to it.
+
+        Exists so the gate's effect is a number somebody can look at rather than
+        counts that quietly moved. Ungated (not poweruser-only) because the
+        dashboard reads it to caption its own figures.
+        """
+        from .instance_attrs import infer as infer_mod
+
+        c = con()
+        try:
+            cov = infer_mod.coverage(c, dataset_id=dataset)
+        finally:
+            c.close()
+        cfg = config.instance_attrs
+        return {**cov, "gate_enabled": cfg.gate_enabled,
+                "cow_threshold": cfg.cow_threshold,
+                "weights_present": Path(cfg.weights).exists()}
+
     # ------------------------------------------------------------------ uploads
     @app.post("/api/uploads", dependencies=[Depends(require_poweruser)])
     def create_upload(

@@ -383,6 +383,76 @@ def _run_remask(job: Job, base: Config, dataset_id: str | None,
         _update(job, status="failed", error=str(e), message=f"Failed: {e}")
 
 
+def start_attrs_score_job(base: Config, dataset_id: str | None = None,
+                          camera_id: str | None = None, limit: int | None = None,
+                          rescore: bool = False) -> Job:
+    """Queue the M5 attribute-scoring pass and return immediately.
+
+    Same in-process rule as `start_remask_job`, for the same reason: DuckDB
+    allows one read-write PROCESS per file and the server holds it, so
+    `cownting attrs score` against a live deployment does not slow the site down
+    — it takes it off the air until the pass ends. In here the handle is ours.
+
+    Cheaper than remask (a MobileNet forward beats a segmentation pass by orders
+    of magnitude) but still a whole-corpus walk over 7,261 frames on a CPU-only
+    box, so it shares remask's manners: it yields to a waiting upload and
+    re-queues itself, and the pass is resumable because scored rows carry the
+    model rev that scored them.
+    """
+    scope = dataset_id or "all days"
+    job = Job(job_id=uuid.uuid4().hex, dataset_id=dataset_id or "",
+              label=f"Attributes · {scope}", kind="attrs_score")
+    with _LOCK:
+        _JOBS[job.job_id] = job
+        _persist(force=True)
+    _enqueue(_run_attrs_score, job, base, dataset_id, camera_id, limit, rescore)
+    return job
+
+
+def _run_attrs_score(job: Job, base: Config, dataset_id: str | None,
+                     camera_id: str | None, limit: int | None, rescore: bool) -> None:
+    from .instance_attrs.infer import run_score
+
+    try:
+        _update(job, status="running", stage="scoring", progress=0.02,
+                message="Loading the attribute model…")
+
+        def on_frame(done: int, total: int) -> None:
+            frac = done / total if total else 1.0
+            _update(job, progress=0.02 + 0.96 * frac,
+                    message=f"Scoring crops… frame {done}/{total}")
+
+        stats = run_score(base, dataset_id=dataset_id, camera_id=camera_id,
+                          limit=limit, rescore=rescore, progress=on_frame,
+                          should_stop=_upload_waiting)
+
+        if stats["frames"] < stats["frames_total"]:
+            # Stepped aside for an upload. Nothing is lost: pending_frames only
+            # returns frames not already carrying this rev, so resuming
+            # continues rather than restarts.
+            _update(job, status="queued", stage="queued",
+                    message=(f"Paused for an upload — {stats['scored']} detections "
+                             "scored so far; resumes when the day is processed."))
+            _enqueue(_run_attrs_score, job, base, dataset_id, camera_id, limit, rescore)
+            return
+
+        msg = (f"Scored {stats['scored']} detections across {stats['frames']} frames; "
+               f"{stats['gated_out']} judged not-a-cow at p<{stats['cow_threshold']}.")
+        if stats["unreadable"]:
+            msg += f" {stats['unreadable']} crop(s) were unreadable and stay unscored."
+        if stats["geometry_mismatch"]:
+            # Not a failure, but nothing else would ever mention it: the model is
+            # being served pixels cut differently from the ones it trained on,
+            # which costs accuracy silently.
+            msg += (" CROP GEOMETRY DIFFERS from training "
+                    f"({stats['geometry_mismatch']}) — accuracy will be below the "
+                    "reported validation figures.")
+        _update(job, status="done", stage="done", progress=1.0,
+                detections=stats["scored"], frames=stats["frames"], message=msg)
+    except Exception as e:  # noqa: BLE001 — surface it in the UI, never kill the worker
+        _update(job, status="failed", error=str(e), message=f"Failed: {e}")
+
+
 def _run_add_camera(
     job: Job, base: Config, dataset_id: str, camera_id: str,
     video_path: str, start_iso: str,

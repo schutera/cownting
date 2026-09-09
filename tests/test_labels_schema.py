@@ -508,11 +508,26 @@ def test_mask_columns_are_last_so_the_archive_stays_aligned():
         cols = [r[0] for r in con.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'detections' ORDER BY ordinal_position").fetchall()]
-        check("mask_poly/mask_parts are the LAST two columns of detections",
-              cols[-2:] == ["mask_poly", "mask_parts"], str(cols[-3:]))
-        check("...and the last two of DET_COLS, which drives every named insert",
-              list(db.DET_COLS)[-2:] == ["mask_poly", "mask_parts"],
-              str(list(db.DET_COLS)[-3:]))
+        # The invariant is "whatever was added most recently sits at the tail",
+        # not "mask_poly is last" — M5 appended the attr_* columns behind it.
+        # What must never happen is a column landing mid-list.
+        tail = ["attr_is_cow", "attr_cow_p", "attr_sun", "attr_sun_p",
+                "attr_behaviour", "attr_behaviour_p", "attr_model_rev"]
+        check("the most recently added columns are LAST in detections",
+              cols[-len(tail):] == tail, str(cols[-len(tail) - 2:]))
+        check("...and last in DET_COLS, which drives every named insert",
+              list(db.DET_COLS)[-len(tail):] == tail, str(list(db.DET_COLS)[-len(tail) - 2:]))
+        check("the outline columns still sit directly ahead of them",
+              cols[-len(tail) - 2:-len(tail)] == ["mask_poly", "mask_parts"],
+              str(cols[-len(tail) - 2:]))
+        # The property all of the above exists to protect, asserted directly:
+        # clip_camera inserts DET_COLS into clipped_detections by name, so every
+        # one of them has to exist there too or the first clip raises.
+        clipped = [r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'clipped_detections'").fetchall()]
+        missing = [c for c in db.DET_COLS if c not in clipped]
+        check("clipped_detections carries every DET_COLS column", not missing, str(missing))
         con.close()
 
 

@@ -433,6 +433,40 @@ def attrs_train(
     typer.secho(f"\nwrote {m['weights']} (rev {m['rev']})", fg=typer.colors.GREEN)
 
 
+@attrs_app.command("score")
+def attrs_score(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option("", "--dataset", help="Limit to one data-package."),
+    camera: str = typer.Option("", "--camera", help="Limit to one camera."),
+    limit: int = typer.Option(0, "--limit", help="Stop after N frames (0 = all)."),
+    rescore: bool = typer.Option(
+        False, "--rescore", help="Re-score rows already carrying this model's rev."
+    ),
+):
+    """Score `detections` with the trained model and write the verdicts.
+
+    OFFLINE ONLY — use `POST /api/attrs/score` on a live deployment. This holds
+    a DuckDB write handle for the whole pass, and DuckDB allows one read-write
+    process per file, so running it against a running server does not slow the
+    site down: it takes it off the air until the pass finishes.
+    """
+    from .instance_attrs.infer import run_score
+
+    cfg = _load(config)
+    s = run_score(cfg, dataset_id=dataset or None, camera_id=camera or None,
+                  limit=limit or None, rescore=rescore)
+    typer.secho(
+        f"scored {s['scored']} detections over {s['frames']}/{s['frames_total']} frames "
+        f"on {s['device']} (rev {s['rev']})", fg=typer.colors.GREEN)
+    typer.echo(f"  {s['gated_out']} judged not-a-cow at p<{s['cow_threshold']}")
+    if s["unreadable"]:
+        typer.secho(f"  {s['unreadable']} unreadable crop(s) stay unscored",
+                    fg=typer.colors.YELLOW)
+    if s["geometry_mismatch"]:
+        typer.secho(f"  CROP GEOMETRY DIFFERS from training: {s['geometry_mismatch']}",
+                    fg=typer.colors.RED)
+
+
 labels_app = typer.Typer(
     help="In-app annotation store (Label page): backup, export, status, reconcile. "
          "Unrelated to the Stage-1b label-select/label-export CVAT loop."

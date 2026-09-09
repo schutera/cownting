@@ -37,6 +37,17 @@ DET_COLS = [
     # every column one slot over into the archive, which is the only copy of a
     # deleted day.
     "mask_poly", "mask_parts",
+    # --- M5 instance attributes (docs/roadmap/M5_instance_attrs.md) ---
+    # Same append-at-the-tail rule as the outline above, for the same archive
+    # reason. In DET_COLS rather than written only by UPDATE because
+    # `clip_camera` -> `restore_clip` round-trips through `clipped_detections`
+    # on exactly this list: leave them out and clipping a camera silently NULLs
+    # a whole scoring pass, which is the failure the mask columns' comment
+    # above already warns about. `insert_detections` fills anything absent with
+    # NULL, so the ingest path needs no change — a fresh detection is simply
+    # unscored until a pass reaches it.
+    "attr_is_cow", "attr_cow_p", "attr_sun", "attr_sun_p",
+    "attr_behaviour", "attr_behaviour_p", "attr_model_rev",
 ]
 
 
@@ -152,7 +163,15 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
             -- disconnected pieces the mask had, so a fragmented outline is
             -- visible to a reviewer as a plausible cause rather than a silently
             -- truncated shape. NEW COLUMNS GO AT THE TAIL — see DET_COLS.
-            mask_poly   VARCHAR, mask_parts INTEGER
+            mask_poly   VARCHAR, mask_parts INTEGER,
+            -- M5: predicted instance attributes. NULL = never scored, which is
+            -- how every consumer distinguishes "the model says no" from "the
+            -- model has not looked" — the gate's filter coalesces to TRUE so an
+            -- unscored corpus behaves exactly as it did before M5 existed.
+            attr_is_cow BOOLEAN, attr_cow_p DOUBLE,
+            attr_sun VARCHAR, attr_sun_p DOUBLE,
+            attr_behaviour VARCHAR, attr_behaviour_p DOUBLE,
+            attr_model_rev VARCHAR
         );
         """
     )
@@ -175,6 +194,14 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     # fresh archive has it second.
     con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS mask_poly VARCHAR")
     con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS mask_parts INTEGER")
+    # M5 attributes — after the mask ALTERs, matching their position at the tail
+    # of the CREATE TABLE body above, so a long-deployed DB and a fresh archive
+    # keep identical column order for archive_dataset's positional copy.
+    for _col, _type in (("attr_is_cow", "BOOLEAN"), ("attr_cow_p", "DOUBLE"),
+                        ("attr_sun", "VARCHAR"), ("attr_sun_p", "DOUBLE"),
+                        ("attr_behaviour", "VARCHAR"), ("attr_behaviour_p", "DOUBLE"),
+                        ("attr_model_rev", "VARCHAR")):
+        con.execute(f"ALTER TABLE detections ADD COLUMN IF NOT EXISTS {_col} {_type}")
     # Reversible-clip staging: when a camera is clipped to a time window, the
     # out-of-window frames/detections are MOVED here (not deleted) so the clip can be
     # undone. Same columns as the live tables — created AFTER the ALTERs above (CTAS
@@ -200,6 +227,14 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     # boot and every test.
     con.execute("ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS mask_poly VARCHAR")
     con.execute("ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS mask_parts INTEGER")
+    # ...and the same for the M5 attribute columns, for the identical reason:
+    # they are in DET_COLS, so clip_camera's named INSERT names them, and on an
+    # already-deployed DB the CTAS above added nothing.
+    for _col, _type in (("attr_is_cow", "BOOLEAN"), ("attr_cow_p", "DOUBLE"),
+                        ("attr_sun", "VARCHAR"), ("attr_sun_p", "DOUBLE"),
+                        ("attr_behaviour", "VARCHAR"), ("attr_behaviour_p", "DOUBLE"),
+                        ("attr_model_rev", "VARCHAR")):
+        con.execute(f"ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS {_col} {_type}")
 
 
 # --------------------------------------------------------------------------- writes
