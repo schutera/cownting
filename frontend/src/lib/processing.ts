@@ -62,6 +62,10 @@ export function isJobActive(job: UploadJob | undefined | null): boolean {
 }
 
 const POLL_ACTIVE_MS = 2000;
+// Job kinds that are passes over EXISTING footage rather than the processing of
+// one newly-uploaded day. They name a dataset but do not own it.
+const BACKFILL_KINDS = new Set(["remask", "attrs_score"]);
+
 const POLL_IDLE_MS = 20000;
 
 /**
@@ -94,13 +98,17 @@ export function useUploadJobs(): UploadJobs {
         const jobs = await listUploadJobs();
         if (!alive) return;
         const map: Record<string, UploadJob> = {};
-        // Remask jobs are EXCLUDED from the per-dataset map on purpose. The list
-        // is active-first then newest-first, so a backfill naming a day would
-        // otherwise win that day's slot and the dashboard would report "tracing
-        // outlines" as if it were that day's upload — which is how the day's
-        // real progress, and its warnings, would silently disappear.
+        // BACKFILL jobs are EXCLUDED from the per-dataset map on purpose. The
+        // list is active-first then newest-first, so a backfill naming a day
+        // would otherwise win that day's slot and the dashboard would report
+        // "tracing outlines" as if it were that day's upload — which is how the
+        // day's real progress, and its warnings, would silently disappear.
+        //
+        // A SET rather than a literal comparison: this was `kind === "remask"`
+        // until attribute scoring became the second backfill, and the next one
+        // must not have to rediscover this rule by shipping the bug.
         for (const j of jobs) {
-          if (j.kind === "remask") continue;
+          if (j.kind !== undefined && BACKFILL_KINDS.has(j.kind)) continue;
           if (!(j.dataset_id in map)) map[j.dataset_id] = j;
         }
         const active = jobs.filter(isJobActive);

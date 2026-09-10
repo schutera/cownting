@@ -117,7 +117,11 @@ function ModelBusyStrip({ jobs }: { jobs: UploadJob[] }) {
     >
       <span className="w-2 h-2 rounded-full shrink-0 bg-accent animate-pulse" />
       <span className="text-[13px] text-near-black">
-        {lead.kind === "remask" ? "Tracing cow outlines" : "The model is working"}
+        {lead.kind === "remask"
+          ? "Tracing cow outlines"
+          : lead.kind === "attrs_score"
+            ? "Scoring cow crops"
+            : "The model is working"}
         {lead.label ? <span className="text-gray-mid"> · {lead.label}</span> : null}
       </span>
       <span className="text-[12px] text-gray-mid truncate">{lead.message}</span>
