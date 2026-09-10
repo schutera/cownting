@@ -1,4 +1,4 @@
-"""In-app multi-camera upload -> auto-process (ingest -> segment -> localize).
+"""In-app multi-camera upload -> auto-process (ingest -> segment -> localize -> score).
 
 Single-box MVP of the roadmap's upload epic (DU2/DU3): a POST lands one video per
 camera, a background worker runs the offline batch scoped to the new day, and a
@@ -70,7 +70,7 @@ class Job:
     dataset_id: str
     label: str
     status: str = "queued"      # queued | running | done | failed
-    stage: str = "queued"       # queued | ingesting | segmenting | localizing | remasking | done
+    stage: str = "queued"       # queued | ingesting | segmenting | localizing | scoring | remasking | done
     # What this job IS. 'upload' covers both a whole day and an added camera —
     # they differ in scope, not in kind. 'remask' is the outline backfill, which
     # is NOT tied to one day's arrival and must therefore be kept out of the
@@ -453,6 +453,64 @@ def _run_attrs_score(job: Job, base: Config, dataset_id: str | None,
         _update(job, status="failed", error=str(e), message=f"Failed: {e}")
 
 
+def _score_stage(job: Job, cfg: Config, *, dataset_id: str, camera_id: str | None,
+                 base_progress: float) -> list[str]:
+    """Run the M5 attribute model over what was just segmented. Returns warnings.
+
+    A PIPELINE STAGE, not a manual step, and that is the whole point of it being
+    here: segmentation writes its results into `detections` as part of processing
+    a day, so a day that arrives segmented but unscored would be a day whose
+    attribute columns are silently NULL while every other day has them. The
+    backfill route (`POST /api/attrs/score`) exists for footage that predates the
+    model, exactly as `/api/remask` does for outlines — it is the exception, not
+    the normal path.
+
+    NEVER fails the upload. Two independent reasons, and both are ordinary rather
+    than exotic:
+
+      - There may be no checkpoint. The model is optional; a deployment that has
+        never trained one must still be able to ingest footage, so a missing
+        weights file skips the stage silently rather than erroring.
+      - Scoring can fail on its own (a corrupt checkpoint, a torch that will not
+        load) while the day is perfectly usable without it. The day's frames,
+        detections and areas are already written by this point; refusing the
+        whole upload over an attribute column would trade something valuable for
+        something regenerable.
+
+    So a failure becomes a WARNING on the job, which is the same channel the
+    camera-health check already uses for "this landed, but look at it".
+    """
+    # Lazy, like every other torch entry point in this codebase: the upload
+    # module is imported at boot on boxes that will never run the model.
+    from pathlib import Path
+
+    from .instance_attrs.infer import run_score
+
+    weights = Path(cfg.instance_attrs.weights)
+    if not weights.exists():
+        return []
+    try:
+        _update(job, stage="scoring", progress=base_progress,
+                message="Scoring cow crops…")
+
+        def on_frame(done: int, total: int) -> None:
+            frac = done / total if total else 1.0
+            _update(job, progress=base_progress + (0.99 - base_progress) * frac,
+                    message=f"Scoring cow crops… frame {done}/{total}")
+
+        stats = run_score(cfg, dataset_id=dataset_id, camera_id=camera_id,
+                          progress=on_frame)
+        out = []
+        if stats["geometry_mismatch"]:
+            out.append("the attribute model was trained on differently-cut crops "
+                       f"({stats['geometry_mismatch']}), so its accuracy will be "
+                       "below the reported validation figures")
+        return out
+    except Exception as e:  # noqa: BLE001 — the day is already usable; say so and move on
+        return [f"cow-attribute scoring failed ({e}); the day is complete but its "
+                f"attribute columns are empty — re-run POST /api/attrs/score"]
+
+
 def _run_add_camera(
     job: Job, base: Config, dataset_id: str, camera_id: str,
     video_path: str, start_iso: str,
@@ -482,8 +540,13 @@ def _run_add_camera(
                 message="Assigning cows to count areas…")
         run_localize(cfg, dataset_id=dataset_id)
 
+        # Scoped to the camera just added — the rest of the day was scored when
+        # it was uploaded, and re-walking it would cost minutes for nothing.
+        score_warnings = _score_stage(job, cfg, dataset_id=dataset_id,
+                                      camera_id=camera_id, base_progress=0.94)
+
         health = _camera_health(cfg, dataset_id)
-        warnings = _warnings_from(health)
+        warnings = _warnings_from(health) + score_warnings
         mine = next((h for h in health if h["camera_id"] == camera_id), None)
         if mine is not None and not mine["ok"]:
             from .quality import describe
@@ -524,14 +587,17 @@ def _run(
 
         n_det = run_segment(cfg, on_progress=on_seg)
 
-        _update(job, stage="localizing", progress=0.92, detections=n_det,
+        _update(job, stage="localizing", progress=0.90, detections=n_det,
                 message="Assigning cows to count areas…")
         run_localize(cfg, dataset_id=dataset_id)
+
+        score_warnings = _score_stage(job, cfg, dataset_id=dataset_id,
+                                      camera_id=None, base_progress=0.92)
 
         # Advisory post-process quality check: warn (never block) if a camera looks
         # obscured / stopped early / found no cows, so the user can delete + re-upload
         # just that stream from the day's camera manager.
-        warnings = _warnings_from(_camera_health(cfg, dataset_id))
+        warnings = _warnings_from(_camera_health(cfg, dataset_id)) + score_warnings
         if warnings:
             n = len(warnings)
             msg = (f"Upload complete, but {n} camera{'s' if n > 1 else ''} need a look: "
