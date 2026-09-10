@@ -130,6 +130,39 @@ class AnnotationCfg(BaseModel):
     max_banner_fraction: float = 0.6     # above this the crop is refused, not blanked
     max_note_chars: int = 500
 
+    # --- What is worth asking about (futurework: "Stop serving unjudgeable
+    # crops"). Measured on 1,164 served instances, 2026-09-10.
+    #
+    # Only 43.8% of what the queue served produced a SUBSTANTIVE answer. The rest
+    # was 563 `low_resolution` flags plus 54 answers of not_visible/cannot_tell —
+    # the annotator spent the same twenty seconds and nobody learned anything.
+    # P(substantive answer) by the animal's longer side in SOURCE pixels:
+    #
+    #     <25px 13.6%   25-35 26.3%   35-45 29.8%
+    #     45-60 35.1%   60-90 46.4%   90+   76.0%
+    #
+    # `min_instance_px` is a hard floor: below it a crop essentially cannot carry
+    # an answer, and it costs 5% of the pool to stop asking. It is deliberately
+    # LOW rather than set where yield peaks — yield rises monotonically with the
+    # floor (76% at 90px) and the temptation is to cut there, but a corpus of
+    # only near animals teaches the model nothing about distant ones, which are
+    # exactly the ones the detector is worst at. That would buy a clean training
+    # set by making it unrepresentative of the problem.
+    #
+    # `clear_instance_px` instead PRIORITISES: at or above it a crop is
+    # comfortably legible and is served first. Smaller-but-not-hopeless
+    # instances are not banished, they queue behind — and because the pool is
+    # ~40x larger than everything labelled to date, "behind" would mean "never".
+    # Hence `small_share`: that fraction of sub-clear instances is promoted into
+    # the front of the queue anyway, so the corpus keeps learning about distant
+    # animals while most annotator time goes where it pays. Membership is
+    # derived from the instance key, like the deep-overlap subset, so every
+    # annotator agrees on the promoted set with no coordination and two of them
+    # can still pair on the same small instance.
+    min_instance_px: int = 25       # hard floor; never served below this
+    clear_instance_px: int = 60     # at/above -> served first
+    small_share: float = 0.15       # of sub-clear instances, promoted anyway
+
 
 class BackupCfg(BaseModel):
     """Weekly zip of the label store, posted to a Discord webhook.

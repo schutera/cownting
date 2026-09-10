@@ -313,8 +313,12 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
     # The trailing two are the annotator, once for the `mine` anti-join and once
     # for `mymask`. Order matters: these are positional and must match the order
     # the joins appear in the CTE below.
-    params += [threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance,
-               annotator, annotator]
+    # Positional and order-sensitive: clear-tier (2), overlap (1), target CASE
+    # (3), mine (1), mymask (1), then the hard floor (1) — matching the order the
+    # placeholders appear in the SQL below.
+    params += [cfg.clear_instance_px, hex_threshold(cfg.small_share),
+               threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance,
+               annotator, annotator, cfg.min_instance_px]
 
     return (
         f"""
@@ -337,6 +341,21 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
             SELECT k.instance_key, k.dataset_id, k.camera_id, k.frame_path, k.ordinal,
                    k.score, k.bbox_x1, k.bbox_y1, k.bbox_x2, k.bbox_y2,
                    ds.day AS day,
+                   -- The animal's longer side in SOURCE pixels, which is what
+                   -- decides whether a crop can carry an answer: crop_geometry
+                   -- cuts a square of max(bw,bh)*(1+2*pad) and never upscales
+                   -- it (scale = min(1, max_width/n)), so a 20px cow is served
+                   -- as 20px of real information no matter how large the
+                   -- browser draws it.
+                   greatest(k.bbox_x2 - k.bbox_x1, k.bbox_y2 - k.bbox_y1) AS long_side,
+                   -- Front of the queue: comfortably legible, OR a deliberate
+                   -- minority of the smaller ones. Keyed off the instance hash
+                   -- with a FIXED salt (not the annotator's), so the promoted
+                   -- subset is the same for everybody and two annotators can
+                   -- still pair on one small instance — the same trick, and the
+                   -- same reason, as the deep-overlap subset above.
+                   (greatest(k.bbox_x2 - k.bbox_x1, k.bbox_y2 - k.bbox_y1) >= ?
+                    OR substr(md5('sm' || k.instance_key), 1, 4) < ?) AS clear,
                    -- The MODEL's outline. `ranked` is SELECT d.* so it arrives
                    -- here for free, but this projection is explicit, so without
                    -- naming it the column is dropped before _item ever sees it.
@@ -389,6 +408,18 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                        FROM {alias}.v_current_mask_edits
                        WHERE annotator = ? GROUP BY effective_key)
                       mymask ON mymask.effective_key = k.instance_key
+            -- THE HARD FLOOR, and it must live at THIS level rather than in
+            -- `ranked` above. `ranked` may only be filtered on partition columns
+            -- of the ordinal window; `bbox_*` are not, so filtering there would
+            -- renumber `ordinal`, change `instance_key`, and orphan every label
+            -- already written for the rows that shift. Here the ordinal is
+            -- already fixed, so this only removes rows.
+            --
+            -- Applied inside _scan_sql rather than by each caller so `queue` and
+            -- `progress` cannot disagree about what the servable pool is — a
+            -- panel counting down toward instances the queue will never hand out
+            -- never reaches "you're caught up".
+            WHERE greatest(k.bbox_x2 - k.bbox_x1, k.bbox_y2 - k.bbox_y1) >= ?
         )""",
         params,
     )
@@ -459,6 +490,11 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         # second label until the whole pool has been swept once, so every pair
         # feeding the kappa queries would come from the fatigued back half of each
         # session. The WHERE clause already caps coverage at target.
+        #
+        # `NOT s.clear` leads the sort so comfortably-legible crops (and the
+        # promoted minority of smaller ones) come first. It is a stable partition
+        # of the pool, not a per-annotator preference, so it cannot desynchronise
+        # two annotators the way ordering on coverage would.
         day_term = "s.day DESC NULLS LAST, " if order == "fresh" else ""
         params.append(annotator)
         params.append(n)
@@ -466,7 +502,7 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             SELECT s.*, count(*) OVER () AS matching
             FROM scoped s
             WHERE {' AND '.join(where)}
-            ORDER BY {day_term}md5(? || s.instance_key)
+            ORDER BY {day_term}(NOT s.clear), md5(? || s.instance_key)
             LIMIT ?
             """, params)
 

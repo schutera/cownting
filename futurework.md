@@ -120,9 +120,9 @@ it back on screen through the side door.
 
 ### Stop serving unjudgeable crops
 
-**Status:** open. Blocks nothing, but it is the cheapest available quality win on
-the annotation corpus and [M5](docs/roadmap/M5_instance_attrs.md) is waiting on
-it.
+**Status:** the size floor SHIPPED (`annotation.min_instance_px` /
+`clear_instance_px` / `small_share`). What remains open is the second half
+below: using the model's own uncertainty to choose what to ask about.
 
 **The symptom.** Annotators are spending their time on crops nobody could
 answer. As of 2026-09-09, against 543 labeled instances:

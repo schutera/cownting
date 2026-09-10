@@ -78,6 +78,20 @@ annotation:
   # "Cannot tell" answers about nothing, contaminating the statistic we're after.
   max_banner_fraction: 0.6
   max_note_chars: 500              # per-annotation free-text note cap
+  # --- what is worth asking about ---
+  # Measured over 1,164 served instances: only 43.8% produced a substantive
+  # answer. The rest were 563 `low_resolution` flags plus 54 answers of
+  # not_visible/cannot_tell — the same annotator minute, nothing learned.
+  # P(substantive) by the animal's longer side in SOURCE pixels:
+  #   <25px 13.6% | 25-35 26.3% | 35-45 29.8% | 45-60 35.1% | 60-90 46.4% | 90+ 76.0%
+  min_instance_px: 25              # hard floor — never served below this
+  clear_instance_px: 60            # at/above this, served FIRST
+  # Yield keeps climbing as the floor rises (76% at 90px) and it is tempting to
+  # cut there. Don't: a corpus of only near animals teaches the model nothing
+  # about distant ones, which are exactly the ones the detector is worst at. So
+  # smaller-but-not-hopeless crops are deprioritised rather than banned, and this
+  # share of them is promoted into the front of the queue anyway.
+  small_share: 0.15
 
 # --- Weekly off-box backup of the annotation store ---
 # data/labels.duckdb is the only state here a re-ingest cannot rebuild: frames,
