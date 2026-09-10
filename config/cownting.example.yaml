@@ -147,6 +147,14 @@ instance_attrs:
   patience: 8                      # early-stops on mean macro-F1, not accuracy
   num_workers: 0
   seed: 1337
+  # Score newly-uploaded days automatically, as a pipeline stage after localize.
+  # Off by default and independent of the weights file existing: a checkpoint on
+  # the box means somebody was evaluating a model, not that arriving footage
+  # should be scored by it. Gates the AUTOMATIC path only — `POST
+  # /api/attrs/score` is an explicit operator action and works regardless, which
+  # is how you score one day, judge the result, and only then turn this on.
+  score_on_ingest: false
+
   # --- the gate ---
   # Below this P(cow) a detection is flagged not-a-cow. High on purpose:
   # wrongly dropping a real animal corrupts the count, which is the product,

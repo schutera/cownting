@@ -465,6 +465,11 @@ def _score_stage(job: Job, cfg: Config, *, dataset_id: str, camera_id: str | Non
     model, exactly as `/api/remask` does for outlines — it is the exception, not
     the normal path.
 
+    Runs only when `instance_attrs.score_on_ingest` is set. A checkpoint sitting
+    on the box is evidence somebody was EVALUATING a model, not consent for
+    production footage to be scored by it — so the switch is a config line
+    somebody wrote, never the presence of a file somebody copied.
+
     NEVER fails the upload. Two independent reasons, and both are ordinary rather
     than exotic:
 
@@ -486,6 +491,8 @@ def _score_stage(job: Job, cfg: Config, *, dataset_id: str, camera_id: str | Non
 
     from .instance_attrs.infer import run_score
 
+    if not cfg.instance_attrs.score_on_ingest:
+        return []
     weights = Path(cfg.instance_attrs.weights)
     if not weights.exists():
         return []

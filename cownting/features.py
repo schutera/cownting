@@ -61,14 +61,6 @@ FEATURES: dict[str, FeatureSpec] = {
         "categorical", False,
         ("feeding", "lying", "standing", "head_probing", "not_visible", "unscored"),
         "attr_behaviour"),
-    # The gate's own verdict, pivotable so an operator can SEE what it is
-    # removing before turning `gate_enabled` on — and can cross it against camera
-    # or hour to find where the segmenter hallucinates.
-    "cow_gate": FeatureSpec(
-        "cow_gate",
-        "CASE WHEN d.attr_is_cow IS NULL THEN 'unscored' "
-        "WHEN d.attr_is_cow THEN 'cow' ELSE 'not a cow' END",
-        "categorical", False, ("cow", "not a cow", "unscored"), "attr_is_cow"),
     "region": FeatureSpec(
         "region", "d.region_id", "categorical", False, None, "region_id", drop_null=True),
     "camera": FeatureSpec(

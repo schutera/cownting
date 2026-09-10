@@ -195,6 +195,21 @@ class InstanceAttrsCfg(BaseModel):
     num_workers: int = 0           # 628 crops; a worker pool costs more than it saves
     seed: int = 1337
 
+    # Score newly-uploaded days automatically, as a pipeline stage after
+    # localize. OFF by default, and separately from the weights file existing: a
+    # checkpoint sitting on the box is evidence somebody was EVALUATING a model,
+    # not consent for production footage to be scored by it. Presence-as-switch
+    # means copying a file silently turns a pipeline stage on, which is not a
+    # decision anybody made out loud.
+    #
+    # Gates the AUTOMATIC path only. `POST /api/attrs/score` and `cownting attrs
+    # score` are explicit operator actions and work regardless — the same split
+    # as `backup.enabled` (the weekly ticker) versus `POST
+    # /api/labels/backup/run` (a person asking for it now). That is what lets you
+    # score one day, look at the result, and only then decide whether arriving
+    # footage should be scored.
+    score_on_ingest: bool = False
+
     # Serving. Below this P(cow) a detection is flagged not-a-cow. Deliberately
     # high: wrongly dropping a real animal corrupts the count, which is the
     # product, while keeping a false positive merely fails to improve it.

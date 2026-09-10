@@ -1158,6 +1158,7 @@ def create_app(config: Config) -> FastAPI:
             c.close()
         cfg = config.instance_attrs
         return {**cov, "gate_enabled": cfg.gate_enabled,
+                "score_on_ingest": cfg.score_on_ingest,
                 "cow_threshold": cfg.cow_threshold,
                 "weights_present": Path(cfg.weights).exists()}
 

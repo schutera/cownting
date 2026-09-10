@@ -231,6 +231,25 @@ restarts and re-running is free.
 `GET /api/attrs/status` reports how much of the corpus is scored and how many
 detections the gate is currently hiding.
 
+### Rolling it out in stages
+
+The three switches are independent on purpose, so the model can be landed
+without touching a single number anybody looks at, and then let in one step at a
+time:
+
+| | effect |
+|---|---|
+| deploy the code | schema columns appear, all NULL. Nothing else changes. |
+| `POST /api/attrs/score` | predictions get written. Still nothing changes — the gate is off and the new pivots simply gain data. |
+| `score_on_ingest: true` | newly-uploaded days score themselves as part of processing. |
+| `gate_enabled: true` | the counts start excluding what the model rejects. |
+
+The useful order is exactly that: score one day by hand, look at the
+`Sun exposure` and `Behaviour` pivots for it and at `GET /api/attrs/status` for
+what the gate would remove, and only then decide about the other two flags.
+Backing any of them out is a config change and a restart — nothing is destroyed
+at any point.
+
 ### Turning the gate on
 
 Scoring only ever *records* a verdict. Two things must both be true before a
@@ -241,9 +260,15 @@ single number in the dashboard moves:
 
 Never-scored rows are counted regardless (`coalesce(attr_is_cow, TRUE)`), so a
 half-scored corpus is a safe state. **Enabling the gate changes historical
-counts** — every chart that counts detections will move. Look at the `Cow gate`
-pivot in the cross-filter first: it shows exactly what would be removed, broken
-down by camera or hour, while the gate is still off.
+counts** — every chart that counts detections will move. `GET /api/attrs/status`
+reports how many detections it would remove, before you turn it on.
+
+The gate is deliberately NOT a cross-filter dimension. It decides what counts as
+a detection at all, which is not an attribute of a cow the way sun exposure or
+behaviour are — and it could not work as one anyway: the crosstab applies the
+gate predicate like every other counting query, so once `gate_enabled` is true a
+"cow gate" pivot would have its own rejected rows filtered out from under it and
+could only ever show the rows it kept.
 
 To back out, set `gate_enabled: false` and restart. Nothing was deleted; the
 verdicts stay on the rows and the counts return.

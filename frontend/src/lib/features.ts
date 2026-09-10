@@ -87,13 +87,6 @@ export const FEATURES: FeatureDef[] = [
               : CHART_MUTED,
   },
   {
-    key: "cow_gate",
-    label: "Cow gate",
-    kind: "categorical",
-    colorFor: (value) =>
-      value === "cow" ? ACTIVE_COLOR : value === "not a cow" ? REST_COLOR : CHART_MUTED,
-  },
-  {
     key: "region",
     label: "Count area",
     kind: "categorical",

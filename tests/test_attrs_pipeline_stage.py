@@ -50,9 +50,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
             raise AssertionError(line)
 
 
-def _cfg(weights: str) -> Config:
+def _cfg(weights: str, *, on: bool = True) -> Config:
     return Config(cameras=[],
-                  instance_attrs=InstanceAttrsCfg(weights=weights, device="cpu"),
+                  instance_attrs=InstanceAttrsCfg(weights=weights, device="cpu",
+                                                  score_on_ingest=on),
                   paths=PathsCfg())
 
 
@@ -77,6 +78,32 @@ def test_the_stage_is_wired_into_both_processing_paths():
           added.split("_score_stage(")[1][:200])
     check("'scoring' is a declared stage in the job vocabulary",
           "scoring" in inspect.getsource(uploads.Job))
+
+
+def test_the_stage_is_off_unless_asked_for():
+    """A checkpoint on the box is evidence somebody was EVALUATING a model, not
+    consent for production footage to be scored by it. Presence-as-switch means
+    copying a file silently turns a pipeline stage on, which is not a decision
+    anybody made out loud — so the default is off even WITH usable weights."""
+    import inspect
+
+    check("score_on_ingest defaults to off",
+          InstanceAttrsCfg().score_on_ingest is False)
+    with tempfile.TemporaryDirectory() as d:
+        # A file that would RAISE if it were ever loaded, proving the flag is
+        # checked before the weights are touched rather than after.
+        w = os.path.join(d, "would_explode.pt")
+        with open(w, "wb") as f:
+            f.write(b"not a checkpoint")
+        job = _job()
+        out = uploads._score_stage(job, _cfg(w, on=False), dataset_id="d1",
+                                   camera_id=None, base_progress=0.92)
+        check("with the flag off the stage does nothing, quietly",
+              out == [] and job.stage != "scoring", f"{out} {job.stage}")
+    # The explicit routes are deliberately NOT gated on it — that is how you
+    # score one day to evaluate before deciding about arriving footage.
+    check("the manual backfill is not gated by score_on_ingest",
+          "score_on_ingest" not in inspect.getsource(uploads.start_attrs_score_job))
 
 
 def test_no_checkpoint_skips_silently():
@@ -111,6 +138,7 @@ def test_a_broken_checkpoint_warns_instead_of_failing_the_upload():
 def main():
     print("=== test_attrs_pipeline_stage ===")
     test_the_stage_is_wired_into_both_processing_paths()
+    test_the_stage_is_off_unless_asked_for()
     test_no_checkpoint_skips_silently()
     test_a_broken_checkpoint_warns_instead_of_failing_the_upload()
     print("=================================")
