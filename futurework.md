@@ -78,6 +78,46 @@ Since Cownting is calibration-free, the shade map lives in **image space** too �
 compute shadow footprints per camera (segmented or geometric) and test cow ground
 points against them, exactly like the panel footprints.
 
+### Show the classification on the image, not just the mask
+
+**Status:** open. Wanted once [M5](docs/roadmap/M5_instance_attrs.md)'s
+predictions are trusted enough to look at.
+
+The overlay currently says WHERE each animal is. It should also say what the
+model thinks it is — a small sun / cloud beside each instance for sun exposure,
+and the behaviour class beside that.
+
+**Reuse what the taxonomy already has.** `label_classes.icon` holds a name from
+`CLASS_ICONS` (never markup, never an asset path), `ClassIcon.tsx` renders it,
+and the taxonomy editor and the answer tiles both already draw from it. So a
+poweruser who adds a class and picks its icon gets that icon on the overlay for
+free, and the icon on the image is by construction the icon on the tile the
+annotator pressed. Nothing new to invent, and one vocabulary rather than two.
+
+**Draw them client-side as SVG, not burned into the PNG.** There are two overlay
+paths today: `detect/overlay.py` burns masks into an image at segment time, and
+`InstanceCrop.tsx` draws the ring/polygon as SVG over the served pixels. The
+ring's own comment gives the argument for the second: the stroke stays a
+hairline at any rendered size, hiding it costs no network, and a style change
+does not invalidate every cached image. Burning icons in would additionally mean
+that re-scoring a day (a new model rev — routine, see M5) requires re-rendering
+every overlay PNG for it, which turns a cheap DB update into a GPU-less
+re-render of 7,261 frames.
+
+**The trap worth designing around: confidence.** `attr_*_p` sits beside every
+prediction precisely so a 0.47 `standing` is not presentable as a 0.98 `lying`,
+and an icon is the most confident-looking widget available — it reads as a fact.
+Options, cheapest first: don't draw below a threshold; draw it at reduced opacity
+scaled to the probability; or draw it hollow below a threshold and filled above.
+Whatever is chosen, an UNSCORED instance must be visually distinct from a
+confidently-classified one, and both must be distinct from a low-confidence
+guess. Three states, not two.
+
+Note the gate is deliberately absent from this list. A detection the gate
+rejects should simply not be drawn at all when `gate_enabled` — it is not a cow,
+so it has no attributes to display, and giving it an icon of its own would put
+it back on screen through the side door.
+
 ### Stop serving unjudgeable crops
 
 **Status:** open. Blocks nothing, but it is the cheapest available quality win on
@@ -97,15 +137,42 @@ answer. As of 2026-09-09, against 543 labeled instances:
 **Target: `not_visible` below 10% of answers on each question.** That is the
 number to hold the fix to.
 
-**Approach.** The queue does not currently ask whether an instance is *worth*
-asking about. It should refuse to serve a detection whose crop cannot carry an
-answer, using signals already sitting on the row — `area_px` above all, and the
-bbox's short side in source pixels before `crop_max_width` upscales it into a
-convincing-looking but information-free tile. A floor on apparent size, tuned
-against the `low_resolution` flags already collected (they are, conveniently, a
-labeled dataset for exactly this decision), is the whole change. `skip_retire`
-already removes an instance after 3 flags; this stops it being served a first
-time.
+**What the queue does today.** Nothing clever, deliberately:
+`ORDER BY md5(annotator || instance_key)` — a stable pseudo-random permutation,
+per annotator, over every instance not yet at its coverage target. Two
+annotators therefore walk the same pool in different orders and meet in the
+middle instead of racing down one list. It is uniform sampling and it is honest,
+but it means the queue never asks whether an instance is *worth* asking about,
+and it is why the class balance is what it is (feeding 161, head_probing 12).
+
+**Approach.** Refuse to serve a detection whose crop cannot carry an answer,
+using signals already on the row — `area_px` above all, and the bbox's short side
+in SOURCE pixels, before `crop_max_width` upscales it into a convincing-looking
+but information-free tile. Tune the floor against the `low_resolution` flags
+already collected; they are, conveniently, a labeled dataset for exactly this
+decision. `skip_retire` already retires an instance after 3 flags — this stops
+it being served a first time.
+
+> **Implementation hazard, and it is a silent one.** The size floor must go in
+> the OUTER filter (on `scoped`), never in `_scan_sql`'s innermost CTE. That CTE
+> may only filter on *partition* columns of the ordinal window — `dataset_id`,
+> `camera_id`, `frame_path` — because those drop whole partitions and cannot
+> renumber the survivors. `area_px` and `score` are not partition columns:
+> filtering on them there renumbers `ordinal`, which changes `instance_key`,
+> which orphans every label already written for the rows that shift.
+> `labeling._scan_sql`'s docstring says this; it is repeated here because this
+> is the change most likely to reach for that spot.
+
+**Now that a model exists, there is a second, larger version of this.** M5 scores
+every detection, so the queue could prioritise instances the model is UNSURE
+about (`attr_*_p` near the decision boundary) or where it predicts a starved
+class — turning annotation into active learning rather than uniform sampling.
+That is a bigger change and it carries its own bias: a corpus selected by model
+uncertainty is no longer a random sample, so it can sharpen the model while
+making the label store useless as a measure of what the herd actually does. If
+it is built, the uniformly-sampled slice has to be kept and marked, or the
+agreement statistics and any prevalence estimate quietly stop meaning what they
+say.
 
 **Why it matters beyond annotator hours.** Every unjudgeable crop that reaches
 the queue costs an answer slot *and* teaches M5's classifier that `not_visible`
