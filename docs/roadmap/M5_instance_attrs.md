@@ -191,7 +191,58 @@ each frame six times over. One decode, all its crops, one batch.
 Each step is independently green and independently useful: step 2 produces an
 inspectable dataset whether or not step 3 ever trains well.
 
-## 9. Known risks
+## 9. The recipe, and how it was chosen (2026-09-16/17)
+
+Everything in `InstanceAttrsCfg`'s recipe block was decided by `cownting attrs
+cv` — 5-fold grouped CV over the 2,381-instance corpus of 2026-09-16 — and that
+harness is what should decide any future change. The reason it exists: a single
+train/val split's fold-to-fold spread is **±0.014** pooled and its rerun noise
+(same seed, cuDNN) **±0.005**, so a 0.01 gain on one split is indistinguishable
+from nothing. The 2026-09-16 retrain showed the failure mode exactly — 3.8x the
+labels, headline flat, because 16 val examples of `head_probing` masked a real
+gain on every other class.
+
+Pooled mean macro-F1, baseline 0.773–0.778 (mobilenet_v3_small, no augmentation):
+
+| change | pooled | verdict |
+|---|---|---|
+| tempered class weights (power 0.5) | 0.774 | no effect |
+| + label smoothing, EMA, warmup, 5x head LR | 0.778 | no effect on the mean; gate fold spread ±0.015 → ±0.006 |
+| + rotation 10°, erasing 0.25, blur 0.25 | **0.788** | +0.010, all three heads up, 25–60px gate F1 0.77 → 0.81 |
+| size reweighting toward production's mix | 0.776 | **hurt** — gate 0.948 → 0.937, 25–60px gate 0.77 → 0.72 |
+| longer schedule (50/10 vs 30/6) | 0.786 | neutral |
+| trunk: mobilenet_v3_large / efficientnet_b0 / resnet18 (baseline recipe) | 0.780 / 0.792 / 0.792 | behaviour 0.54 → 0.59 |
+| **efficientnet_b0 + full recipe** | **0.801 ± 0.009** | wins every fold vs baseline |
+| **resnet18 + full recipe** | **0.798 ± 0.007** | tie with B0; 36.5 vs 43.5 ms/crop on the box's CPU |
+
+ResNet18 ships: the two trunks tie within rerun noise on the headline and on
+the 25–60px gate, and it is the faster of the two on the serving box (depthwise
+convolutions are memory-bound on CPU; the GFLOPs ordering is not the wall-clock
+ordering). Behaviour per class, pooled over all 1,943 labelled instances,
+baseline → shipped: feeding 0.72 → 0.81, lying 0.91 → 0.97, standing 0.55 →
+0.69, not_visible 0.42 → 0.40, head_probing 0.09 → 0.09.
+
+### 9.1 Judge it by crop size
+
+The labelled corpus is bigger-crop than the pool the model scores: a crop under
+60px was usually flagged rather than answered, so train and val sit at a median
+of 84px while the 46,486-detection pool is a median of 57px with 48% at
+25–60px. Every headline is therefore optimistic for production, and every report
+now carries the size-band table. The number to read for the gate is **not_cow
+F1 on 25–60px**: the 2026-09-16 retrain had dropped it from 0.88 to 0.75 while
+its headline stayed at 0.97; the shipped recipe has it at 0.80 pooled under CV
+and 0.88 on the fixed split.
+
+### 9.2 What the fixed split can and cannot say
+
+Two seeds of the same recipe on the same 477-item split landed at 0.763 and
+0.775 — the seed alone moves it by 0.012, which is the entire gap between the
+shipped model and the earlier ones on that split. The 58 items in `head_probing`
+and behaviour's `not_visible` decide it, and neither is learnable at this
+volume. The split is fine for early stopping and for the size-band gate figure;
+it is not fine for choosing between recipes. Use the CV.
+
+## 10. Known risks
 
 - **543 samples is small.** Transfer learning from ImageNet makes it viable, not
   comfortable. The honest expectation is a useful sun head, a usable behaviour
@@ -203,4 +254,4 @@ inspectable dataset whether or not step 3 ever trains well.
 - **One site, five cameras, 17 days.** Nothing here has been shown to transfer to
   a different farm, and the block split does not test that. Treat cross-site
   performance as unmeasured.
-- **`head_probing` at n=12 is decorative** until the class grows.
+- **`head_probing` is unlearnable at n=56** — pooled F1 ≤ 0.12 in every one of the eleven CV configurations tried. It is visually near-identical to `feeding` and should be merged into it or dropped from the model's head; keeping it costs the headline metric ~0.02 for nothing.

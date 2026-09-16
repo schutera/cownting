@@ -229,15 +229,23 @@ def test_size_reweight_draws_the_production_mix():
 
 # --------------------------------------------------------------- augmentation
 
-def test_augmentation_knobs_are_off_by_default_and_wire_in_when_set():
+def test_augmentation_knobs_are_on_by_default_and_zero_turns_them_off():
     from torchvision import transforms as TV
 
-    off = T._transforms(InstanceAttrsCfg(img_size=64), train=True)
+    # The CV-chosen defaults: augmentation ON. Pinned, because it was the one
+    # recipe change that measurably helped and a refactor that quietly zeroed
+    # it would cost 0.01 pooled and 0.04 on the 25–60px gate without failing.
+    d = InstanceAttrsCfg()
+    check("defaults: rotation, erasing and blur are on",
+          d.aug_rotate_deg > 0 and d.aug_erase_p > 0 and d.aug_blur_p > 0,
+          f"{d.aug_rotate_deg} {d.aug_erase_p} {d.aug_blur_p}")
+    off = T._transforms(InstanceAttrsCfg(img_size=64, aug_rotate_deg=0, aug_erase_p=0,
+                                         aug_blur_p=0), train=True)
     names = [type(t).__name__ for t in off.transforms]
-    check("defaults: no rotation, no erasing, no blur",
+    check("zeroed: no rotation, no erasing, no blur",
           not any(n in names for n in ("RandomRotation", "RandomErasing", "RandomApply")),
           str(names))
-    check("...only the label-safe geometry is on",
+    check("...only the label-safe geometry remains",
           "RandomResizedCrop" in names and "RandomHorizontalFlip" in names, str(names))
 
     on = T._transforms(InstanceAttrsCfg(img_size=64, aug_rotate_deg=10, aug_erase_p=0.3,
@@ -267,7 +275,7 @@ def main():
     test_weight_power_tempers_the_rare_class()
     test_tta_flips_the_width_axis_and_averages_logits()
     test_size_reweight_draws_the_production_mix()
-    test_augmentation_knobs_are_off_by_default_and_wire_in_when_set()
+    test_augmentation_knobs_are_on_by_default_and_zero_turns_them_off()
     print("==================================")
     if _FAILED:
         print(f"{_FAILED} check(s) FAILED")

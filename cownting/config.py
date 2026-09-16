@@ -216,7 +216,7 @@ class InstanceAttrsCfg(BaseModel):
     # box and scores on this CPU-only one.
     device: str = "auto"
     img_size: int = 224            # what the ImageNet backbone was trained at
-    epochs: int = 40
+    epochs: int = 50
     batch_size: int = 32
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -224,34 +224,54 @@ class InstanceAttrsCfg(BaseModel):
     # epochs. Macro rather than accuracy because the classes that matter here
     # are the rare ones — a gate that never predicts `not_cow` scores 89%
     # accuracy and is useless.
-    patience: int = 8
+    patience: int = 10
     num_workers: int = 0           # a few thousand crops; a worker pool costs more than it saves
     seed: int = 1337
 
-    # --- the recipe. Every knob below defaults to what a 5-fold grouped CV over
-    # the 2026-09-16 corpus picked (see the commit that set them); the CV harness
-    # is `cownting attrs cv`, and it is what should decide any change here, not
-    # a single train/val run — with 477 val items and 16 of the rarest class, one
-    # split cannot tell a 0.01 improvement from noise.
-    backbone: str = "mobilenet_v3_small"   # see instance_attrs.model.BACKBONES
-    # Inverse-frequency class weights raised to this power. 1.0 lets forty noisy
-    # head_probing examples carry ~15x the weight of a feeding one and steer
-    # the shared trunk; 0.5 tempers that to ~4x.
-    weight_power: float = 1.0
-    label_smoothing: float = 0.0
+    # --- the recipe. Every default below was chosen by `cownting attrs cv`,
+    # 5-fold grouped CV over the 2,381-instance corpus of 2026-09-16, and that
+    # harness — not a single train/val run — is what should decide any change:
+    # one split's fold-to-fold spread is ±0.014 pooled and its rerun noise
+    # ±0.005, so a 0.01 improvement on one split is indistinguishable from
+    # nothing. What the CV said, pooled mean macro-F1 with the baseline at
+    # 0.773–0.778:
+    #
+    #   tempered class weights (power 0.5)          0.774   no effect
+    #   + smoothing/EMA/warmup/head-LR              0.778   no effect on the mean;
+    #                                                       gate fold spread ±0.015 -> ±0.006
+    #   + rotate 10° / erase 0.25 / blur 0.25       0.788   +0.010, all three heads up,
+    #                                                       gate F1 on 25–60px 0.77 -> 0.81
+    #   size reweighting toward production's mix   0.776   HURT: gate 0.948 -> 0.937,
+    #                                                       25–60px gate 0.77 -> 0.72
+    #   longer schedule (50/10 vs 30/6)             0.786   neutral
+    #   trunk: mobilenet_v3_large / efficientnet_b0 / resnet18 on the baseline
+    #                                               0.780 / 0.792 / 0.792
+    #                                                       behaviour 0.54 -> 0.59
+    #
+    # Measured on the serving box's two CPU threads, ms per crop:
+    #   mobilenet_v3_small 4.4 · mobilenet_v3_large 16.4 · resnet18 36.5 ·
+    #   efficientnet_b0 43.5 (depthwise convs are memory-bound on CPU; the
+    #   GFLOPs ordering is not the wall-clock ordering).
+    backbone: str = "resnet18"   # see instance_attrs.model.BACKBONES
+    # Inverse-frequency class weights raised to this power. No measurable effect
+    # either way; kept at 0.5 so forty noisy head_probing examples carry ~4x a
+    # feeding one rather than ~15x, which is the less surprising failure mode.
+    weight_power: float = 0.5
+    label_smoothing: float = 0.1
     # Exponential moving average of the weights, evaluated instead of the raw
-    # ones. 0 disables. Standard small-data stabiliser; cheap.
-    ema_decay: float = 0.0
-    # Linear LR warmup over this many epochs before the cosine decay.
-    warmup_epochs: int = 0
-    # The freshly-initialised heads may learn faster than the pretrained trunk.
-    head_lr_mult: float = 1.0
-    # Augmentation that cannot relabel a sample. NOT brightness/contrast — shaded
-    # vs direct_sun IS a brightness judgement. Rotation and erasing are geometric;
-    # blur is resolution degradation, which the corpus genuinely spans (25–400px).
-    aug_rotate_deg: float = 0.0
-    aug_erase_p: float = 0.0
-    aug_blur_p: float = 0.0
+    # ones, with BatchNorm buffers averaged too. Did not move the mean; halved
+    # the gate's fold-to-fold spread.
+    ema_decay: float = 0.998
+    warmup_epochs: int = 2
+    head_lr_mult: float = 5.0
+    # The one recipe change that cleared the noise bar. Geometry and resolution
+    # only — NOT brightness/contrast, because shaded vs direct_sun IS a
+    # brightness judgement. Blur is the deliberate one: the corpus spans 25–400px
+    # crops all resized to one size, so a sharp cow and a blurred one are the
+    # same class and the model is taught so.
+    aug_rotate_deg: float = 10.0
+    aug_erase_p: float = 0.25
+    aug_blur_p: float = 0.25
     # Average the prediction over the crop and its mirror at eval/inference.
     tta_hflip: bool = False
     # Sample training crops so their SIZE distribution matches the pool the

@@ -154,13 +154,33 @@ instance_attrs:
   val_fraction: 0.2
   split_seed: 1337
   img_size: 224
-  epochs: 40
+  epochs: 50
   batch_size: 32
   lr: 0.0003
   weight_decay: 0.0001
-  patience: 8                      # early-stops on mean macro-F1, not accuracy
+  patience: 10                     # early-stops on mean macro-F1, not accuracy
   num_workers: 0
   seed: 1337
+  # --- the recipe. Chosen by `cownting attrs cv` (5-fold grouped CV), and that
+  # is what should decide any change here: one train/val split's noise is
+  # ±0.014, so a single run cannot tell a 0.01 gain from nothing.
+  backbone: resnet18      # mobilenet_v3_small|mobilenet_v3_large|efficientnet_b0|resnet18
+  weight_power: 0.5                # class weights = inverse-frequency ** this
+  label_smoothing: 0.1
+  ema_decay: 0.998                 # halves the gate's fold-to-fold spread
+  warmup_epochs: 2
+  head_lr_mult: 5.0
+  # Augmentation — the one change that measurably helped (+0.010 pooled, and
+  # gate F1 on 25–60px crops 0.77 -> 0.81). Geometry and resolution only; never
+  # brightness, because shaded vs direct_sun IS a brightness judgement.
+  aug_rotate_deg: 10
+  aug_erase_p: 0.25
+  aug_blur_p: 0.25
+  tta_hflip: false                 # mirror-averaged logits at eval/inference
+  # Draw training crops in production's size mix. Measured to HURT (small crops
+  # are the noisiest labels); left here because the harness can re-test it.
+  size_reweight: false
+  cv_folds: 5
   # Score newly-uploaded days automatically, as a pipeline stage after localize.
   # Off by default and independent of the weights file existing: a checkpoint on
   # the box means somebody was evaluating a model, not that arriving footage
