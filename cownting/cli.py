@@ -440,6 +440,40 @@ def attrs_train(
     typer.secho(f"\nwrote {m['weights']} (rev {m['rev']})", fg=typer.colors.GREEN)
 
 
+@attrs_app.command("cv")
+def attrs_cv(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option("", "--dataset", help="Override instance_attrs.dataset_dir."),
+    folds: int = typer.Option(0, "--folds", help="Override instance_attrs.cv_folds."),
+    out: str = typer.Option("", "--out", help="Also write the full result as JSON here."),
+):
+    """Grouped k-fold cross-validation — the number that decides a recipe.
+
+    One train/val split cannot tell a 0.01 improvement from noise here: ~480 val
+    items, sixteen of the rarest class. K folds over camera-day blocks validate
+    every instance exactly once, pool the confusion matrices, and put a real
+    error bar on every figure. Saves no checkpoint; use `attrs train` to ship
+    the recipe this picks.
+    """
+    import json as _json
+
+    from .instance_attrs.cv import cross_validate, format_cv
+
+    cfg = _load(config)
+
+    def log(row):
+        typer.echo(f"  fold {row['fold']}: {row['val']} val, {row['epochs']} epochs, "
+                   f"mean macro-F1 {row['mean_macro_f1']:.3f}")
+
+    res = cross_validate(cfg, dataset_dir=dataset or None, folds=folds or None, log=log)
+    typer.echo("")
+    typer.echo(format_cv(res))
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            _json.dump(res, f, indent=2)
+        typer.secho(f"\nwrote {out}", fg=typer.colors.GREEN)
+
+
 @attrs_app.command("score")
 def attrs_score(
     config: str = CONFIG_OPT,

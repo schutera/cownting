@@ -225,8 +225,37 @@ class InstanceAttrsCfg(BaseModel):
     # are the rare ones — a gate that never predicts `not_cow` scores 89%
     # accuracy and is useless.
     patience: int = 8
-    num_workers: int = 0           # 628 crops; a worker pool costs more than it saves
+    num_workers: int = 0           # a few thousand crops; a worker pool costs more than it saves
     seed: int = 1337
+
+    # --- the recipe. Every knob below defaults to what a 5-fold grouped CV over
+    # the 2026-09-16 corpus picked (see the commit that set them); the CV harness
+    # is `cownting attrs cv`, and it is what should decide any change here, not
+    # a single train/val run — with 477 val items and 16 of the rarest class, one
+    # split cannot tell a 0.01 improvement from noise.
+    backbone: str = "mobilenet_v3_small"   # see instance_attrs.model.BACKBONES
+    # Inverse-frequency class weights raised to this power. 1.0 lets forty noisy
+    # head_probing examples carry ~15x the weight of a feeding one and steer
+    # the shared trunk; 0.5 tempers that to ~4x.
+    weight_power: float = 1.0
+    label_smoothing: float = 0.0
+    # Exponential moving average of the weights, evaluated instead of the raw
+    # ones. 0 disables. Standard small-data stabiliser; cheap.
+    ema_decay: float = 0.0
+    # Linear LR warmup over this many epochs before the cosine decay.
+    warmup_epochs: int = 0
+    # The freshly-initialised heads may learn faster than the pretrained trunk.
+    head_lr_mult: float = 1.0
+    # Augmentation that cannot relabel a sample. NOT brightness/contrast — shaded
+    # vs direct_sun IS a brightness judgement. Rotation and erasing are geometric;
+    # blur is resolution degradation, which the corpus genuinely spans (25–400px).
+    aug_rotate_deg: float = 0.0
+    aug_erase_p: float = 0.0
+    aug_blur_p: float = 0.0
+    # Average the prediction over the crop and its mirror at eval/inference.
+    tta_hflip: bool = False
+    # Grouped k-fold cross-validation over blocks, for `cownting attrs cv`.
+    cv_folds: int = 5
 
     # Score newly-uploaded days automatically, as a pipeline stage after
     # localize. OFF by default, and separately from the weights file existing: a

@@ -37,8 +37,56 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def build_model(heads: Mapping[str, Sequence[str]], *, pretrained: bool = True):
-    """A shared MobileNetV3-Small trunk with one linear head per task.
+# The trunks this model can be built on, smallest first. All ImageNet-pretrained
+# from torchvision, all cheap enough for the CPU-only serving box (the largest,
+# resnet18, is ~1.8 GFLOPs per crop — under 20 ms on two threads, so 46k crops
+# is still minutes). Kept to torchvision so no new dependency and no download
+# outside the one the existing YOLO weights already do at image build.
+BACKBONES = ("mobilenet_v3_small", "mobilenet_v3_large", "efficientnet_b0", "resnet18")
+DEFAULT_BACKBONE = "mobilenet_v3_small"
+
+
+def _trunk(backbone: str, pretrained: bool):
+    """The pretrained feature extractor with its ImageNet classifier removed.
+
+    Returns (module, feature_dim). Each family keeps its penultimate layer where
+    one exists (MobileNet's 1024/1280-d projection, EfficientNet's dropout) —
+    those are part of the pretrained representation, and dropping them throws
+    away what 2,000 samples cannot re-learn.
+    """
+    import torch.nn as nn
+    from torchvision import models
+
+    if backbone == "mobilenet_v3_small":
+        w = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        net = models.mobilenet_v3_small(weights=w)
+        dim = net.classifier[3].in_features
+        net.classifier = nn.Sequential(*list(net.classifier[:3]))
+        return net, dim
+    if backbone == "mobilenet_v3_large":
+        w = models.MobileNet_V3_Large_Weights.IMAGENET1K_V2 if pretrained else None
+        net = models.mobilenet_v3_large(weights=w)
+        dim = net.classifier[3].in_features
+        net.classifier = nn.Sequential(*list(net.classifier[:3]))
+        return net, dim
+    if backbone == "efficientnet_b0":
+        w = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        net = models.efficientnet_b0(weights=w)
+        dim = net.classifier[1].in_features
+        net.classifier = nn.Sequential(net.classifier[0])       # keep the dropout
+        return net, dim
+    if backbone == "resnet18":
+        w = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        net = models.resnet18(weights=w)
+        dim = net.fc.in_features
+        net.fc = nn.Identity()
+        return net, dim
+    raise ValueError(f"unknown backbone {backbone!r}; one of {BACKBONES}")
+
+
+def build_model(heads: Mapping[str, Sequence[str]], *, backbone: str = DEFAULT_BACKBONE,
+                pretrained: bool = True):
+    """A shared pretrained trunk with one linear head per task.
 
     `heads` is head -> ordered class names, straight from the dataset manifest,
     so the checkpoint's output layout is defined by the taxonomy that produced
@@ -49,16 +97,8 @@ def build_model(heads: Mapping[str, Sequence[str]], *, pretrained: bool = True):
     exercised without a weights download.
     """
     import torch.nn as nn
-    from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
-    weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-    net = mobilenet_v3_small(weights=weights)
-    # Replace the 1000-way ImageNet classifier with our own heads, but keep the
-    # penultimate 1024-d layer: it is part of the pretrained feature extractor,
-    # and dropping it throws away representation we cannot re-learn from 628
-    # samples.
-    in_features = net.classifier[3].in_features
-    net.classifier = nn.Sequential(*list(net.classifier[:3]))
+    net, in_features = _trunk(backbone, pretrained)
 
     # Defined here rather than at module scope because nn.Module cannot be
     # subclassed until torch is imported, and this module must stay importable
@@ -81,11 +121,14 @@ def build_model(heads: Mapping[str, Sequence[str]], *, pretrained: bool = True):
             feat = self.trunk(x)
             return {h: c(feat) for h, c in self.classifiers.items()}
 
-    return MultiHead(net, in_features, {h: list(cs) for h, cs in heads.items()})
+    m = MultiHead(net, in_features, {h: list(cs) for h, cs in heads.items()})
+    m.backbone = backbone
+    return m
 
 
 def masked_loss(logits: Mapping[str, Any], targets: Mapping[str, Any],
-                weights: Mapping[str, Any] | None = None):
+                weights: Mapping[str, Any] | None = None, *,
+                label_smoothing: float = 0.0):
     """Cross-entropy per head, skipping samples whose target for that head is -1.
 
     -1 is the "no label" sentinel and it is why this function exists. The
@@ -111,7 +154,8 @@ def masked_loss(logits: Mapping[str, Any], targets: Mapping[str, Any],
         if n == 0:
             continue
         w = None if weights is None else weights.get(head)
-        loss = F.cross_entropy(logit[keep], t[keep], weight=w)
+        loss = F.cross_entropy(logit[keep], t[keep], weight=w,
+                               label_smoothing=float(label_smoothing))
         parts[head] = float(loss.detach())
         total = loss if total is None else total + loss
     if total is None:
@@ -122,19 +166,25 @@ def masked_loss(logits: Mapping[str, Any], targets: Mapping[str, Any],
     return total, parts
 
 
-def class_weights(counts: Sequence[int], *, device=None):
-    """Inverse-frequency weights, normalised to mean 1.
+def class_weights(counts: Sequence[int], *, power: float = 1.0, device=None):
+    """Inverse-frequency weights raised to `power`, normalised to mean 1.
 
-    The gate is 443 cow against 57 not-a-cow. Unweighted, predicting "cow"
-    always scores 89% and learns nothing — and the minority class is the entire
+    The gate is ~1,670 cow against ~225 not-a-cow. Unweighted, predicting "cow"
+    always scores 88% and learns nothing — and the minority class is the entire
     point of the head. Normalising to mean 1 keeps the loss magnitude comparable
     across heads so one head's imbalance does not dominate the shared trunk's
     gradient.
+
+    `power` tempers the correction. At 1.0 (plain inverse frequency) the
+    behaviour head's 40-sample `head_probing` gets ~15x the weight of `feeding`,
+    which lets forty noisy examples steer the shared trunk; at 0.5 (square root)
+    that becomes ~4x — still favouring the rare class, no longer letting it
+    dominate. Which is right is an empirical question the CV harness answers.
     """
     import torch
 
     c = torch.tensor([max(1, int(n)) for n in counts], dtype=torch.float32)
-    w = c.sum() / (len(c) * c)
+    w = (c.sum() / (len(c) * c)) ** float(power)
     w = w / w.mean()
     return w.to(device) if device is not None else w
 
@@ -160,6 +210,10 @@ def save_checkpoint(path: str | Path, *, model, heads: Mapping[str, Sequence[str
     blob = {
         "version": CHECKPOINT_VERSION,
         "state_dict": model.state_dict(),
+        # Which trunk the state_dict fits. A checkpoint written before this
+        # field existed is a mobilenet_v3_small by construction, so the loader
+        # defaults to that rather than refusing.
+        "backbone": getattr(model, "backbone", DEFAULT_BACKBONE),
         "heads": heads_out,
         "img_size": int(img_size),
         "norm": {"mean": list(IMAGENET_MEAN), "std": list(IMAGENET_STD)},
@@ -198,7 +252,8 @@ def load_checkpoint(path: str | Path, *, device: str = "cpu") -> dict[str, Any]:
             f"{p}: checkpoint version {got}, this build reads {CHECKPOINT_VERSION}. "
             "Re-train rather than loading it — the layout changed."
         )
-    model = build_model(blob["heads"], pretrained=False)
+    model = build_model(blob["heads"], backbone=blob.get("backbone", DEFAULT_BACKBONE),
+                        pretrained=False)
     model.load_state_dict(blob["state_dict"])
     model.eval()
     blob["model"] = model
