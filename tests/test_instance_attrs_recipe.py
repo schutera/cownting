@@ -181,6 +181,52 @@ def test_tta_flips_the_width_axis_and_averages_logits():
     check("a symmetric input is unchanged by TTA", torch.allclose(a, b, atol=1e-5))
 
 
+# --------------------------------------------------------------- size reweight
+
+def test_size_reweight_draws_the_production_mix():
+    """The labelled corpus is ~18% 25–60px; production is ~48%. The sampler must
+    turn the former into the latter in expectation — and be OFF by default, or
+    every existing number silently changes."""
+    import torch
+    from torch.utils.data import WeightedRandomSampler
+
+    check("size_reweight is off by default", InstanceAttrsCfg().size_reweight is False)
+    target = InstanceAttrsCfg().size_target_shares
+    check("the default target is production's measured mix and sums to 1",
+          abs(sum(target.values()) - 1.0) < 1e-9 and target["25-60"] == 0.48, str(target))
+
+    # A corpus with the labelled data's skew: 1% / 17% / 37% / 45%.
+    def item(side):
+        return {"bbox": [0, 0, side, side], "labels": {"cow": "cow"}}
+    items = [item(15)] * 10 + [item(40)] * 170 + [item(75)] * 370 + [item(150)] * 450
+    w, mult = T.size_sample_weights(items, target)
+    check("a 25–60px item is upweighted ~2.8x its corpus share",
+          2.6 < mult["25-60"] < 3.0, str(mult))
+    check("a 90+ item is downweighted to ~0.5x", 0.45 < mult["90+"] < 0.55, str(mult))
+    check("one weight per item, in item order",
+          len(w) == len(items) and w[0] == mult["<25"] and w[-1] == mult["90+"])
+
+    gen = torch.Generator().manual_seed(0)
+    s = WeightedRandomSampler(torch.tensor(w, dtype=torch.double), num_samples=40000,
+                              replacement=True, generator=gen)
+    from cownting.instance_attrs.strata import band_of, long_side
+    drawn = [band_of(long_side(items[i])) for i in s]
+    for b, share in target.items():
+        got = drawn.count(b) / len(drawn)
+        check(f"drawn share of {b} matches the target ({share:.2f})",
+              abs(got - share) < 0.02, f"got {got:.3f}")
+
+    # Effective class counts follow the sampling, not the raw list.
+    items2 = [{"bbox": [0, 0, 40, 40], "labels": {"cow": "not_cow"}},
+              {"bbox": [0, 0, 150, 150], "labels": {"cow": "cow"}}]
+    w2, _ = T.size_sample_weights(items2, {"25-60": 0.9, "90+": 0.1})
+    raw = T._class_counts(items2, {"cow": ["not_cow", "cow"]})
+    eff = T._class_counts(items2, {"cow": ["not_cow", "cow"]}, w2)
+    check("raw counts are one each", raw["cow"] == [1.0, 1.0], str(raw))
+    check("effective counts weight the small crop up and the big one down",
+          eff["cow"][0] > eff["cow"][1], str(eff))
+
+
 # --------------------------------------------------------------- augmentation
 
 def test_augmentation_knobs_are_off_by_default_and_wire_in_when_set():
@@ -220,6 +266,7 @@ def main():
     test_unknown_backbone_is_refused()
     test_weight_power_tempers_the_rare_class()
     test_tta_flips_the_width_axis_and_averages_logits()
+    test_size_reweight_draws_the_production_mix()
     test_augmentation_knobs_are_off_by_default_and_wire_in_when_set()
     print("==================================")
     if _FAILED:

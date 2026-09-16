@@ -183,7 +183,7 @@ def class_weights(counts: Sequence[int], *, power: float = 1.0, device=None):
     """
     import torch
 
-    c = torch.tensor([max(1, int(n)) for n in counts], dtype=torch.float32)
+    c = torch.tensor([max(1.0, float(n)) for n in counts], dtype=torch.float32)
     w = (c.sum() / (len(c) * c)) ** float(power)
     w = w / w.mean()
     return w.to(device) if device is not None else w

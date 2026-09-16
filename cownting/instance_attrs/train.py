@@ -208,14 +208,43 @@ def mean_macro_f1(report: dict[str, Any]) -> float:
     return sum(r["macro_f1"] for r in report.values()) / max(1, len(report))
 
 
-def _class_counts(items: list[dict], heads: dict[str, list[str]]) -> dict[str, list[int]]:
-    counts = {h: [0] * len(cs) for h, cs in heads.items()}
-    for it in items:
+def _class_counts(items: list[dict], heads: dict[str, list[str]],
+                  item_weights: list[float] | None = None) -> dict[str, list[float]]:
+    """Per-head class counts over `items` — weighted, when sampling is.
+
+    With size reweighting on, the model does not see the raw class balance: a
+    25–60px crop is drawn ~2.8x as often as its share, and small crops skew
+    towards not_visible. Class weights derived from raw counts would then
+    correct an imbalance that is not the one being trained on, so the counts
+    are the EFFECTIVE ones — each item's contribution is its sampling weight.
+    """
+    counts = {h: [0.0] * len(cs) for h, cs in heads.items()}
+    for i, it in enumerate(items):
+        w = 1.0 if item_weights is None else float(item_weights[i])
         for h, cs in heads.items():
             c = it["labels"].get(h)
             if c in cs:
-                counts[h][cs.index(c)] += 1
+                counts[h][cs.index(c)] += w
     return counts
+
+
+def size_sample_weights(items: list[dict], target_shares: dict[str, float]
+                        ) -> tuple[list[float], dict[str, float]]:
+    """Per-item sampling weights that make the drawn size distribution match
+    `target_shares`. Returns (weights, multiplier per band).
+
+    weight = target share / corpus share, per band, so drawing with replacement
+    reproduces the target mix in expectation. A band absent from the corpus is
+    simply never drawn (nothing to draw); a band absent from the target is
+    drawn with weight 0.
+    """
+    from .strata import band_of, long_side
+
+    bands = [band_of(long_side(it)) for it in items]
+    n = max(1, len(bands))
+    corpus = {b: bands.count(b) / n for b in set(bands)}
+    mult = {b: (float(target_shares.get(b, 0.0)) / corpus[b]) for b in corpus}
+    return [mult[b] for b in bands], mult
 
 
 def fit(cfg: InstanceAttrsCfg, root: Path, heads: dict[str, list[str]],
@@ -234,8 +263,23 @@ def fit(cfg: InstanceAttrsCfg, root: Path, heads: dict[str, list[str]],
     CropDataset = _dataset_class()
     tr = CropDataset(root, tr_items, heads, _transforms(cfg, train=True))
     va = CropDataset(root, va_items, heads, _transforms(cfg, train=False))
-    tl = DataLoader(tr, batch_size=cfg.batch_size, shuffle=True,
-                    num_workers=cfg.num_workers, collate_fn=_collate)
+
+    # Size reweighting is a SAMPLER, not a per-sample loss weight: it touches
+    # nothing but which items an epoch draws, so every consumer of the dataset
+    # and the collate — evaluation, CV, scoring — is untouched. One epoch is
+    # still len(train) draws, with replacement, seeded.
+    sampler = None
+    item_w: list[float] | None = None
+    size_mult: dict[str, float] = {}
+    if cfg.size_reweight:
+        from torch.utils.data import WeightedRandomSampler
+        item_w, size_mult = size_sample_weights(tr_items, cfg.size_target_shares)
+        gen = torch.Generator().manual_seed(cfg.seed)
+        sampler = WeightedRandomSampler(torch.tensor(item_w, dtype=torch.double),
+                                        num_samples=len(tr_items), replacement=True,
+                                        generator=gen)
+    tl = DataLoader(tr, batch_size=cfg.batch_size, shuffle=(sampler is None),
+                    sampler=sampler, num_workers=cfg.num_workers, collate_fn=_collate)
     vl = DataLoader(va, batch_size=cfg.batch_size, shuffle=False,
                     num_workers=cfg.num_workers, collate_fn=_collate)
 
@@ -244,7 +288,7 @@ def fit(cfg: InstanceAttrsCfg, root: Path, heads: dict[str, list[str]],
     # Weights from the TRAIN split only. Deriving them from the whole manifest
     # would leak the val class balance into the training objective — a small
     # leak, but a free one to avoid.
-    counts = _class_counts(tr_items, heads)
+    counts = _class_counts(tr_items, heads, item_w)
     weights = {h: M.class_weights(counts[h], power=cfg.weight_power, device=device)
                for h in heads}
 
@@ -329,7 +373,8 @@ def fit(cfg: InstanceAttrsCfg, root: Path, heads: dict[str, list[str]],
         final.load_state_dict(best_state)
     final.eval()
     return {"model": final, "report": best_report, "history": history,
-            "best": round(best, 4), "epochs": len(history), "counts": counts}
+            "best": round(best, 4), "epochs": len(history), "counts": counts,
+            "size_multipliers": {b: round(m, 3) for b, m in size_mult.items()}}
 
 
 def train(config: Config, *, dataset_dir: str | Path | None = None,
@@ -345,6 +390,8 @@ def train(config: Config, *, dataset_dir: str | Path | None = None,
 
     t0 = time.time()
     r = fit(cfg, root, heads, tr_items, va_items, device=device, pretrained=pretrained)
+    from . import strata as S
+    by_size = S.stratified_report(r["model"], root, va_items, heads, cfg, device)
     metrics = {
         "mean_macro_f1": r["best"],
         "epochs_run": r["epochs"],
@@ -354,11 +401,15 @@ def train(config: Config, *, dataset_dir: str | Path | None = None,
         "recipe": {k: getattr(cfg, k) for k in (
             "weight_power", "label_smoothing", "ema_decay", "warmup_epochs",
             "head_lr_mult", "aug_rotate_deg", "aug_erase_p", "aug_blur_p",
-            "tta_hflip", "lr", "batch_size", "img_size")},
+            "tta_hflip", "size_reweight", "lr", "batch_size", "img_size")},
         "train_size": len(tr_items),
         "val_size": len(va_items),
-        "train_class_counts": {h: dict(zip(heads[h], r["counts"][h])) for h in heads},
+        "train_class_counts": {h: dict(zip(heads[h], [round(c, 1) for c in r["counts"][h]]))
+                               for h in heads},
+        "size_multipliers": r["size_multipliers"],
         "heads": r["report"],
+        "by_size": by_size["by_size"],
+        "band_counts": by_size["band_counts"],
         "history": r["history"],
     }
     dest = Path(out) if out is not None else Path(cfg.weights)
@@ -387,4 +438,10 @@ def format_report(metrics: dict[str, Any]) -> str:
             flag = "  <- no val examples" if s["support"] == 0 else ""
             out.append(f"      {short:<14} n={s['support']:<4} "
                        f"P={s['precision']:.2f} R={s['recall']:.2f} F1={s['f1']:.2f}{flag}")
+    if metrics.get("by_size"):
+        from . import strata as S
+        out.append("")
+        out.append(S.format_by_size({"all": metrics["heads"], "by_size": metrics["by_size"],
+                                     "band_counts": metrics["band_counts"]},
+                                    title="  by crop size, macro-F1:"))
     return "\n".join(out)

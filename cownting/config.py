@@ -254,6 +254,18 @@ class InstanceAttrsCfg(BaseModel):
     aug_blur_p: float = 0.0
     # Average the prediction over the crop and its mirror at eval/inference.
     tta_hflip: bool = False
+    # Sample training crops so their SIZE distribution matches the pool the
+    # model will score, not the pool annotators labelled. The two differ a lot:
+    # a crop under 60px was usually flagged rather than answered, so the
+    # labelled corpus is ~18% 25–60px where production is ~48%. Left alone, the
+    # model learns least about the band it will see most — and the retrain on
+    # the post-floor corpus measurably lost gate accuracy there (not_cow F1
+    # 0.88 -> 0.75 on 25–60px) while its headline stayed at 0.97.
+    size_reweight: bool = False
+    # Production's share per band on the animal's longer side, measured over the
+    # 46,486-detection pool on 2026-09-16. Keys are strata.SIZE_BANDS names.
+    size_target_shares: dict = Field(default_factory=lambda: {
+        "<25": 0.05, "25-60": 0.48, "60-90": 0.24, "90+": 0.23})
     # Grouped k-fold cross-validation over blocks, for `cownting attrs cv`.
     cv_folds: int = 5
 

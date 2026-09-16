@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config, resolve_device
+from . import strata as S
 from . import train as T
 from .dataset import load_manifest
 
@@ -81,19 +82,25 @@ def cross_validate(config: Config, *, dataset_dir: str | Path | None = None,
     t0 = time.time()
     pooled = None
     per_fold: list[dict[str, Any]] = []
+    # Every fold's predictions, in item order, so the size cut at the end is
+    # over ALL instances — the rare band and the rare class both get judged on
+    # everything they have rather than on one fold's handful.
+    all_items: list[dict] = []
+    all_pt: dict[str, tuple[list[int], list[int]]] = {h: ([], []) for h in heads}
     for f in range(k):
         va = [it for it in items if assign[it["block"]] == f]
         tr = [it for it in items if assign[it["block"]] != f]
         r = T.fit(cfg, root, heads, tr, va, device=device, pretrained=pretrained)
-        # Re-derive the fold's confusion from the best model rather than trusting
-        # the report: the report was the early-stopping read and is the same
-        # thing, but summing matrices needs the matrices.
-        from torch.utils.data import DataLoader
-        CropDataset = T._dataset_class()
-        vl = DataLoader(CropDataset(root, va, heads, T._transforms(cfg, train=False)),
-                        batch_size=cfg.batch_size, shuffle=False, collate_fn=T._collate)
-        conf = T.confusion(r["model"].to(device), vl, heads, device, tta_hflip=cfg.tta_hflip)
+        # Re-derive the fold's predictions from the best model rather than
+        # trusting the report: the report was the early-stopping read and is the
+        # same thing, but pooling needs the raw predictions.
+        pt = S.predict(r["model"], root, va, heads, cfg, device)
+        conf = S.confusion_from(pt, heads)
         pooled = conf if pooled is None else _sum_conf(pooled, conf)
+        all_items.extend(va)
+        for h in heads:
+            all_pt[h][0].extend(pt[h][0])
+            all_pt[h][1].extend(pt[h][1])
         rep = T.report_from_confusion(conf, heads)
         per_fold.append({"fold": f, "train": len(tr), "val": len(va),
                          "epochs": r["epochs"], "mean_macro_f1": T.mean_macro_f1(rep),
@@ -104,6 +111,7 @@ def cross_validate(config: Config, *, dataset_dir: str | Path | None = None,
             log(per_fold[-1])
 
     pooled_report = T.report_from_confusion(pooled, heads)
+    by_size = S.stratified(all_pt, all_items, heads)
 
     def mean_std(vals):
         n = len(vals)
@@ -127,11 +135,17 @@ def cross_validate(config: Config, *, dataset_dir: str | Path | None = None,
         "recipe": {kk: getattr(cfg, kk) for kk in (
             "weight_power", "label_smoothing", "ema_decay", "warmup_epochs",
             "head_lr_mult", "aug_rotate_deg", "aug_erase_p", "aug_blur_p",
-            "tta_hflip", "lr", "batch_size", "img_size", "epochs", "patience")},
+            "tta_hflip", "size_reweight", "lr", "batch_size", "img_size", "epochs",
+            "patience")},
         "pooled": pooled_report,
         "pooled_mean_macro_f1": round(T.mean_macro_f1(pooled_report), 4),
         "spread": spread,
         "per_fold": per_fold,
+        # The cut that says what production will see: the labelled corpus is
+        # bigger-crop than the pool the model scores, so the pooled headline is
+        # optimistic and this is the number to read alongside it.
+        "by_size": by_size["by_size"],
+        "band_counts": by_size["band_counts"],
     }
 
 
@@ -150,4 +164,9 @@ def format_cv(res: dict[str, Any]) -> str:
             cm, cs = res["spread"]["per_class"][h][c]
             out.append(f"      {c.split('.')[-1]:<14} n={pc['support']:<4} "
                        f"pooled F1 {pc['f1']:.2f}   per-fold {cm:.2f} ± {cs:.2f}")
+    if res.get("by_size"):
+        out.append("")
+        out.append(S.format_by_size({"all": res["pooled"], "by_size": res["by_size"],
+                                     "band_counts": res["band_counts"]},
+                                    title="  by crop size (pooled over all folds), macro-F1:"))
     return "\n".join(out)
