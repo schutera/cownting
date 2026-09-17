@@ -75,6 +75,25 @@ visually near-identical to `feeding` ("head down at hardware, ground or water,
 dashboard keeps the distinction the taxonomy makes, and so the class grows into
 usefulness instead of having to be re-separated later.
 
+### 2.2 `head_probing` was merged away (2026-09-17)
+
+Kept as a fourth class through eleven CV configurations and never learnable:
+pooled F1 ≤ 0.12 on all 56 examples, absorbed by `standing` (30) and `feeding`
+(16) in the confusion matrix, and costing the headline ~0.02 for nothing. It is
+now archived in the taxonomy — `cownting labels archive-class
+behaviour.head_probing`, an audited soft archive; annotators are no longer
+offered it — and its 56 existing answers are carried into the training set by
+`config/instance_attrs_relabels.csv`: **17 → feeding, 41 → standing**, each
+instance decided by the mean softmax of the two trained checkpoints (resnet18
+`1452984b21ba` and efficientnet_b0 `9deb70536869`) over those two classes. The
+two models disagreed on 16; those went by the averaged probability. Every
+decision, both models' probabilities and the original annotator are in
+`config/instance_attrs_relabels.audit.csv`.
+
+The store was NOT rewritten — it is append-only by design — and the pre-merge
+store is at `data/backups/labels-pre-merge/` on the box. Reverting the merge is
+deleting the `relabels:` line and restoring the class; nothing else moves.
+
 > **Backlog dependency.** `not_visible` is 136 + 64 answers because the queue is
 > serving crops too small to judge. The fix is upstream in the sampling, not
 > here — see `futurework.md` → *"Stop serving unjudgeable crops"*. Once that

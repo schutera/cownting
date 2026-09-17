@@ -203,6 +203,22 @@ class InstanceAttrsCfg(BaseModel):
     dataset_dir: str = "data/instance_attrs/dataset"
     weights: str = "data/models/instance_attrs.pt"
 
+    # Relabelling at DATASET-BUILD time — the store itself is never rewritten.
+    # The label store is append-only on purpose (annotator variability is the
+    # product), so a class merge is expressed here, as a mapping applied when
+    # the training set is built, and the original answers stay in the store and
+    # in every backup. Two forms, applied in this order:
+    #   merge_classes  class_key -> class_key, for every answer of that class
+    #   relabels       a CSV (instance_key, group_key, class_key) of per-instance
+    #                  overrides — used for the 2026-09-17 head_probing merge,
+    #                  where each instance was assigned to feeding or standing
+    #                  by the two shipped checkpoints' vote; the audit trail
+    #                  (both models' probabilities, the annotator) is beside it.
+    # Either may name a class that is archived in the taxonomy; the TARGET must
+    # be active or the answer is dropped, the same as any other archived class.
+    merge_classes: dict = Field(default_factory=dict)
+    relabels: str | None = None
+
     # Split. The unit is a contiguous run of frames from one camera on one day —
     # at ingest.frame_interval_seconds = 60 those are minutes, so 30 is a
     # half-hour block. Instances from adjacent frames are near-duplicates, so a

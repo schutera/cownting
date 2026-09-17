@@ -646,6 +646,47 @@ def labels_reconcile(
         typer.echo(f"{k:>20}: {v}")
 
 
+@labels_app.command("archive-class")
+def labels_archive_class(
+    class_key: str = typer.Argument(..., help="e.g. behaviour.head_probing"),
+    config: str = CONFIG_OPT,
+    restore: bool = typer.Option(False, "--restore", help="Un-archive instead."),
+    actor: str = typer.Option("cli", "--actor", help="Recorded in taxonomy_audit."),
+):
+    """Archive (or restore) one class in the live taxonomy, with an audit row.
+
+    The same operation the taxonomy editor's archive button performs, from the
+    shell. Archiving is SOFT: the row stays, every stored answer against it
+    stays readable and counted, and the class simply stops being offered to
+    annotators. The taxonomy revision bumps, so a session mid-answer gets a 409
+    `taxonomy_stale` and reloads rather than writing against a class that is
+    no longer on the tile.
+
+    Takes a short-lived write handle on the label store. The server opens that
+    store per request rather than holding it, so this normally goes through
+    with the site up; a lock clash is retried (~9 s) and then reported, not
+    forced.
+    """
+    from . import labels_db
+    from .labeling import labels_connect
+
+    cfg = _load(config)
+    con = labels_connect(cfg)
+    try:
+        before = labels_db._one(con, "label_classes", "class_key", class_key)
+        if before is None:
+            typer.secho(f"no such class {class_key!r}", fg=typer.colors.RED)
+            raise typer.Exit(1)
+        labels_db.update_class(con, class_key, active=restore, actor=actor,
+                               actor_role="poweruser")
+        after = labels_db._one(con, "label_classes", "class_key", class_key)
+        rev = labels_db.taxonomy_revision(con)
+    finally:
+        con.close()
+    state = "active" if after["active"] else "archived"
+    typer.secho(f"{class_key}: {state} (taxonomy revision {rev})", fg=typer.colors.GREEN)
+
+
 @labels_app.command("reseed")
 def labels_reseed(
     config: str = CONFIG_OPT,

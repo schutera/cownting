@@ -145,6 +145,14 @@ backup:
 instance_attrs:
   dataset_dir: data/instance_attrs/dataset
   weights: data/models/instance_attrs.pt
+  # Class merges are applied when the training set is BUILT; the label store is
+  # never rewritten. `merge_classes` maps every answer of a class; `relabels`
+  # is a per-instance CSV (instance_key, group_key, class_key). The shipped CSV
+  # is the 2026-09-17 head_probing merge — 17 to feeding, 41 to standing, each
+  # decided by the two trained checkpoints' vote — and its .audit.csv sibling
+  # carries both models' probabilities and the original annotator per row.
+  merge_classes: {}
+  relabels: config/instance_attrs_relabels.csv
   device: auto                     # cuda > mps > cpu; train on a GPU box, serve on CPU
   # Split. The unit is a contiguous run of frames from ONE camera on ONE day —
   # at ingest.frame_interval_seconds = 60 these are minutes, so 30 is a

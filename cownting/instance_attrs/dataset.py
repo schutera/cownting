@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import duckdb
 
@@ -204,13 +204,21 @@ def head_vocabulary(lcon: duckdb.DuckDBPyConnection) -> dict[str, tuple[str, ...
 # disagreement. That is the same "escape as missing data" reading the
 # `*_NO_ESCAPE` agreement queries take, and it recovers labels that are not
 # actually contested.
+#
+# ARCHIVED classes are deliberately NOT filtered here. `collect_samples` may
+# remap an answer (a class merge) before it checks the vocabulary, and a merge
+# only works if the answer reaches it: with `AND c.active` in this query the
+# head_probing answers vanished in SQL and the merge silently carried nothing.
+# The active-class filter lives in Python, AFTER the remap. One consequence,
+# and the right one: two raters who said head_probing and feeding are contested
+# here and stay contested — archiving a class must not manufacture agreement.
 _SQL_ANSWERS = """
 SELECT v.effective_key, v.group_key,
        count(DISTINCT v.class_key) AS n_classes,
        any_value(v.class_key)      AS class_key
 FROM v_current_answers v
 JOIN label_classes c ON c.class_key = v.class_key
-WHERE NOT coalesce(v.acting_preview, FALSE) AND NOT c.is_escape AND c.active
+WHERE NOT coalesce(v.acting_preview, FALSE) AND NOT c.is_escape
 GROUP BY 1, 2
 HAVING count(DISTINCT v.class_key) = 1
 """
@@ -257,22 +265,47 @@ GROUP BY 1
 """
 
 
+def load_relabels(path: str | Path | None) -> dict[tuple[str, str], str]:
+    """(instance_key, group_key) -> class_key from a relabels CSV. Empty if None."""
+    if not path:
+        return {}
+    import csv
+
+    out: dict[tuple[str, str], str] = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            out[(row["instance_key"], row["group_key"])] = row["class_key"]
+    return out
+
+
 def collect_samples(
     lcon: duckdb.DuckDBPyConnection,
     *,
     block_frames: int,
     vocab: dict[str, tuple[str, ...]] | None = None,
+    merge_classes: Mapping[str, str] | None = None,
+    relabels: Mapping[tuple[str, str], str] | None = None,
 ) -> list[Sample]:
     """Every instance with at least one usable label, with its provenance.
 
     Pure read; renders nothing. Split out from `build_dataset` so the label
     arithmetic is testable without a filesystem full of JPEGs.
+
+    `merge_classes` and `relabels` rewrite an answer BEFORE the vocabulary
+    check, so an answer against a now-archived class can be carried into an
+    active one instead of dropped. The store is not touched. Note the order:
+    the SQL unanimity test runs on the stored classes, so two raters who said
+    head_probing and feeding are contested in the store and stay contested —
+    a merge recovers single-rater answers, not disagreements.
     """
     vocab = vocab if vocab is not None else head_vocabulary(lcon)
     known = {h: set(cs) for h, cs in vocab.items()}
+    merge = dict(merge_classes or {})
+    over = dict(relabels or {})
 
     answers: dict[str, dict[str, str]] = {}
     for key, group_key, _n, class_key in lcon.execute(_SQL_ANSWERS).fetchall():
+        class_key = over.get((key, group_key), merge.get(class_key, class_key))
         if group_key in known and class_key in known[group_key]:
             answers.setdefault(key, {})[group_key] = class_key
 
@@ -322,10 +355,12 @@ def build_dataset(
     crops = root / "crops"
     crops.mkdir(parents=True, exist_ok=True)
 
+    relabels = load_relabels(cfg.relabels)
     lcon = labeling.labels_connect(config)
     try:
         vocab = head_vocabulary(lcon)
-        samples = collect_samples(lcon, block_frames=cfg.block_frames, vocab=vocab)
+        samples = collect_samples(lcon, block_frames=cfg.block_frames, vocab=vocab,
+                                  merge_classes=cfg.merge_classes, relabels=relabels)
     finally:
         lcon.close()
 
@@ -392,6 +427,11 @@ def build_dataset(
             "block_frames": cfg.block_frames,
             "val_fraction": cfg.val_fraction,
             "split_seed": cfg.split_seed,
+            # What was rewritten on the way in, so a manifest can be told apart
+            # from one built on the raw store.
+            "merge_classes": dict(cfg.merge_classes),
+            "relabels": cfg.relabels,
+            "relabels_applied": len(relabels),
             "crop_pad": acfg.crop_pad,
             "crop_max_width": acfg.crop_max_width,
             "mask_timestamp_banner": acfg.mask_timestamp_banner,
