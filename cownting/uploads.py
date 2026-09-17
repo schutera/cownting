@@ -76,7 +76,7 @@ class Job:
     # is NOT tied to one day's arrival and must therefore be kept out of the
     # per-dataset job map the dashboard builds, or it would displace the upload
     # job for whichever day it happens to name.
-    kind: str = "upload"        # upload | remask
+    kind: str = "upload"        # upload | remask | attrs_score
     progress: float = 0.0       # 0..1, coarse (stage boundaries + per-frame during segment)
     message: str = "Queued"
     error: Optional[str] = None
@@ -335,9 +335,17 @@ def _upload_waiting() -> bool:
     The backfill is hours and an upload is minutes, so a strict FIFO would make
     someone who just dropped in a day of footage wait all afternoon to see it
     processed. This is the signal the backfill yields on.
+
+    Positive on purpose — "an upload is active", not "something other than me
+    is active". The first version excluded only 'remask', so the attribute
+    backfill counted ITSELF as the upload it should yield to: it stepped aside
+    on its first frame, re-queued itself, reloaded the model, and did that
+    every three seconds for as long as the process lived. A backfill kind
+    added later must not be able to repeat that by forgetting to add itself to
+    an exclusion list.
     """
     with _LOCK:
-        return any(j.kind != "remask" and j.status in ACTIVE for j in _JOBS.values())
+        return any(j.kind == "upload" and j.status in ACTIVE for j in _JOBS.values())
 
 
 def _run_remask(job: Job, base: Config, dataset_id: str | None,
