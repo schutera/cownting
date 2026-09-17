@@ -1,4 +1,5 @@
 import type {
+  FrameDetection,
   Site,
   CountRow,
   PostureRow,
@@ -400,6 +401,12 @@ export function getDaySeries(): Promise<DaySeries> {
 
 export function frameImg(camera: string, frameIdx: number, kind: "overlay" | "raw" | "pose" = "overlay"): string {
   return withDs(`/api/img/frame/${camera}/${frameIdx}?kind=${kind}`);
+}
+
+// Every detection on one frame with the crop model's verdicts. Drawn client-side
+// over the frame image so a re-score is a DB update, not 7,261 new PNGs.
+export function getFrameDetections(camera: string, frameIdx: number): Promise<FrameDetection[]> {
+  return j<FrameDetection[]>(`/api/frame-detections?camera=${encodeURIComponent(camera)}&frame_idx=${frameIdx}`);
 }
 
 // The per-camera frame_idx to show at one instant (timestamp bucket). Cameras

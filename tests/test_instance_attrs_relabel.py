@@ -138,6 +138,35 @@ def test_a_relabel_targeting_an_archived_class_is_dropped_not_kept():
             con.close()
 
 
+def test_exclude_classes_leaves_the_head_and_the_taxonomy_alone():
+    """Excluding a class from TRAINING must not touch the taxonomy (annotators
+    keep the option) and must shrink the head — a class in the vocabulary with
+    no training examples is an output the model can still land on by drift."""
+    _NV = {"class_key": "behaviour.not_visible", "group_key": "behaviour",
+           "class_name": "Not visible"}
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        try:
+            k1 = _answer(con, "00000001.jpg", [_NV])
+            k2 = _answer(con, "00000002.jpg", [_FEED])
+            vocab = ds.head_vocabulary(con, exclude=["behaviour.not_visible"])
+            check("the excluded class leaves the head's vocabulary",
+                  "behaviour.not_visible" not in vocab["behaviour"], str(vocab["behaviour"]))
+            check("...while the rest of the head is intact",
+                  "behaviour.feeding" in vocab["behaviour"], str(vocab["behaviour"]))
+            out = {s.instance_key: s for s in ds.collect_samples(con, block_frames=30, vocab=vocab)}
+            check("its answers are dropped from that head",
+                  k1 not in out or "behaviour" not in out[k1].labels, str(out.get(k1)))
+            check("other answers are untouched",
+                  out[k2].labels.get("behaviour") == "behaviour.feeding", str(out.get(k2)))
+            active = con.execute(
+                "SELECT active FROM label_classes WHERE class_key='behaviour.not_visible'"
+            ).fetchone()[0]
+            check("the taxonomy still offers it", active is True)
+        finally:
+            con.close()
+
+
 def test_relabel_csv_round_trip():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "r.csv")
@@ -176,6 +205,7 @@ def main():
     test_archiving_alone_drops_the_answers_and_a_merge_carries_them()
     test_per_instance_relabels_override_the_blanket_merge()
     test_a_relabel_targeting_an_archived_class_is_dropped_not_kept()
+    test_exclude_classes_leaves_the_head_and_the_taxonomy_alone()
     test_relabel_csv_round_trip()
     test_archive_class_survives_a_reseed()
     print("===================================")

@@ -81,6 +81,14 @@ def test_bands_cover_every_item_exactly_once_and_reports_agree():
         pt = S.predict(net, Path(d), items, HEADS, cfg, "cpu")
         check("predictions come back in item order, one per item",
               all(len(pt[h][0]) == len(items) and len(pt[h][1]) == len(items) for h in HEADS))
+        # The softmax rows ride along, one per item, and are distributions —
+        # what a threshold question is answered on.
+        check("a probability row per item, summing to 1, argmax == prediction",
+              all(len(pt[h][2]) == len(items)
+                  and all(abs(sum(r) - 1.0) < 1e-3 for r in pt[h][2])
+                  and all(max(range(len(r)), key=r.__getitem__) == pt[h][0][i]
+                          for i, r in enumerate(pt[h][2]))
+                  for h in HEADS))
         # A NO_LABEL target where the item carries no answer for that head.
         unl = [i for i, it in enumerate(items) if "sun_exposure" not in it["labels"]]
         check("unlabeled heads carry the sentinel, not a class",
@@ -114,7 +122,7 @@ def test_a_band_is_scored_only_on_its_own_items():
     1.0 and the <25 band 0.0 — not a blend."""
     items = [{"bbox": [0, 0, s, s], "labels": {"cow": "cow"}} for s in (10, 12, 100, 120)]
     heads = {"cow": ["not_cow", "cow"]}
-    pt = {"cow": ([0, 0, 1, 1], [1, 1, 1, 1])}          # wrong, wrong, right, right
+    pt = {"cow": ([0, 0, 1, 1], [1, 1, 1, 1], [[1, 0]] * 2 + [[0, 1]] * 2)}  # wrong, wrong, right, right
     strat = S.stratified(pt, items, heads)
     small = strat["by_size"]["<25"]["cow"]
     big = strat["by_size"]["90+"]["cow"]

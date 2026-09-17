@@ -223,6 +223,15 @@ curl -X POST 'https://<host>/api/attrs/score'          # whole corpus, resumable
 curl -X POST 'https://<host>/api/attrs/score?dataset=2025-07-03'   # or one day
 ```
 
+Without a browser session — from a shell on the box — touch a request file in
+`data/` instead; the in-process ticker picks it up within 15 minutes (within
+two minutes right after a restart), enqueues the same job, and deletes the file:
+
+```bash
+docker exec -u cownting cownting-cownting-1 sh -c 'echo "{}" > /app/data/attrs_score.request'
+#   or, scoped:  echo '{"dataset": "2025-07-03", "rescore": true}' > data/attrs_score.request
+```
+
 Progress rides `GET /api/uploads` like every other job — there is no second
 status route. The pass yields to a waiting upload and re-queues itself, and
 scored rows carry the model's rev, so an interrupted pass resumes rather than

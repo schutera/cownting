@@ -150,7 +150,8 @@ def split_blocks(
     return out
 
 
-def head_vocabulary(lcon: duckdb.DuckDBPyConnection) -> dict[str, tuple[str, ...]]:
+def head_vocabulary(lcon: duckdb.DuckDBPyConnection, *,
+                    exclude: Sequence[str] = ()) -> dict[str, tuple[str, ...]]:
     """head -> its ordered class names, derived from the LIVE taxonomy.
 
     Three rules, each of which is one of M5's frozen decisions:
@@ -175,6 +176,7 @@ def head_vocabulary(lcon: duckdb.DuckDBPyConnection) -> dict[str, tuple[str, ...
     one the tiles and the hotkeys use — so a class index means the same thing
     across the dataset, the checkpoint and the dashboard.
     """
+    drop = set(exclude)
     out: dict[str, tuple[str, ...]] = {COW_HEAD: COW_CLASSES}
     groups = lcon.execute(
         "SELECT group_key FROM label_groups WHERE active AND NOT multi_select "
@@ -186,8 +188,9 @@ def head_vocabulary(lcon: duckdb.DuckDBPyConnection) -> dict[str, tuple[str, ...
             "AND NOT is_escape ORDER BY sort_order, class_key",
             [gk],
         ).fetchall()
-        if rows:
-            out[gk] = tuple(r[0] for r in rows)
+        keep = tuple(r[0] for r in rows if r[0] not in drop)
+        if keep:
+            out[gk] = keep
     return out
 
 
@@ -358,7 +361,7 @@ def build_dataset(
     relabels = load_relabels(cfg.relabels)
     lcon = labeling.labels_connect(config)
     try:
-        vocab = head_vocabulary(lcon)
+        vocab = head_vocabulary(lcon, exclude=cfg.exclude_classes)
         samples = collect_samples(lcon, block_frames=cfg.block_frames, vocab=vocab,
                                   merge_classes=cfg.merge_classes, relabels=relabels)
     finally:
@@ -430,6 +433,7 @@ def build_dataset(
             # What was rewritten on the way in, so a manifest can be told apart
             # from one built on the raw store.
             "merge_classes": dict(cfg.merge_classes),
+            "exclude_classes": list(cfg.exclude_classes),
             "relabels": cfg.relabels,
             "relabels_applied": len(relabels),
             "crop_pad": acfg.crop_pad,

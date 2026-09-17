@@ -16,6 +16,11 @@ import {
 
 export type FeatureKind = "categorical" | "temporal_frame" | "temporal_hour";
 
+// The model looked and declined to name a class. Lighter than CHART_MUTED
+// ('unscored' / 'not visible') so the two greys read apart in a strip; the
+// legend carries the words either way.
+export const UNSURE_COLOR = "#e4dfd5";
+
 export interface FeatureDef {
   key: string;
   label: string;
@@ -56,6 +61,9 @@ export const FEATURES: FeatureDef[] = [
   // statement about coverage: scoring is resumable and yields to uploads, so a
   // half-scored corpus is an ordinary state. Hiding those rows would leave a
   // pivot whose total silently disagrees with every other total on the page.
+  // 'unsure' (the model looked and declined) and 'unscored' (it never looked)
+  // are both greys, and deliberately different greys: they are different facts,
+  // and the legend names each. Never folded together.
   {
     key: "sun",
     label: "Sun exposure",
@@ -65,7 +73,9 @@ export const FEATURES: FeatureDef[] = [
         ? SHELTER_COLOR
         : value === "direct_sun"
           ? OPEN_COLOR
-          : CHART_MUTED,
+          : value === "unsure"
+            ? UNSURE_COLOR
+            : CHART_MUTED,
   },
   {
     key: "behaviour",
@@ -82,8 +92,8 @@ export const FEATURES: FeatureDef[] = [
           ? REST_COLOR
           : value === "feeding"
             ? ACCENT_COLORS[0]
-            : value === "head_probing"
-              ? ACCENT_COLORS[1]
+            : value === "unsure"
+              ? UNSURE_COLOR
               : CHART_MUTED,
   },
   {

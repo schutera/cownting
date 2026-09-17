@@ -138,9 +138,17 @@ def score_detections(
     total_frames = len(groups)
 
     cow_i = heads.get(COW_HEAD, []).index("cow") if "cow" in heads.get(COW_HEAD, []) else None
+    # The abstention rule needs to know which behaviour output is not_visible
+    # and which are the substantive postures. Resolved once from the checkpoint's
+    # own vocabulary; a checkpoint trained without the class simply never
+    # abstains on p(nv) and only the confidence half applies.
+    beh = heads.get("behaviour", [])
+    nv_i = beh.index("behaviour.not_visible") if "behaviour.not_visible" in beh else None
+    subst_i = [i for i in range(len(beh)) if i != nv_i]
     scored = 0
     unreadable = 0
     gated_out = 0
+    abstained = 0
     pending: list[tuple] = []
     done_frames = 0
 
@@ -190,8 +198,21 @@ def score_detections(
                         vals["attr_sun"] = cs[j]
                         vals["attr_sun_p"] = float(p[j])
                     elif h == "behaviour":
-                        vals["attr_behaviour"] = cs[j]
-                        vals["attr_behaviour_p"] = float(p[j])
+                        # Abstain rather than show a posture the model cannot
+                        # back (config docstring for the why). NULL class, but
+                        # the probability of the posture it WOULD have shown is
+                        # kept, and attr_model_rev is still written, so the row
+                        # reads as 'unsure' — distinct from 'unscored'.
+                        best = max(subst_i, key=lambda i: float(p[i])) if subst_i else j
+                        conf = float(p[best])
+                        pnv = float(p[nv_i]) if nv_i is not None else 0.0
+                        if pnv >= cfg.abstain_nv_p or conf < cfg.abstain_min_conf:
+                            vals["attr_behaviour"] = None
+                            vals["attr_behaviour_p"] = conf
+                            abstained += 1
+                        else:
+                            vals["attr_behaviour"] = cs[best]
+                            vals["attr_behaviour_p"] = conf
                 pending.append((
                     vals.get("attr_is_cow"), vals.get("attr_cow_p"),
                     vals.get("attr_sun"), vals.get("attr_sun_p"),
@@ -215,7 +236,9 @@ def score_detections(
         "scored": scored,
         "unreadable": unreadable,
         "gated_out": gated_out,
+        "abstained": abstained,
         "cow_threshold": cfg.cow_threshold,
+        "abstain": {"nv_p": cfg.abstain_nv_p, "min_conf": cfg.abstain_min_conf},
         "device": device,
         "geometry_mismatch": geom_mismatch,
         "metrics": blob.get("metrics", {}).get("mean_macro_f1"),
@@ -272,9 +295,12 @@ def coverage(con, *, dataset_id: str | None = None) -> dict[str, Any]:
         f"""SELECT count(*) AS detections,
                    count(attr_model_rev) AS scored,
                    count(*) FILTER (WHERE attr_is_cow = false) AS not_cow,
-                   count(DISTINCT attr_model_rev) AS revs
+                   count(DISTINCT attr_model_rev) AS revs,
+                   count(*) FILTER (WHERE attr_model_rev IS NOT NULL
+                                      AND attr_behaviour IS NULL) AS unsure
             FROM detections {where}""",
         params,
     ).fetchone()
     return {"detections": int(row[0]), "scored": int(row[1]),
-            "not_cow": int(row[2]), "model_revs": int(row[3])}
+            "not_cow": int(row[2]), "model_revs": int(row[3]),
+            "behaviour_unsure": int(row[4])}

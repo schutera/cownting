@@ -616,6 +616,28 @@ def kpi_summary(con, dataset_id: str | None = None) -> dict:
         p + p + p + p + p + p,
     ).fetchone()
     frames, valid_frames, dets, standing, lying, sheltering = row
+    # What the M5 crop model says, for the KPI rail. A separate query rather
+    # than nine more subqueries above: that SELECT binds its dataset parameter
+    # positionally per subquery, and extending it is how a filter silently stops
+    # applying to one of them. Same gate predicate as everything else.
+    a = con.execute(
+        f"""
+        SELECT count(*) FILTER (WHERE attr_model_rev IS NOT NULL)                      AS scored,
+               count(*) FILTER (WHERE attr_behaviour = 'behaviour.feeding')            AS feeding,
+               count(*) FILTER (WHERE attr_behaviour = 'behaviour.lying')              AS b_lying,
+               count(*) FILTER (WHERE attr_behaviour = 'behaviour.standing')           AS b_standing,
+               count(*) FILTER (WHERE attr_behaviour = 'behaviour.not_visible')        AS b_not_visible,
+               count(*) FILTER (WHERE attr_model_rev IS NOT NULL
+                                  AND attr_behaviour IS NULL)                          AS b_unsure,
+               count(*) FILTER (WHERE attr_sun = 'sun_exposure.shaded')                AS shaded,
+               count(*) FILTER (WHERE attr_sun = 'sun_exposure.direct_sun')            AS direct_sun,
+               count(*) FILTER (WHERE attr_sun = 'sun_exposure.not_visible')           AS s_not_visible
+        FROM detections WHERE 1=1{dp} AND {g}
+        """,
+        p,
+    ).fetchone()
+    scored, feeding, b_lying, b_standing, b_nv, b_unsure, shaded, direct, s_nv = (
+        int(v or 0) for v in a)
     return {
         "frames": int(frames or 0),
         "valid_frames": int(valid_frames or 0),
@@ -626,6 +648,15 @@ def kpi_summary(con, dataset_id: str | None = None) -> dict:
         "cows_per_frame": round((dets / valid_frames), 2) if valid_frames else 0.0,
         "pct_lying": round(100 * lying / dets, 1) if dets else 0.0,
         "pct_sheltering": round(100 * sheltering / dets, 1) if dets else 0.0,
+        # `scored` is the denominator the strips use — the model's own view of
+        # the day. 0 means the model has not looked at this day; the rail says
+        # so instead of drawing empty bars.
+        "attrs": {
+            "scored": scored,
+            "behaviour": {"feeding": feeding, "lying": b_lying, "standing": b_standing,
+                          "not_visible": b_nv, "unsure": b_unsure},
+            "sun": {"shaded": shaded, "direct_sun": direct, "not_visible": s_nv},
+        },
     }
 
 

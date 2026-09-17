@@ -48,19 +48,26 @@ FEATURES: dict[str, FeatureSpec] = {
     # and yielding to uploads, a partially-scored corpus is an ordinary state, and
     # a pivot that silently omitted those rows would show a total that disagrees
     # with every other total on the page.
+    # Three tail buckets, and the distinction matters: 'unscored' = the model
+    # never looked (attr_model_rev NULL); 'unsure' = it looked and declined to
+    # name a posture (the abstention rule in config.InstanceAttrsCfg); a class =
+    # it looked and is confident. Collapsing unsure into unscored would hide
+    # exactly the number the abstention exists to make visible.
     "sun": FeatureSpec(
         "sun",
-        "CASE WHEN d.attr_sun IS NULL THEN 'unscored' "
+        "CASE WHEN d.attr_model_rev IS NULL THEN 'unscored' "
+        "WHEN d.attr_sun IS NULL THEN 'unsure' "
         "ELSE replace(d.attr_sun, 'sun_exposure.', '') END",
         "categorical", False,
-        ("shaded", "direct_sun", "not_visible", "unscored"), "attr_sun"),
+        ("shaded", "direct_sun", "not_visible", "unsure", "unscored"), "attr_model_rev"),
     "behaviour": FeatureSpec(
         "behaviour",
-        "CASE WHEN d.attr_behaviour IS NULL THEN 'unscored' "
+        "CASE WHEN d.attr_model_rev IS NULL THEN 'unscored' "
+        "WHEN d.attr_behaviour IS NULL THEN 'unsure' "
         "ELSE replace(d.attr_behaviour, 'behaviour.', '') END",
         "categorical", False,
-        ("feeding", "lying", "standing", "head_probing", "not_visible", "unscored"),
-        "attr_behaviour"),
+        ("feeding", "lying", "standing", "not_visible", "unsure", "unscored"),
+        "attr_model_rev"),
     "region": FeatureSpec(
         "region", "d.region_id", "categorical", False, None, "region_id", drop_null=True),
     "camera": FeatureSpec(

@@ -230,6 +230,14 @@ export interface ClassIconProps {
 /* Always renders an <svg> of the requested size, aria-hidden because the class
    name beside it already carries the meaning — announcing "sun graphic" before
    "Direct sun" is noise for a screen reader, not information. */
+/** The bare 24x24 glyph, for callers that already own an <svg> (the frame
+    viewer's badge layer) and cannot nest a second one. Same lookup, same
+    fallback to the neutral dot, no wrapper. Stroke and fill come from the
+    enclosing group's `stroke`/`color`. */
+export function ClassGlyph({ name }: { name: string }) {
+  return <>{isIconName(name) ? GLYPHS[name] : GLYPHS.dot}</>;
+}
+
 export function ClassIcon({ name, className = "w-[26px] h-[26px]" }: ClassIconProps) {
   const glyph = isIconName(name) ? GLYPHS[name] : GLYPHS.dot;
   return (

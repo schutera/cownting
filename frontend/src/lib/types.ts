@@ -1,4 +1,22 @@
-export interface Kpis { frames:number; valid_frames:number; detections:number; standing:number; lying:number; sheltering:number; cows_per_frame:number; pct_lying:number; pct_sheltering:number; }
+export interface Kpis { frames:number; valid_frames:number; detections:number; standing:number; lying:number; sheltering:number; cows_per_frame:number; pct_lying:number; pct_sheltering:number; attrs?: AttrKpis; }
+// What the M5 crop model says about the day. `scored` is the denominator: the
+// detections the model has looked at (gate applied). `unsure` is a real bucket —
+// the model looked and declined to name a posture — never folded into a class.
+export interface AttrKpis {
+  scored: number;
+  behaviour: { feeding:number; lying:number; standing:number; not_visible:number; unsure:number };
+  sun: { shaded:number; direct_sun:number; not_visible:number };
+}
+// One detection on one frame, with the model's verdicts — what the frame
+// viewer draws its attribute badges from. Boxes are full-frame pixels.
+export interface FrameDetection {
+  detection_id:number; bbox_x1:number; bbox_y1:number; bbox_x2:number; bbox_y2:number;
+  posture:string|null;
+  attr_is_cow:boolean|null; attr_cow_p:number|null;
+  attr_sun:string|null; attr_sun_p:number|null;
+  attr_behaviour:string|null; attr_behaviour_p:number|null;
+  attr_model_rev:string|null;
+}
 // Whole-day totals for one count area: split by posture + how many were under a panel.
 export interface AreaSummaryRow { region_id:string; total:number; standing:number; lying:number; sheltering:number; }
 export interface ImgMeta { url:string; width:number; height:number; }

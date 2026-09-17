@@ -84,8 +84,12 @@ def _fixture(d: str) -> tuple[Config, str]:
         cameras=[],
         annotation=AnnotationCfg(crop_pad=0.35, crop_max_width=768,
                                  mask_timestamp_banner=True),
+        # Abstention OFF here: random weights never clear a 0.6 confidence, so
+        # with the default rule every behaviour class would be NULL and "every
+        # column is written" could not be tested. The rule gets its own test.
         instance_attrs=InstanceAttrsCfg(weights=os.path.join(d, "m.pt"),
-                                        device="cpu", cow_threshold=0.5),
+                                        device="cpu", cow_threshold=0.5,
+                                        abstain_min_conf=0.0, abstain_nv_p=1.01),
         paths=PathsCfg(artifacts_dir=art, db_path=os.path.join(d, "cownting.duckdb")),
     )
     con = db.connect(cfg.paths.db_path)
@@ -218,6 +222,38 @@ def test_a_crop_geometry_change_is_reported_not_swallowed():
               str(s["geometry_mismatch"]))
 
 
+def test_abstention_leaves_a_rev_and_a_probability_but_no_class():
+    """An abstained row must read as 'unsure', not 'unscored': the rev says the
+    model looked, the probability says how close it came, and only the class is
+    withheld. Random weights sit well under any real confidence threshold, so
+    the default rule abstains on every row — which is exactly the case to pin."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rev = _fixture(d)
+        cfg.instance_attrs.abstain_min_conf = 0.99       # nothing clears it
+        cfg.instance_attrs.abstain_nv_p = 1.01
+        s = I.run_score(cfg)
+        check("the summary counts the abstentions", s["abstained"] == 6, str(s["abstained"]))
+        con = db.connect(cfg.paths.db_path)
+        row = con.execute(
+            """SELECT count(*), count(attr_behaviour), count(attr_behaviour_p),
+                      count(attr_model_rev), count(attr_sun)
+               FROM detections""").fetchone()
+        check("no behaviour class is written", row[1] == 0, str(row))
+        check("...but every row keeps its probability and its rev — 'unsure', not 'unscored'",
+              row[2] == 6 and row[3] == 6, str(row))
+        check("the sun head is untouched by the behaviour rule", row[4] == 6, str(row))
+        cov = I.coverage(con)
+        check("coverage reports the unsure count", cov["behaviour_unsure"] == 6, str(cov))
+        con.close()
+
+        cfg.instance_attrs.abstain_min_conf = 0.0        # everything clears it
+        I.run_score(cfg, rescore=True)
+        con = db.connect(cfg.paths.db_path)
+        n = con.execute("SELECT count(attr_behaviour) FROM detections").fetchone()[0]
+        check("with the rule off every row gets a class", n == 6, str(n))
+        con.close()
+
+
 def test_missing_weights_fail_loudly():
     with tempfile.TemporaryDirectory() as d:
         cfg, _rev = _fixture(d)
@@ -255,6 +291,7 @@ def main():
     test_a_different_model_rev_reclaims_every_row()
     test_the_gate_threshold_decides_the_flag_not_the_argmax()
     test_a_crop_geometry_change_is_reported_not_swallowed()
+    test_abstention_leaves_a_rev_and_a_probability_but_no_class()
     test_missing_weights_fail_loudly()
     test_coverage_reports_what_the_gate_is_doing()
     print("=================================")

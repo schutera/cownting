@@ -86,7 +86,9 @@ def cross_validate(config: Config, *, dataset_dir: str | Path | None = None,
     # over ALL instances — the rare band and the rare class both get judged on
     # everything they have rather than on one fold's handful.
     all_items: list[dict] = []
-    all_pt: dict[str, tuple[list[int], list[int]]] = {h: ([], []) for h in heads}
+    all_pt: dict[str, tuple[list[int], list[int], list[list[float]]]] = {
+        h: ([], [], []) for h in heads}
+    all_folds: list[int] = []
     for f in range(k):
         va = [it for it in items if assign[it["block"]] == f]
         tr = [it for it in items if assign[it["block"]] != f]
@@ -98,9 +100,11 @@ def cross_validate(config: Config, *, dataset_dir: str | Path | None = None,
         conf = S.confusion_from(pt, heads)
         pooled = conf if pooled is None else _sum_conf(pooled, conf)
         all_items.extend(va)
+        all_folds.extend([f] * len(va))
         for h in heads:
             all_pt[h][0].extend(pt[h][0])
             all_pt[h][1].extend(pt[h][1])
+            all_pt[h][2].extend(pt[h][2])
         rep = T.report_from_confusion(conf, heads)
         per_fold.append({"fold": f, "train": len(tr), "val": len(va),
                          "epochs": r["epochs"], "mean_macro_f1": T.mean_macro_f1(rep),
@@ -146,6 +150,17 @@ def cross_validate(config: Config, *, dataset_dir: str | Path | None = None,
         # optimistic and this is the number to read alongside it.
         "by_size": by_size["by_size"],
         "band_counts": by_size["band_counts"],
+        # OUT-OF-FOLD predictions for every instance: each was scored by the
+        # one model that never saw it. This is what a threshold or calibration
+        # question is answered on — 2,381 leakage-free probability rows rather
+        # than a 477-item split — and it is why the CV keeps the softmax.
+        "oof": [
+            {"instance_key": it["instance_key"], "fold": all_folds[i],
+             "block": it["block"], "bbox": it["bbox"],
+             "target": {h: all_pt[h][1][i] for h in heads},
+             "prob": {h: all_pt[h][2][i] for h in heads}}
+            for i, it in enumerate(all_items)
+        ],
     }
 
 

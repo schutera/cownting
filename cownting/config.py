@@ -218,6 +218,12 @@ class InstanceAttrsCfg(BaseModel):
     # be active or the answer is dropped, the same as any other archived class.
     merge_classes: dict = Field(default_factory=dict)
     relabels: str | None = None
+    # Classes to leave OUT of the model entirely: removed from the head's
+    # vocabulary, their answers dropped (the instance still trains the other
+    # heads). The taxonomy is untouched — annotators keep the option. Exists to
+    # test "do not train not_visible at all, call it by confidence instead"
+    # against "train it and threshold its probability", on the same OOF data.
+    exclude_classes: list = Field(default_factory=list)
 
     # Split. The unit is a contiguous run of frames from one camera on one day —
     # at ingest.frame_interval_seconds = 60 those are minutes, so 30 is a
@@ -324,6 +330,36 @@ class InstanceAttrsCfg(BaseModel):
     # high: wrongly dropping a real animal corrupts the count, which is the
     # product, while keeping a false positive merely fails to improve it.
     cow_threshold: float = 0.5
+    # --- behaviour abstention ---
+    # The behaviour head's not_visible class is the annotator's epistemic state,
+    # not a look ("too little of the body is visible to read the posture"), and
+    # it trains to ~40% recall / ~50% precision no matter what — a partially
+    # occluded cow looks like a cow. So the dashboard does not try to DETECT
+    # "not visible"; it declines to SHOW a posture it cannot back. Scoring writes
+    # attr_behaviour = NULL (attr_model_rev still set, so it reads as 'unsure',
+    # not 'unscored') when
+    #     p(not_visible) >= abstain_nv_p   or   max(feeding, lying, standing) < abstain_min_conf
+    # Fit on out-of-fold probabilities of all 1,943 behaviour-labelled instances
+    # (2026-09-17, resnet18 recipe; `attrs cv` keeps the softmax). Coverage is
+    # the share of crops that get a posture; precision is how often the shown
+    # posture matches the annotator, with the annotator's own not_visible
+    # counted as "should have abstained":
+    #
+    #     rule                     coverage   precision   nv caught
+    #     argmax (no abstention)     92.0%      83.3%        —
+    #     conf < 0.5                 81.8%      87.7%       61.9%
+    #     conf < 0.6   <- default    73.1%      90.7%       74.8%
+    #     conf < 0.7                 64.0%      93.0%       83.2%
+    #     conf < 0.8                 50.8%      95.4%       92.6%
+    #
+    # Max-confidence is the stronger signal; a p(not_visible) threshold adds
+    # nothing on top (high p(nv) already forces low confidence), so abstain_nv_p
+    # is set where it only fires when not_visible is the argmax. The class is
+    # still trained: it is what keeps the confidence honest on occluded crops.
+    # The raw probability is kept in attr_behaviour_p either way.
+    abstain_nv_p: float = 0.50
+    abstain_min_conf: float = 0.60
+
     # Master switch for the gate's EFFECT. Scoring always writes its verdict;
     # this decides whether the rest of the app filters on it. Off by default
     # because turning it on moves every historical count in the dashboard.

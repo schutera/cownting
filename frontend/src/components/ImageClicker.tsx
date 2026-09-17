@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { CSSProperties, PointerEvent as RPointerEvent } from "react";
+import type { CSSProperties, PointerEvent as RPointerEvent, ReactNode } from "react";
 import { SectionLabel } from "../components/ui";
 import { CHART_PRIMARY } from "../lib/palette";
 
@@ -51,6 +51,7 @@ export function ImageClicker({
   onMovePoint,
   onDeletePoint,
   maxHeight = "68vh",
+  overlay,
 }: {
   src: string;
   naturalWidth: number;
@@ -66,7 +67,12 @@ export function ImageClicker({
   preview?: number[][][]; // provisional polygons (e.g. an import preview), drawn dashed in a distinct colour
   onMovePoint?: (index: number, pt: [number, number]) => void; // polyline: drag a current-line vertex
   onDeletePoint?: (index: number) => void; // polyline: double-click a current-line vertex to remove it
-  maxHeight?: string; // any CSS length — caps the viewport so a tall image still fits on screen
+  maxHeight?: string;
+  /** Extra layer drawn INSIDE the zoom/pan transform, in natural-pixel
+      coordinates, on top of the image. Receives 1/scale so a caller can keep
+      on-screen sizes constant across zoom (the same trick the markers use).
+      Pointer-transparent: it annotates, it never intercepts. */
+  overlay?: (invScale: number) => ReactNode; // any CSS length — caps the viewport so a tall image still fits on screen
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -273,6 +279,9 @@ export function ImageClicker({
           }}
         >
           <img ref={imgRef} src={src} className="w-full block" draggable={false} />
+          {overlay ? (
+            <div className="absolute inset-0 pointer-events-none">{overlay(invScale)}</div>
+          ) : null}
           {mode === "polyline" ? (
             <div className="absolute inset-0 pointer-events-none">
               {/* Connecting segments — SVG in natural-px viewBox so lines track

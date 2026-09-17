@@ -1141,6 +1141,45 @@ def create_app(config: Config) -> FastAPI:
                                                 rescore=rescore)
         return uploads_mod.job_dict(job)
 
+    @app.get("/api/frame-detections")
+    def frame_detections(camera: str, frame_idx: int, dataset: str | None = None):
+        """Every detection on one frame, with its box and the model's verdicts.
+
+        What the frame viewer draws its attribute icons from — client-side, as
+        SVG over the served image, for the same reasons the label crop's ring
+        is drawn that way: a style change costs no re-render, and a re-score (a
+        new model rev) is a DB update rather than 7,261 new PNGs. Boxes are in
+        full-frame pixels; the client scales them to the displayed image.
+
+        The gate predicate applies exactly as it does to every count: with
+        `gate_enabled` a rejected detection is not returned, so it is not drawn.
+        With the gate off, `attr_is_cow` rides along so the viewer can still
+        mark a rejected one rather than present it as a cow.
+        """
+        c = con()
+        try:
+            ds = resolve_ds(c, dataset)
+            rows = c.execute(
+                f"""SELECT d.detection_id, d.bbox_x1, d.bbox_y1, d.bbox_x2, d.bbox_y2,
+                           d.posture, d.attr_is_cow, d.attr_cow_p, d.attr_sun, d.attr_sun_p,
+                           d.attr_behaviour, d.attr_behaviour_p, d.attr_model_rev
+                    FROM detections d
+                    JOIN frames f ON f.camera_id = d.camera_id AND f.frame_path = d.frame_path
+                     AND f.dataset_id IS NOT DISTINCT FROM d.dataset_id
+                    WHERE d.camera_id = ? AND f.frame_idx = ?
+                      AND d.dataset_id IS NOT DISTINCT FROM ?
+                      AND {db.gate_clause('d')}
+                    ORDER BY d.detection_id""",
+                [camera, frame_idx, ds],
+            ).fetchall()
+        finally:
+            c.close()
+        keys = ("detection_id", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "posture",
+                "attr_is_cow", "attr_cow_p", "attr_sun", "attr_sun_p",
+                "attr_behaviour", "attr_behaviour_p", "attr_model_rev")
+        return [{k: (float(v) if isinstance(v, float) else v) for k, v in zip(keys, r)}
+                for r in rows]
+
     @app.get("/api/attrs/status")
     def attrs_status(dataset: str | None = None):
         """How much of the corpus is scored, and what the gate is doing to it.

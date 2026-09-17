@@ -48,8 +48,10 @@ def band_of(side: float) -> str:
 
 
 def predict(net, root: Path, items: list[dict], heads: dict[str, list[str]],
-            cfg: InstanceAttrsCfg, device: str) -> dict[str, tuple[list[int], list[int]]]:
-    """Per head: (predictions, targets) in ITEM ORDER, NO_LABEL where unlabeled.
+            cfg: InstanceAttrsCfg, device: str
+            ) -> dict[str, tuple[list[int], list[int], list[list[float]]]]:
+    """Per head: (predictions, targets, softmax rows) in ITEM ORDER, NO_LABEL
+    where unlabeled.
 
     Item order is the contract that lets a caller slice by any per-item
     attribute — size here, but a camera or a day would work the same way. The
@@ -62,14 +64,20 @@ def predict(net, root: Path, items: list[dict], heads: dict[str, list[str]],
     dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=T._collate)
     preds: dict[str, list[int]] = {h: [] for h in heads}
     targs: dict[str, list[int]] = {h: [] for h in heads}
+    probs: dict[str, list[list[float]]] = {h: [] for h in heads}
     net = net.to(device).eval()
     with torch.no_grad():
         for xs, ys in dl:
             out = T._forward(net, xs.to(device), tta_hflip=cfg.tta_hflip)
             for h in heads:
-                preds[h].extend(out[h].argmax(1).cpu().tolist())
+                sm = torch.softmax(out[h], dim=1).cpu()
+                preds[h].extend(sm.argmax(1).tolist())
                 targs[h].extend(ys[h].tolist())
-    return {h: (preds[h], targs[h]) for h in heads}
+                # The full distribution, not just the argmax: threshold and
+                # calibration questions ("what if we only call not_visible
+                # above p=0.3?") need it, and it costs nothing to keep.
+                probs[h].extend([[round(v, 5) for v in row] for row in sm.tolist()])
+    return {h: (preds[h], targs[h], probs[h]) for h in heads}
 
 
 def confusion_from(pred_targ: dict[str, tuple[list[int], list[int]]],
@@ -78,7 +86,7 @@ def confusion_from(pred_targ: dict[str, tuple[list[int], list[int]]],
     """Confusion matrices over the items where `keep` is True (all, if None)."""
     conf = {h: [[0] * len(cs) for _ in cs] for h, cs in heads.items()}
     for h in heads:
-        p, t = pred_targ[h]
+        p, t = pred_targ[h][0], pred_targ[h][1]
         for i, (pi, ti) in enumerate(zip(p, t)):
             if ti >= 0 and (keep is None or keep[i]):
                 conf[h][ti][pi] += 1

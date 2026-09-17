@@ -99,6 +99,14 @@ _ALERT = "[cownting.alert] LABEL-BACKUP"
 # configured fires, and the watermark advances once either way so a milestone is
 # announced exactly once.
 _MILESTONE_ALERT = "[cownting.alert] LABEL-MILESTONE"
+# A file an operator can `touch` from the shell to enqueue an attribute-scoring
+# pass IN THE SERVER PROCESS. The HTTP route is poweruser-gated and a shell on
+# the box is at least as trusted; this is the in-process trigger a shell can
+# reach. Optional JSON body {"dataset": ..., "camera": ..., "rescore": bool};
+# an empty file means "everything, resume". Consumed (deleted) on pickup, so a
+# request fires once, and the decision is logged with the job id.
+SCORE_REQUEST = "attrs_score.request"
+_SCORE_ALERT = "[cownting.alert] ATTRS-SCORE"
 _UA = "cownting-labels-backup/1.0 (+https://cownting.schutera.com)"
 _ZIP_GLOB = "labels-*.zip"
 
@@ -846,6 +854,42 @@ def _milestone_text(labeled: int, level: int, step: int) -> str:
     )
 
 
+def check_score_request(config: Config) -> dict[str, Any] | None:
+    """Enqueue an attribute-scoring job if the request file exists. Returns the
+    job dict, or None. Never raises: it runs on the shared ticker thread."""
+    import json as _json
+    from pathlib import Path
+
+    req = Path(config.paths.db_path).parent / SCORE_REQUEST
+    if not req.exists():
+        return None
+    body: dict[str, Any] = {}
+    try:
+        raw = req.read_text(encoding="utf-8").strip()
+        if raw:
+            body = _json.loads(raw)
+            if not isinstance(body, dict):
+                body = {}
+    except Exception as e:  # noqa: BLE001 — a malformed body is still a request
+        print(f"{_SCORE_ALERT} request body unreadable ({e}); scoring everything")
+        body = {}
+    # Consume FIRST, so a job that raises on enqueue cannot re-fire forever.
+    try:
+        req.unlink()
+    except OSError as e:
+        print(f"{_SCORE_ALERT} could not remove {req.name}: {e}; not enqueuing")
+        return None
+    from . import uploads as uploads_mod   # lazy: uploads imports the pipeline
+
+    job = uploads_mod.start_attrs_score_job(
+        config, dataset_id=body.get("dataset"), camera_id=body.get("camera"),
+        rescore=bool(body.get("rescore", False)))
+    print(f"{_SCORE_ALERT} enqueued job {job.job_id} "
+          f"dataset={body.get('dataset') or 'all'} rescore={bool(body.get('rescore', False))}",
+          flush=True)
+    return uploads_mod.job_dict(job)
+
+
 def check_milestone(
     config: Config,
     *,
@@ -1040,4 +1084,8 @@ def _ticker() -> None:
                 check_milestone(cfg, trigger="schedule")
             except Exception as e:  # noqa: BLE001 — never let a ping kill the ticker
                 print(f"{_MILESTONE_ALERT} tick crashed: {_redact(str(e) or repr(e))}")
+            try:
+                check_score_request(cfg)
+            except Exception as e:  # noqa: BLE001 — same rule
+                print(f"{_SCORE_ALERT} tick crashed: {_redact(str(e) or repr(e))}")
         time.sleep(_TICK_S)

@@ -437,7 +437,8 @@ def _run_attrs_score(job: Job, base: Config, dataset_id: str | None,
             return
 
         msg = (f"Scored {stats['scored']} detections across {stats['frames']} frames; "
-               f"{stats['gated_out']} judged not-a-cow at p<{stats['cow_threshold']}.")
+               f"{stats['gated_out']} judged not-a-cow at p<{stats['cow_threshold']}; "
+               f"{stats.get('abstained', 0)} left unsure on behaviour.")
         if stats["unreadable"]:
             msg += f" {stats['unreadable']} crop(s) were unreadable and stay unscored."
         if stats["geometry_mismatch"]:

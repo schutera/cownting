@@ -266,6 +266,36 @@ and behaviour's `not_visible` decide it, and neither is learnable at this
 volume. The split is fine for early stopping and for the size-band gate figure;
 it is not fine for choosing between recipes. Use the CV.
 
+### 9.3 Behaviour: abstain rather than guess (2026-09-17)
+
+The behaviour head's `not_visible` is the annotator's epistemic state, not a
+look — "too little of the body is visible to read the posture" — and it trains
+to ~40% recall / ~50% precision in every configuration, because a partially
+occluded cow looks like a cow. Sun's `not_visible` is different (dark, blown
+out, cut off *look* like something) and works at 0.84 F1; it is left alone.
+
+So the dashboard does not try to detect "not visible" for behaviour. It declines
+to show a posture it cannot back. Scoring writes `attr_behaviour = NULL` with
+`attr_model_rev` set — the row reads as **unsure**, distinct from **unscored** —
+when `max(feeding, lying, standing) < abstain_min_conf`. The threshold was fit on
+out-of-fold probabilities of all 1,943 behaviour-labelled instances:
+
+| rule | coverage | precision of shown postures | annotator's not_visible caught |
+|---|---|---|---|
+| argmax, no abstention | 92.0% | 83.3% | — |
+| conf < 0.5 | 81.8% | 87.7% | 61.9% |
+| **conf < 0.6 (default)** | **73.1%** | **90.7%** | **74.8%** |
+| conf < 0.7 | 64.0% | 93.0% | 83.2% |
+| conf < 0.8 | 50.8% | 95.4% | 92.6% |
+
+A `p(not_visible)` threshold was tested alongside and adds nothing: high p(nv)
+already forces low confidence. The class is still trained, and should be — it is
+what keeps the confidence honest on occluded crops. Dropping it and relying on
+confidence alone was not measured, and is the one variant here that was not.
+
+The operating point is a config line (`instance_attrs.abstain_min_conf`); the
+number to watch is the `unsure` bucket in the behaviour pivot and the KPI rail.
+
 ## 10. Known risks
 
 - **543 samples is small.** Transfer learning from ImageNet makes it viable, not
