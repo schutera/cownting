@@ -170,6 +170,21 @@ def _persist(force: bool = False) -> None:
         pass  # persistence is best-effort; never fail a job over a disk hiccup
 
 
+# What to do about a job the restart killed, by kind. An upload has to be sent
+# again; the two backfills only have to be STARTED again — every row they had
+# already written carries the model rev / outline that scored it, so a fresh
+# pass skips those and continues. Telling someone to "re-upload this day" for
+# an interrupted corpus-wide scoring pass sent them to the wrong page.
+_INTERRUPTED = {
+    "upload": "Interrupted by a server restart — re-upload this day to finish it.",
+    "remask": ("Interrupted by a server restart — start the outline pass again "
+               "(POST /api/remask); it resumes where it stopped."),
+    "attrs_score": ("Interrupted by a server restart — start scoring again "
+                    "(POST /api/attrs/score, or the request file); rows already "
+                    "scored are kept and the pass resumes where it stopped."),
+}
+
+
 def recover_jobs(config: Config) -> None:
     """Point the job store at data/upload_jobs.json and reload any prior snapshot.
 
@@ -191,7 +206,7 @@ def recover_jobs(config: Config) -> None:
             if job.status in ACTIVE:
                 job.status = "failed"
                 job.error = "interrupted by a server restart"
-                job.message = "Interrupted by a server restart — re-upload this day to finish it."
+                job.message = _INTERRUPTED.get(job.kind, _INTERRUPTED["upload"])
             _JOBS[job.job_id] = job
         _persist(force=True)
 

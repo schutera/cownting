@@ -118,9 +118,45 @@ def test_an_unaccompanied_backfill_runs_to_done():
             _restore(saved)
 
 
+def test_a_restart_tells_each_kind_of_job_the_right_thing():
+    """The upload has to be sent again; the backfills only started again. The
+    first production restart under a scoring pass told the operator to
+    're-upload this day' for a corpus-wide job with no day."""
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        from cownting.config import Config, PathsCfg
+        cfg = Config(cameras=[], paths=PathsCfg(db_path=os.path.join(d, "cownting.duckdb")))
+        store = os.path.join(d, "upload_jobs.json")
+        rows = [
+            {"job_id": "u1", "dataset_id": "2025-07-03", "label": "t", "status": "running", "kind": "upload"},
+            {"job_id": "r1", "dataset_id": "", "label": "t", "status": "queued", "kind": "remask"},
+            {"job_id": "a1", "dataset_id": "", "label": "t", "status": "running", "kind": "attrs_score"},
+            {"job_id": "d1", "dataset_id": "2025-07-02", "label": "t", "status": "done", "kind": "upload",
+             "message": "Upload complete."},
+        ]
+        with open(store, "w") as f:
+            json.dump(rows, f)
+        saved = _with_jobs([])
+        try:
+            uploads.recover_jobs(cfg)
+            J = uploads._JOBS
+            check("every active job is failed as interrupted",
+                  all(J[k].status == "failed" and J[k].error for k in ("u1", "r1", "a1")))
+            check("the finished one is untouched", J["d1"].status == "done" and J["d1"].message == "Upload complete.")
+            check("an upload says re-upload", "re-upload" in J["u1"].message, J["u1"].message)
+            check("a remask says start the outline pass again",
+                  "/api/remask" in J["r1"].message and "re-upload" not in J["r1"].message, J["r1"].message)
+            check("a scoring pass says start scoring again and that it resumes",
+                  "/api/attrs/score" in J["a1"].message and "resumes" in J["a1"].message
+                  and "re-upload" not in J["a1"].message, J["a1"].message)
+        finally:
+            _restore(saved)
+
+
 def main():
     test_the_predicate_means_an_upload_and_nothing_else()
     test_an_unaccompanied_backfill_runs_to_done()
+    test_a_restart_tells_each_kind_of_job_the_right_thing()
     print(f"\n{'ALL OK' if not _FAILED else f'{_FAILED} FAILED'}")
     sys.exit(1 if _FAILED else 0)
 
