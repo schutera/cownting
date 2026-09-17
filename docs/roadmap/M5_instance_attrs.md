@@ -233,13 +233,18 @@ Pooled mean macro-F1, baseline 0.773–0.778 (mobilenet_v3_small, no augmentatio
 | trunk: mobilenet_v3_large / efficientnet_b0 / resnet18 (baseline recipe) | 0.780 / 0.792 / 0.792 | behaviour 0.54 → 0.59 |
 | **efficientnet_b0 + full recipe** | **0.801 ± 0.009** | wins every fold vs baseline |
 | **resnet18 + full recipe** | **0.798 ± 0.007** | tie with B0; 36.5 vs 43.5 ms/crop on the box's CPU |
+| resnet18 + full recipe, head_probing merged (§2.2) | 0.849 ± 0.007 | four behaviour classes, so NOT comparable to the row above; on the shared four, behaviour 0.717 → 0.741, standing 0.69 → 0.74; gate and sun unchanged |
 
 ResNet18 ships: the two trunks tie within rerun noise on the headline and on
 the 25–60px gate, and it is the faster of the two on the serving box (depthwise
 convolutions are memory-bound on CPU; the GFLOPs ordering is not the wall-clock
 ordering). Behaviour per class, pooled over all 1,943 labelled instances,
-baseline → shipped: feeding 0.72 → 0.81, lying 0.91 → 0.97, standing 0.55 →
-0.69, not_visible 0.42 → 0.40, head_probing 0.09 → 0.09.
+baseline → shipped → after the head_probing merge: feeding 0.72 → 0.81 → 0.82,
+lying 0.91 → 0.97 → 0.97, standing 0.55 → 0.69 → 0.74, not_visible 0.42 → 0.40
+→ 0.43. The merge's headline jump (0.798 → 0.849) is mostly the metric
+changing — a mean over four learnable classes instead of five with one at 0.09
+— and about +0.024 of it is a real gain on the shared classes, above the
+±0.009 fold spread. Trained checkpoint: resnet18 `e27d6d4d6638`, 2026-09-17.
 
 ### 9.1 Judge it by crop size
 
