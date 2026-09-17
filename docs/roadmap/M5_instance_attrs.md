@@ -196,6 +196,15 @@ The work is grouped **by frame, not by detection**. 46,486 detections live on
 7,261 frames — roughly 6.4 per frame — so decoding per detection would decode
 each frame six times over. One decode, all its crops, one batch.
 
+A shell on the box has no session for the poweruser route, so there is a second
+way in: a request file (`data/attrs_score.request`) that the in-process ticker
+consumes and turns into the same job (DEPLOY.md). The pass yields to a waiting
+*upload* — and only to an upload: the first production run yielded to its own
+running job and reloaded the model every three seconds until py-spy found it
+(commit `6cb20d4`). On the box's CPU a full pass over the corpus is ~65 min
+(ResNet18, ~110 frames/min); an interrupted pass resumes, because scored rows
+carry the rev that scored them.
+
 ## 8. Phasing
 
 | Step | Ships |
@@ -206,9 +215,16 @@ each frame six times over. One decode, all its crops, one batch.
 | 4 | `instance_attrs/infer.py` + schema + `POST /api/attrs/score`. CLI `attrs score` |
 | 5 | `features.py` + `db.export_df` + frontend — the numbers reach insights and the CSV |
 | 6 | Deploy; score all 17 days |
+| 7 | Calibrated abstention (§9.3), the `unsure` bucket end to end, KPI strips, frame badges, the request-file trigger |
 
 Each step is independently green and independently useful: step 2 produces an
 inspectable dataset whether or not step 3 ever trains well.
+
+**Where it stands (2026-09-17).** All seven shipped. Production runs rev
+`e27d6d4d6638` (ResNet18, `head_probing` merged away, §2.2) over the whole
+corpus; `score_on_ingest` is on, so a new day scores itself after segmentation;
+`gate_enabled` is still off — the dashboard shows what the model thinks, it does
+not yet drop what the model rejects (§10).
 
 ## 9. The recipe, and how it was chosen (2026-09-16/17)
 

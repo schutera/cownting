@@ -80,8 +80,17 @@ points against them, exactly like the panel footprints.
 
 ### Show the classification on the image, not just the mask
 
-**Status:** open. Wanted once [M5](docs/roadmap/M5_instance_attrs.md)'s
-predictions are trusted enough to look at.
+**Status:** SHIPPED 2026-09-17, in the shape argued for below — `AttrBadges.tsx`
+draws one dark pill per animal as SVG inside the frame viewer's zoom/pan
+transform, from `/api/frame-detections`, using the taxonomy's own glyphs
+(`ClassGlyph`). The three states landed as: confident (solid), *unsure* (a
+question glyph where the posture would be, at reduced weight — the model
+abstained, see M5 §9.3), and gate-rejected (struck through and faded, drawn
+only while the gate is off). An unscored crop gets no badge at all, so an
+absent badge IS the unscored state. The "confidence as opacity" variant was
+not taken: a calibrated abstain/show threshold makes a cleaner claim than a
+badge that is 63% there. What is still open here is nothing on the overlay
+itself; the remaining question is the gate (M5 §10).
 
 The overlay currently says WHERE each animal is. It should also say what the
 model thinks it is — a small sun / cloud beside each instance for sun exposure,
