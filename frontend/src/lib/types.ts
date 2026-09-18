@@ -119,7 +119,10 @@ export interface Crosstab {
   cells: CrosstabCell[]; primary_totals: Record<string, number>; total: number;
 }
 // A feature the backend can cross-filter on, plus whether it has data available.
-export interface FeatureInfo { key: string; kind: string; available: boolean; }
+export interface FeatureInfo { key: string; kind: string; available: boolean;   /** This dimension skips detections that have no value for it, so a pivot
+      on it counts fewer cows than are in view (region: outside every area). */
+  drops_unassigned?: boolean;
+}
 
 // One camera's frame coverage over the day: contiguous [startInstant, endInstant]
 // runs on the shared instant axis (gaps split them), plus its count + first/last ts.

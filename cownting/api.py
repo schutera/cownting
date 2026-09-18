@@ -1402,7 +1402,13 @@ def create_app(config: Config) -> FastAPI:
         c = con()
         avail = db.available_features(c)
         c.close()
-        return [{"key": k, "kind": s.kind, "available": avail.get(k, True)}
+        # `drops_unassigned` mirrors the spec's `drop_null`: a pivot on such a
+        # dimension counts FEWER detections than are in view, because rows with
+        # no value for it are skipped (region: a cow outside every count area).
+        # Surfaced so the UI can say so — two panels showing 15 and 4 for the
+        # same moment reads as a bug unless the smaller one explains itself.
+        return [{"key": k, "kind": s.kind, "available": avail.get(k, True),
+                 "drops_unassigned": s.drop_null}
                 for k, s in features_mod.FEATURES.items()]
 
     @app.get("/api/crosstab")
