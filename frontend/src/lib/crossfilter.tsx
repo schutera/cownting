@@ -94,8 +94,15 @@ export function CrossFilterProvider({ children }: { children: ReactNode }) {
   const { frame } = useTimeline();
   const [features, setFeatures] = useState<FeatureInfo[]>([]);
   const [regionLabels, setRegionLabels] = useState<Record<string, string>>({});
-  const [group, setGroup] = useState("panel");
-  const [ratio, setRatio] = useState("posture");
+  // "Of the cows in each light condition, what are they doing?" — the question
+  // this project exists to answer, and the one pairing that is always worth the
+  // default slot. The previous default (under-panels x posture) was a poor one
+  // twice over: `posture` is the segmenter's geometric proxy, superseded by the
+  // model's behaviour head, and `panel` collapses to a single group on any day
+  // where nothing stood under a panel — a breakdown with one bar compares
+  // nothing.
+  const [group, setGroup] = useState("sun");
+  const [ratio, setRatio] = useState("behaviour");
   const [data, setData] = useState<Crosstab | null>(null);
   const [loading, setLoading] = useState(false);
   const [dayData, setDayData] = useState<Crosstab | null>(null);
