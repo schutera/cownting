@@ -129,9 +129,11 @@ it back on screen through the side door.
 
 ### Stop serving unjudgeable crops
 
-**Status:** the size floor SHIPPED (`annotation.min_instance_px` /
-`clear_instance_px` / `small_share`). What remains open is the second half
-below: using the model's own uncertainty to choose what to ask about.
+**Status:** SHIPPED, both halves. The size floor
+(`annotation.min_instance_px` / `clear_instance_px` / `small_share`) landed
+2026-09-10; the model-uncertainty half landed 2026-09-18 and is described at
+the end of this entry. What remains is to re-measure the `not_visible` share
+against the 10% target now that both are live.
 
 **The symptom.** Annotators are spending their time on crops nobody could
 answer. As of 2026-09-09, against 543 labeled instances:
@@ -172,21 +174,46 @@ it being served a first time.
 > `labeling._scan_sql`'s docstring says this; it is repeated here because this
 > is the change most likely to reach for that spot.
 
-**Now that a model exists, there is a second, larger version of this.** M5 scores
-every detection, so the queue could prioritise instances the model is UNSURE
-about (`attr_*_p` near the decision boundary) or where it predicts a starved
-class — turning annotation into active learning rather than uniform sampling.
-That is a bigger change and it carries its own bias: a corpus selected by model
-uncertainty is no longer a random sample, so it can sharpen the model while
-making the label store useless as a measure of what the herd actually does. If
-it is built, the uniformly-sampled slice has to be kept and marked, or the
-agreement statistics and any prevalence estimate quietly stop meaning what they
-say.
+**The second, larger version — SHIPPED 2026-09-18.** M5 scores every detection,
+so the queue promotes instances the model is unsure about: `attr_behaviour_p`
+under `annotation.uncertain_below` (0.75), which by construction covers every
+crop it abstained on (§9.3 puts those below 0.60) as well as the postures it
+called with thin support. On the corpus as scored that is 51.8% of detections
+(36.3% abstained, 15.5% thin) — a real concentration, and wide enough that two
+annotators still pair.
+
+It is a promoted MINORITY into the existing front tier, not a new strict tier,
+for the reason `small_share` is: the servable pool is ~40x everything labelled
+to date, so anything sorted strictly behind is never reached at all.
+**Legibility still leads uncertainty**, and that order is the whole policy —
+the model is least confident on precisely the tiny crops a human cannot read
+either, so reversing the two walks straight back into the problem the size
+floor was built to fix.
+
+The bias this buys is handled rather than accepted. `annotation.uniform_share`
+(0.25) is held out of the rule as a marked random sample; `queue_reason` rides
+the item to the annotation the way `serve_event_id` already does, with
+off-vocabulary values dropped rather than stored; and membership of the
+unbiased slice is `md5('uni' || instance_key)`, so an analysis next year can
+rebuild exactly that slice from the key alone, after the probabilities it was
+selected against have been overwritten by a re-score. On a corpus the model has
+never scored every row reads as maximally uncertain and the served order is
+byte-identical to before.
+
+Not built: prioritising a *starved class*. The uncertainty signal already
+correlates with it, and a second selection pressure would need its own
+justification and its own held-out slice.
 
 **Why it matters beyond annotator hours.** Every unjudgeable crop that reaches
 the queue costs an answer slot *and* teaches M5's classifier that `not_visible`
 is a common outcome. Fixing the sampling changes that head's class balance, so
 M5 gets retrained after this ships — retrained, not redesigned.
+
+> That prediction was confirmed from the other direction on 2026-09-18:
+> deliberately ADDING 427 unjudgeable crops to the trained catch-all cost
+> 0.03–0.08 F1 on every substantive class (M5 §2.3). The class balance of that
+> head is not a detail of the corpus, it is the thing that decides whether
+> `shaded` can be trusted.
 
 ---
 

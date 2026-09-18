@@ -100,6 +100,72 @@ deleting the `relabels:` line and restoring the class; nothing else moves.
 > lands, `not_visible` should fall below 10% of answers and this head's class
 > balance changes; the model is retrained, not redesigned.
 
+### 2.3 One escape hatch, and why its answers are still not trained (2026-09-18)
+
+Each question shipped with TWO ways to decline: `not_visible` ("too little of
+the body is visible"), a normal trained class, and `cannot_tell` ("the body is
+visible, but it will not resolve"), an `is_escape` class that the dataset
+builder dropped as missing data. The distinction is real and was correctly
+drawn. **Annotators did not observe it.**
+
+Measured over the same days, the same camera-days and near-identical crop sizes
+(median longer side 79px vs 84px):
+
+| | `not_visible` | `cannot_tell` | sum | sun | shade |
+|---|---|---|---|---|---|
+| kilian | **45.4%** | 7.5% | 52.9% | 28.6% | 18.4% |
+| alexandra | **17.8%** | 26.5% | 44.3% | 30.2% | 25.5% |
+
+They agree closely on WHICH crops are unanswerable and disagree almost totally
+on which button says so — day by day, kilian's `not_visible` tracks alexandra's
+`not_visible + cannot_tell`. Because the escape was dropped and the other was
+trained, kilian supplied **75%** of the trained `not_visible` examples while
+supplying ~50% of `shaded` and `direct_sun`: the class had become one person's
+convention. Inter-annotator agreement on the 49 doubly-labelled instances is
+55% for sun and 71% for behaviour, and the single largest disagreement is
+exactly `cannot_tell` vs `not_visible`.
+
+**The taxonomy fix: one no-answer option per question.** `cannot_tell` is
+archived; `not_visible` keeps its class_key (it is in every stored answer and
+every `attr_*` column) and takes the title *Cannot tell*, the question glyph,
+and a definition naming every reason for having no answer. Two buttons that
+mean the same thing to the people pressing them are one button.
+
+**The training fix that was measured and REJECTED.** The obvious follow-on —
+fold the escape answers into the trained class and recover the 427 instances
+(319 sun, 108 behaviour) the builder had been dropping — makes the model worse
+on every class the dashboard shows:
+
+| | E11 (deployed) | E12 (escapes merged) |
+|---|---|---|
+| behaviour coverage after abstention | 73.1% | 70.0% |
+| behaviour precision of shown | 90.7% | 88.4% |
+| sun shade/direct read correctly¹ | 80.4% | 78.4% |
+| sun `shaded` F1¹ | 0.787 | 0.710 |
+| sun `direct_sun` F1¹ | 0.857 | 0.826 |
+
+¹ over the identical instances in both runs (1,052 / 439 / 613), so this is a
+like-for-like comparison and not an artifact of the evaluation set growing.
+Fold std is 0.011–0.013, so the `shaded` drop is six standard deviations.
+
+The mechanism is visible in the class: `not_visible` grows 686 → 1,005 and
+stops being one thing. "Too little of the body is visible" is a property of the
+pixels and trains to 0.87. "The body is visible but it will not resolve" is the
+annotator's epistemic state and is not in the crop at all. The mixed class is
+noisier, and the noise bleeds outward — `shaded` precision falls 0.83 → 0.70.
+
+So `merge_classes` stays empty and the escape stays out of training, which is
+what `is_escape` always meant. The dataset builder still CARRIES an escape-only
+answer now (`_SQL_ANSWERS` yields rather than discards, and a substantive answer
+from any rater still wins) so the decision is a config line rather than a schema
+change — but the measured answer is no.
+
+**What remains open.** The surviving no-answer option is still trained, so
+future answers to it re-enter the class this experiment just showed to be
+mixed. The clean end state is probably to drop the trained catch-all on the sun
+head as well and let confidence carry it, exactly as behaviour does (§9.3) —
+`exclude_classes` exists for that experiment and it has not been run.
+
 ## 3. The banner mask is a methodological requirement
 
 Training crops are cut by **`labeling.render_crop`** — the same function that
