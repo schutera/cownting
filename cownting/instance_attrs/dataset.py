@@ -156,14 +156,17 @@ def head_vocabulary(lcon: duckdb.DuckDBPyConnection, *,
 
     Three rules, each of which is one of M5's frozen decisions:
 
-    - `is_escape` classes are excluded. That is `cannot_tell`, defined as "the
-      body is visible, but the pose will not resolve" — genuine annotator
-      uncertainty. `labels_db`'s `SQL_*_NO_ESCAPE` variants already treat it as
-      missing data for the agreement statistics; the model does the same.
-      `not_visible` is NOT escape and IS trained: its definition is a property of
-      the crop ("too little of the body is visible"), so it is predictable from
-      pixels, and it is the model's only honest output on the many unjudgeable
-      crops in the corpus.
+    - `is_escape` classes are excluded from the VOCABULARY. That is
+      `cannot_tell`, defined as "the body is visible, but the pose will not
+      resolve" — genuine annotator uncertainty. `labels_db`'s `SQL_*_NO_ESCAPE`
+      variants treat it as missing data for the agreement statistics; the
+      model has no output for it. But an escape ANSWER is not thrown away here
+      any more: `_SQL_ANSWERS` carries it when it is all an instance has, and
+      `merge_classes` may fold it into a trained class (2026-09-18: both
+      cannot_tell → not_visible, see M5 §2.3). `not_visible` is NOT escape and
+      IS trained: its definition is a property of the crop ("too little of the
+      body is visible"), so it is predictable from pixels, and it is the
+      model's only honest output on the many unjudgeable crops in the corpus.
     - Archived classes are excluded, but only from the vocabulary — an answer
       recorded against a class since archived simply has nowhere to go and is
       dropped for that head, exactly as the Label page stops offering it.
@@ -202,11 +205,19 @@ def head_vocabulary(lcon: duckdb.DuckDBPyConnection, *,
 # about has no single truth to train on and is dropped for that head — silently
 # picking one rater's answer would teach the model to reproduce a coin flip.
 #
-# Escape answers are filtered BEFORE the unanimity test, so "one rater said
-# Shaded, the other said Cannot tell" reads as unanimous Shaded rather than as a
-# disagreement. That is the same "escape as missing data" reading the
-# `*_NO_ESCAPE` agreement queries take, and it recovers labels that are not
-# actually contested.
+# Escape answers YIELD to substantive ones: "one rater said Shaded, the other
+# said Cannot tell" reads as unanimous Shaded rather than as a disagreement —
+# the same "escape as missing data" reading the `*_NO_ESCAPE` agreement queries
+# take, and it recovers labels that are not actually contested. But an escape
+# is no longer DISCARDED when it is all an instance has. The first version
+# filtered escapes out before the unanimity test, full stop, which silently
+# dropped every instance whose only answer was Cannot tell — 319 for sun, 108
+# for behaviour by 2026-09-18 — and did so asymmetrically: one annotator put
+# unanswerable crops under Cannot tell (dropped), the other under Not visible
+# (trained), so the trained class became one person's convention. Now an
+# all-escape instance is emitted with the escape's class_key; `collect_samples`
+# then either merges it into a trained class (`merge_classes`) or, with no
+# merge configured, drops it at the vocabulary check exactly as before.
 #
 # ARCHIVED classes are deliberately NOT filtered here. `collect_samples` may
 # remap an answer (a class merge) before it checks the vocabulary, and a merge
@@ -217,13 +228,16 @@ def head_vocabulary(lcon: duckdb.DuckDBPyConnection, *,
 # here and stay contested — archiving a class must not manufacture agreement.
 _SQL_ANSWERS = """
 SELECT v.effective_key, v.group_key,
-       count(DISTINCT v.class_key) AS n_classes,
-       any_value(v.class_key)      AS class_key
+       count(DISTINCT CASE WHEN NOT c.is_escape THEN v.class_key END) AS n_classes,
+       coalesce(max(CASE WHEN NOT c.is_escape THEN v.class_key END),
+                max(CASE WHEN c.is_escape THEN v.class_key END))     AS class_key
 FROM v_current_answers v
 JOIN label_classes c ON c.class_key = v.class_key
-WHERE NOT coalesce(v.acting_preview, FALSE) AND NOT c.is_escape
+WHERE NOT coalesce(v.acting_preview, FALSE)
 GROUP BY 1, 2
-HAVING count(DISTINCT v.class_key) = 1
+HAVING count(DISTINCT CASE WHEN NOT c.is_escape THEN v.class_key END) = 1
+    OR (count(DISTINCT CASE WHEN NOT c.is_escape THEN v.class_key END) = 0
+        AND count(DISTINCT CASE WHEN c.is_escape THEN v.class_key END) = 1)
 """
 
 # The outline verdict, collapsed per instance. An instance carrying BOTH a

@@ -132,12 +132,44 @@ def test_multi_select_group_is_refused_not_guessed():
 
 # ------------------------------------------------------------------------ labels
 
+_MERGE = {"sun_exposure.cannot_tell": "sun_exposure.not_visible"}
+
+
+def test_an_escape_only_instance_is_a_label_once_merged():
+    """Nobody could read the light -> that IS the label, not missing data.
+
+    Two annotators filed unanswerable crops under different escapes for a
+    month (one under Cannot tell, dropped; one under Not visible, trained), so
+    the trained class was a convention rather than a property of the crop.
+    With the merge configured the escape-only instance trains as not_visible;
+    without it, it is dropped exactly as before — the SQL change alone is a
+    no-op for every deployment that never configures the merge.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        _answer(con, "00000001.jpg", [_ESCAPE], annotator="alice")
+        _answer(con, "00000002.jpg", [_SHADED], annotator="alice")
+        merged = {s.instance_key: s for s in ds.collect_samples(con, block_frames=30,
+                                                                  merge_classes=_MERGE)}
+        check("with the merge, the escape-only instance is a not_visible label",
+              merged[_key("00000001.jpg")].labels.get("sun_exposure") == "sun_exposure.not_visible",
+              str(merged.get(_key("00000001.jpg"))))
+        check("...and an ordinary answer is untouched by it",
+              merged[_key("00000002.jpg")].labels.get("sun_exposure") == "sun_exposure.shaded")
+        plain = {s.instance_key: s for s in ds.collect_samples(con, block_frames=30)}
+        check("without a merge, the escape-only instance is dropped as before",
+              _key("00000001.jpg") not in plain, str(plain.keys()))
+        con.close()
+
+
 def test_escape_answers_are_missing_data_not_disagreement():
     """One rater says Shaded, the other Cannot tell -> unanimous Shaded.
 
-    Escapes are filtered BEFORE the unanimity test, the same reading
-    labels_db's *_NO_ESCAPE agreement queries take. Testing after would score
-    this as contested and throw away a label that is not actually contested.
+    An escape YIELDS to a substantive answer — the reading labels_db's
+    *_NO_ESCAPE agreement queries take. Scoring this as contested would throw
+    away a label that is not actually contested. Holds with the merge on, too:
+    a merge recovers escape-ONLY instances, it never outvotes a rater who could
+    answer.
     """
     with tempfile.TemporaryDirectory() as d:
         con = _store(d)
@@ -146,6 +178,11 @@ def test_escape_answers_are_missing_data_not_disagreement():
         by_key = {s.instance_key: s for s in ds.collect_samples(con, block_frames=30)}
         s = by_key[_key("00000001.jpg")]
         check("escape is treated as missing, not as a disagreement",
+              s.labels.get("sun_exposure") == "sun_exposure.shaded", str(s.labels))
+        by_key = {s.instance_key: s for s in ds.collect_samples(con, block_frames=30,
+                                                                  merge_classes=_MERGE)}
+        s = by_key[_key("00000001.jpg")]
+        check("...and the merge does not turn it into a contest either",
               s.labels.get("sun_exposure") == "sun_exposure.shaded", str(s.labels))
         con.close()
 
@@ -289,6 +326,7 @@ def main():
     print("=== test_instance_attrs_dataset ===")
     test_vocabulary_drops_escape_and_keeps_not_visible()
     test_multi_select_group_is_refused_not_guessed()
+    test_an_escape_only_instance_is_a_label_once_merged()
     test_escape_answers_are_missing_data_not_disagreement()
     test_a_contested_instance_trains_nothing_on_that_head()
     test_a_false_positive_is_a_gate_label_with_no_class_labels()

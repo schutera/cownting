@@ -151,7 +151,14 @@ instance_attrs:
   # is the 2026-09-17 head_probing merge — 17 to feeding, 41 to standing, each
   # decided by the two trained checkpoints' vote — and its .audit.csv sibling
   # carries both models' probabilities and the original annotator per row.
-  merge_classes: {}
+  # Since 2026-09-18 the two Cannot tell escapes fold into Not visible: an
+  # instance whose only answer is the escape is a label ("nobody could read
+  # this"), not missing data, and dropping it had made the trained class one
+  # annotator's convention (docs/roadmap/M5_instance_attrs.md §2.3). An escape
+  # still yields to a substantive answer from any other rater.
+  merge_classes:
+    sun_exposure.cannot_tell: sun_exposure.not_visible
+    behaviour.cannot_tell: behaviour.not_visible
   relabels: config/instance_attrs_relabels.csv
   device: auto                     # cuda > mps > cpu; train on a GPU box, serve on CPU
   # Split. The unit is a contiguous run of frames from ONE camera on ONE day —

@@ -687,6 +687,50 @@ def labels_archive_class(
     typer.secho(f"{class_key}: {state} (taxonomy revision {rev})", fg=typer.colors.GREEN)
 
 
+@labels_app.command("edit-class")
+def labels_edit_class(
+    class_key: str = typer.Argument(..., help="e.g. sun_exposure.not_visible"),
+    config: str = CONFIG_OPT,
+    name: str | None = typer.Option(None, "--name", help="New tile title."),
+    description: str | None = typer.Option(None, "--description", help="New definition text."),
+    icon: str | None = typer.Option(None, "--icon", help="A CLASS_ICONS name; dot clears."),
+    actor: str = typer.Option("cli", "--actor", help="Recorded in taxonomy_audit."),
+):
+    """Retitle / re-describe one class in the live taxonomy, with an audit row.
+
+    The taxonomy editor's edit form, from the shell — the same `update_class`,
+    the same audit trail, the same revision bump so open sessions reload. The
+    class_key never changes: it is the stable identifier in every stored
+    answer, every checkpoint's vocabulary and every `attr_*` column, and
+    `annotation_choices` snapshots the name an annotator actually saw, so a
+    retitle rewrites nothing historical.
+    """
+    from . import labels_db
+    from .labeling import labels_connect
+
+    if name is None and description is None and icon is None:
+        typer.secho("nothing to change: pass --name, --description and/or --icon",
+                    fg=typer.colors.RED)
+        raise typer.Exit(1)
+    cfg = _load(config)
+    con = labels_connect(cfg)
+    try:
+        before = labels_db._one(con, "label_classes", "class_key", class_key)
+        if before is None:
+            typer.secho(f"no such class {class_key!r}", fg=typer.colors.RED)
+            raise typer.Exit(1)
+        labels_db.update_class(con, class_key, name=name, description=description,
+                               icon=icon, actor=actor, actor_role="poweruser")
+        after = labels_db._one(con, "label_classes", "class_key", class_key)
+        rev = labels_db.taxonomy_revision(con)
+    finally:
+        con.close()
+    for field in ("name", "description", "icon"):
+        if before[field] != after[field]:
+            typer.echo(f"  {field}: {before[field]!r} -> {after[field]!r}")
+    typer.secho(f"{class_key}: updated (taxonomy revision {rev})", fg=typer.colors.GREEN)
+
+
 @labels_app.command("reseed")
 def labels_reseed(
     config: str = CONFIG_OPT,

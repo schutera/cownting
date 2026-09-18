@@ -740,21 +740,37 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "is_escape": False,
                 "description": "Most of the body is in open sun, casting its own sharp shadow.",
             },
+            # ONE no-answer option. Until 2026-09-18 there were two — Not visible
+            # ("too little of the body") and an escape, Cannot tell ("visible, but
+            # will not resolve") — and the two annotators split the same
+            # unanswerable crops between them in opposite proportions (45% vs 18%
+            # Not visible). The escape was dropped from training, so the trained
+            # class became one person's convention. The key stays not_visible: it
+            # is in every stored answer and every attr_sun value.
             {
                 "class_key": "sun_exposure.not_visible",
-                "name": "Not visible",
-                "icon": "eye-off",
+                "name": "Cannot tell",
+                "icon": "question",
                 "sort_order": 30,
                 "is_escape": False,
-                "description": "Too little of the body is visible to judge: cut off, blocked, or blown out.",
+                "description": ("Neither shade nor direct sun can be read from this crop: "
+                                "overcast sky with no shadows anywhere, too little of the "
+                                "body visible, cut off, blocked, or blown out. The one answer "
+                                "for every such case."),
             },
+            # Folded into the option above; ships archived so a fresh install
+            # offers one escape. An existing store keeps whatever the operator
+            # decided (reseed never archives or restores).
             {
                 "class_key": "sun_exposure.cannot_tell",
-                "name": "Cannot tell",
+                "name": "Cannot tell (retired)",
                 "icon": "question",
                 "sort_order": 40,
                 "is_escape": True,
-                "description": "The body is visible, but sun versus shade will not resolve.",
+                "active": False,
+                "description": ("Retired 2026-09-18 — merged into the single Cannot tell "
+                                "above. Answers given against it are kept and train as "
+                                "that class."),
             },
         ),
     },
@@ -803,21 +819,27 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "is_escape": False,
                 "description": "Head down at hardware, ground, or water, investigating rather than eating.",
             },
+            # ONE no-answer option — see the sun_exposure note above.
             {
                 "class_key": "behaviour.not_visible",
-                "name": "Not visible",
-                "icon": "eye-off",
+                "name": "Cannot tell",
+                "icon": "question",
                 "sort_order": 45,
                 "is_escape": False,
-                "description": "Too little of the body is visible to read the posture.",
+                "description": ("The posture cannot be read from this crop: too little of the "
+                                "body visible, or the body is there but the pose will not "
+                                "resolve. The one answer for every such case."),
             },
             {
                 "class_key": "behaviour.cannot_tell",
-                "name": "Cannot tell",
+                "name": "Cannot tell (retired)",
                 "icon": "question",
                 "sort_order": 50,
                 "is_escape": True,
-                "description": "The body is visible, but the pose will not resolve.",
+                "active": False,
+                "description": ("Retired 2026-09-18 — merged into the single Cannot tell "
+                                "above. Answers given against it are kept and train as "
+                                "that class."),
             },
         ),
     },
@@ -882,12 +904,18 @@ def seed_taxonomy(
             )
         for c in g["classes"]:
             if c["class_key"] not in have_classes:
+                # `active: False` in the seed ships a class already archived (a
+                # retired option a fresh install must still be able to READ, since
+                # backups restored into it carry answers against the key). Only on
+                # first insert: reseed never archives or restores an existing row.
+                active = bool(c.get("active", True))
                 con.execute(
                     "INSERT INTO label_classes (class_key, group_key, name, description, "
-                    "icon, sort_order, is_escape, created_by, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, now())",
+                    "icon, sort_order, is_escape, active, archived_at, created_by, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, " + ("NULL" if active else "now()") +
+                    ", ?, now())",
                     [c["class_key"], g["group_key"], c["name"], c["description"],
-                     _valid_icon(c["icon"]), c["sort_order"], c["is_escape"], actor],
+                     _valid_icon(c["icon"]), c["sort_order"], c["is_escape"], active, actor],
                 )
                 written += 1
                 continue
