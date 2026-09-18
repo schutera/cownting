@@ -43,6 +43,9 @@ export function AreaMap({
   // Per-area crop-model composition — behaviour + light. Empty on a day the
   // model has not scored, and on a server too old to send it.
   const [attrs, setAttrs] = useState<Record<string, AreaAttrs>>({});
+  // Cows the segmenter found that sit in no count area — no badge represents
+  // them, and they are the majority, so the caption names them.
+  const [outside, setOutside] = useState(0);
   // Per-area cows under a panel — drawn as unit blocks stacked above the circle.
   const [sheltering, setSheltering] = useState<Record<string, number>>({});
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -75,6 +78,7 @@ export function AreaMap({
         setPostures(d.postures ?? {});
         setSheltering(d.sheltering ?? {});
         setAttrs(d.attrs ?? {});
+        setOutside(d.outside ?? 0);
       })
       .catch(() => {
         /* counts are optional — the map still renders the area outlines */
@@ -456,6 +460,12 @@ export function AreaMap({
           : `${shownTotal} cow${shownTotal === 1 ? "" : "s"} across ${nAreas} area${
               nAreas === 1 ? "" : "s"
             } · ${frame == null ? "peak, whole day" : "this frame"}`}
+        {nAreas > 0 && outside > 0 ? (
+          <span className="text-gray-mid">
+            {" "}
+            · {outside.toLocaleString()} outside any area
+          </span>
+        ) : null}
       </div>
       {nAreas > 0 && legend.entries.length > 0 ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1.5 text-[11px] text-gray-tertiary">

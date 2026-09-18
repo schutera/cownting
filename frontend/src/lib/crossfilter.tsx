@@ -71,10 +71,6 @@ type CrossFilterCtx = {
   dayData: Crosstab | null;
   dayLoading: boolean;
   available: Record<string, boolean>; // feature key -> has data yet
-  // feature key -> pivoting on it skips detections with no value (see the API's
-  // `drops_unassigned`). The UI has to say so, or the strips look like they are
-  // losing cows the panel above them just counted.
-  dropsUnassigned: Record<string, boolean>;
   regionLabels: Record<string, string>; // region id -> camera-based display label
   // The instant this pivot is scoped to, straight from the scrubber. null =
   // whole day. Exposed so the chart can SAY which it is: the same strip means
@@ -114,11 +110,6 @@ export function CrossFilterProvider({ children }: { children: ReactNode }) {
     return m;
   }, [features]);
 
-  const dropsUnassigned = useMemo(() => {
-    const m: Record<string, boolean> = {};
-    for (const f of features) m[f.key] = f.drops_unassigned === true;
-    return m;
-  }, [features]);
 
   useEffect(() => {
     let alive = true;
@@ -171,7 +162,7 @@ export function CrossFilterProvider({ children }: { children: ReactNode }) {
   return (
     <Ctx.Provider
       value={{ group, ratio, setGroup, setRatio, data, loading, dayData, dayLoading,
-               available, dropsUnassigned, regionLabels, frame }}
+               available, regionLabels, frame }}
     >
       {children}
     </Ctx.Provider>

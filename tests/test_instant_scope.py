@@ -38,7 +38,7 @@ if __package__ in (None, ""):
 
 import pandas as pd  # noqa: E402
 
-from cownting import db  # noqa: E402
+from cownting import db, features  # noqa: E402
 
 _FAILED = 0
 BIN = 60.0
@@ -218,6 +218,68 @@ def test_the_model_split_is_scoped_too_and_the_whole_day_is_untouched():
             con.close()
 
 
+def test_a_cow_in_no_count_area_is_counted_not_dropped():
+    """Most of the herd stands outside every drawn count area — 53.8% of the
+    corpus on 2026-09-18, and 100% of two whole days whose areas were never
+    drawn. A breakdown BY count area used to discard them silently, so it
+    reported 4 cows where the map beside it drew 15: a discrepancy
+    indistinguishable from a bug, and on those two days a breakdown of nothing.
+
+    They are their own group now, so the pivot reconciles with every other
+    surface and the uncovered share is a number on the screen."""
+    with tempfile.TemporaryDirectory() as d:
+        con = db.connect(os.path.join(d, "c.duckdb"))
+        try:
+            db.init_db(con); _seed(con)
+            # Half the fixture's detections are moved outside every area.
+            con.execute("UPDATE detections SET region_id = NULL WHERE bbox_x1 >= 50")
+            total = con.execute("SELECT count(*) FROM detections").fetchone()[0]
+            inside = con.execute(
+                "SELECT count(region_id) FROM detections").fetchone()[0]
+            check("the fixture has cows both inside and outside an area",
+                  0 < inside < total, f"{inside} of {total}")
+
+            dfr, dom, _ = db.crosstab(con, "region", "behaviour", dataset_id="d1")
+            got = int(dfr["n"].sum())
+            check("a breakdown by count area keeps every cow",
+                  got == total, f"{got} vs {total}")
+            check("...with the uncovered ones in their own named group",
+                  features.REGION_NONE in [str(x) for x in dom], str(dom))
+            n_outside = int(dfr[dfr["primary"] == features.REGION_NONE]["n"].sum())
+            check("...carrying exactly the cows no area covers",
+                  n_outside == total - inside, f"{n_outside} vs {total - inside}")
+
+            check("and the helper the map captions with agrees",
+                  db.detections_outside_areas(con, "d1") == total - inside,
+                  str(db.detections_outside_areas(con, "d1")))
+
+            # The case that used to produce an empty chart rather than a finding.
+            con.execute("UPDATE detections SET region_id = NULL")
+            dfr2, dom2, _ = db.crosstab(con, "region", "behaviour", dataset_id="d1")
+            check("a day with NO areas drawn breaks down to one honest group",
+                  int(dfr2["n"].sum()) == total and [str(x) for x in dom2] == [features.REGION_NONE],
+                  f'{int(dfr2["n"].sum())} in {dom2}')
+        finally:
+            con.close()
+
+
+def test_the_uncovered_count_is_scoped_to_the_instant_too():
+    with tempfile.TemporaryDirectory() as d:
+        con = db.connect(os.path.join(d, "c.duckdb"))
+        try:
+            db.init_db(con); _seed(con)
+            con.execute("UPDATE detections SET region_id = NULL WHERE bbox_x1 >= 50")
+            day = db.detections_outside_areas(con, "d1")
+            inst = _instants(con)
+            per = [db.detections_outside_areas(con, "d1", instant=i, bin_seconds=BIN)
+                   for i in inst]
+            check("the per-instant counts sum to the day's", sum(per) == day,
+                  f"{per} sums to {sum(per)}, day is {day}")
+            check("an empty instant contributes none", per[-1] == 0, str(per))
+        finally:
+            con.close()
+
+
 def main():
     print("=== test_instant_scope ===")
     test_an_instant_is_not_a_frame_idx()
@@ -225,6 +287,8 @@ def main():
     test_a_genuinely_empty_instant_still_reads_as_empty()
     test_the_panel_counts_cameras_not_frames_at_an_instant()
     test_the_model_split_is_scoped_too_and_the_whole_day_is_untouched()
+    test_a_cow_in_no_count_area_is_counted_not_dropped()
+    test_the_uncovered_count_is_scoped_to_the_instant_too()
     print("\n" + ("PASS" if not _FAILED else f"{_FAILED} FAILED"))
     sys.exit(1 if _FAILED else 0)
 

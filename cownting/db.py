@@ -894,6 +894,32 @@ def area_attrs_dict(row) -> dict[str, int]:
     }
 
 
+def detections_outside_areas(con, dataset_id: str | None = None, *,
+                             instant: int | None = None,
+                             bin_seconds: float = 60.0) -> int:
+    """Cows that fall inside NO count area — the map draws no badge for them.
+
+    Over half the corpus (53.8% on 2026-09-18, and everything on two days whose
+    areas were never drawn), so a map whose badges sum to far less than the
+    panel above it is correct, not broken. Reported so it can say so rather than
+    leaving the reader to discover the gap by subtraction. Same gate as every
+    other count."""
+    where = ["d.region_id IS NULL", gate_clause("d")]
+    params: list = []
+    if dataset_id is not None:
+        where.append("d.dataset_id = ?")
+        params.append(dataset_id)
+    join = ""
+    if instant is not None:
+        join = ("JOIN frames f ON d.camera_id = f.camera_id "
+                "AND d.frame_path = f.frame_path")
+        where.append(f"{_instant_expr(bin_seconds)} = ?")
+        params.append(instant)
+    return int(con.execute(
+        f"SELECT count(*) FROM detections d {join} WHERE {' AND '.join(where)}",
+        params).fetchone()[0])
+
+
 def area_counts_whole_day(con, dataset_id: str | None = None, bin_seconds: float = 60.0) -> pd.DataFrame:
     """Whole-day occupancy per count area for the map's "whole day" toggle.
 

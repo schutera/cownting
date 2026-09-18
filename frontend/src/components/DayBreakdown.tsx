@@ -22,7 +22,7 @@ import { SectionLabel } from "./ui";
  * this adds is the per-group comparison.
  */
 export function DayBreakdown({ cameras }: { cameras: string[] }) {
-  const { group, ratio, dayData, dayLoading, regionLabels, dropsUnassigned } = useCrossFilter();
+  const { group, ratio, dayData, dayLoading, regionLabels } = useCrossFilter();
   const groupLabel = (featureByKey(group)?.label ?? group).toLowerCase();
   const ratioLabel = (featureByKey(ratio)?.label ?? ratio).toLowerCase();
 
@@ -92,11 +92,6 @@ export function DayBreakdown({ cameras }: { cameras: string[] }) {
         })}
       </div>
 
-      {dropsUnassigned[group] || dropsUnassigned[ratio] ? (
-        <p className="mt-2 text-[11px] text-gray-tertiary leading-snug">
-          Only cows inside a count area.
-        </p>
-      ) : null}
     </div>
   );
 }

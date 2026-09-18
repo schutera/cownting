@@ -943,7 +943,6 @@ def create_app(config: Config) -> FastAPI:
         ds = resolve_ds(c, dataset)
         if frame is None:
             df = db.area_counts_whole_day(c, ds, bin_seconds)
-            c.close()
             counts = {r.region_id: int(r.peak) for r in df.itertuples()}
             sheltering = {r.region_id: int(r.sheltering) for r in df.itertuples()}
             postures = {
@@ -955,11 +954,17 @@ def create_app(config: Config) -> FastAPI:
                 for r in df.itertuples()
             }
             attrs = {r.region_id: db.area_attrs_dict(r) for r in df.itertuples()}
+            outside = db.detections_outside_areas(c, ds)
+            c.close()
             return {
                 "counts": counts,
                 "postures": postures,
                 "sheltering": sheltering,
                 "attrs": attrs,
+                # Cows the segmenter found that fall in NO count area. Over half
+                # the corpus, so a map whose badges sum to less than the panel
+                # above it is correct rather than broken — but only if it says so.
+                "outside": outside,
                 "frame": None,
             }
         ds_filter = " AND f.dataset_id = ?" if ds else ""
@@ -977,6 +982,7 @@ def create_app(config: Config) -> FastAPI:
             "GROUP BY d.region_id",
             [frame] + ([ds] if ds else []),
         ).df()
+        outside = db.detections_outside_areas(c, ds, instant=frame, bin_seconds=bin_seconds)
         c.close()
         counts = {r.region_id: int(r.n) for r in df.itertuples()}
         sheltering = {r.region_id: int(r.shel) for r in df.itertuples()}
@@ -987,7 +993,7 @@ def create_app(config: Config) -> FastAPI:
         }
         attrs = {r.region_id: db.area_attrs_dict(r) for r in df.itertuples()}
         return {"counts": counts, "postures": postures, "sheltering": sheltering,
-                "attrs": attrs, "frame": frame}
+                "attrs": attrs, "outside": outside, "frame": frame}
 
     @app.get("/api/day-series")
     def day_series(dataset: str | None = None):
@@ -1402,13 +1408,7 @@ def create_app(config: Config) -> FastAPI:
         c = con()
         avail = db.available_features(c)
         c.close()
-        # `drops_unassigned` mirrors the spec's `drop_null`: a pivot on such a
-        # dimension counts FEWER detections than are in view, because rows with
-        # no value for it are skipped (region: a cow outside every count area).
-        # Surfaced so the UI can say so — two panels showing 15 and 4 for the
-        # same moment reads as a bug unless the smaller one explains itself.
-        return [{"key": k, "kind": s.kind, "available": avail.get(k, True),
-                 "drops_unassigned": s.drop_null}
+        return [{"key": k, "kind": s.kind, "available": avail.get(k, True)}
                 for k, s in features_mod.FEATURES.items()]
 
     @app.get("/api/crosstab")

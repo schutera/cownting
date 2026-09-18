@@ -21,8 +21,8 @@ import { RatioStrips } from "./RatioStrips";
  * Scoped to the scrubbed instant, like everything else under the map.
  */
 export function CrossFilter({ cameras }: { cameras: string[] }) {
-  const { group, ratio, setGroup, setRatio, data, loading, available,
-          dropsUnassigned, frame } = useCrossFilter();
+  const { group, ratio, setGroup, setRatio, data, loading, available, frame } =
+    useCrossFilter();
   const { timeline } = useTimeline();
 
   const when = (() => {
@@ -62,15 +62,6 @@ export function CrossFilter({ cameras }: { cameras: string[] }) {
         />
         ?
       </p>
-
-      {/* A dimension that skips unassigned rows counts fewer cows than the panel
-          above, and an unexplained 15-against-4 reads as a broken number. */}
-      {dropsUnassigned[group] || dropsUnassigned[ratio] ? (
-        <p className="-mt-1 mb-3 text-[11px] text-gray-tertiary">
-          Counts only cows inside a count area — any outside every area are left out
-          of this breakdown.
-        </p>
-      ) : null}
 
       {data && data.total > 0 ? (
         <RatioStrips data={data} groupKey={group} ratioKey={ratio} cameras={cameras} />

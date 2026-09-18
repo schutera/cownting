@@ -22,6 +22,11 @@ class FeatureSpec:
     drop_null: bool = False       # add "<sql> IS NOT NULL" (e.g. region: skip unassigned)
 
 
+# The group a detection falls into when it is inside no count area. A literal
+# rather than NULL so it survives the GROUP BY, and readable enough that a
+# client with no label mapping still renders something meaningful.
+REGION_NONE = "(outside any area)"
+
 FEATURES: dict[str, FeatureSpec] = {
     "posture": FeatureSpec(
         "posture", "coalesce(d.posture, 'unknown')", "categorical", False,
@@ -68,8 +73,20 @@ FEATURES: dict[str, FeatureSpec] = {
         "categorical", False,
         ("feeding", "lying", "standing", "not_visible", "unsure", "unscored"),
         "attr_model_rev"),
+    # A cow the segmenter found but that stands outside every drawn count area
+    # gets NO region_id, and that is the MAJORITY of them: 53.8% of the corpus on
+    # 2026-09-18, and 100% on two whole days whose areas were never drawn. This
+    # used to be `drop_null=True`, so a breakdown by count area silently reported
+    # 4 cows where the map beside it drew 15 — a discrepancy indistinguishable
+    # from a bug, and on those two days a breakdown of nothing at all.
+    #
+    # Now they are their own bucket. The totals reconcile with every other
+    # surface, and the share of the herd that no count area covers becomes a
+    # number on the screen instead of a footnote — which is the actionable part,
+    # since the fix for it is to draw more areas.
     "region": FeatureSpec(
-        "region", "d.region_id", "categorical", False, None, "region_id", drop_null=True),
+        "region", f"coalesce(d.region_id, '{REGION_NONE}')", "categorical", False,
+        None, "region_id"),
     "camera": FeatureSpec(
         "camera", "d.camera_id", "categorical", False, None),
     "hour": FeatureSpec(

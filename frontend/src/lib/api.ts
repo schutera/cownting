@@ -507,6 +507,10 @@ export interface AreaCounts {
   postures: Record<string, PostureBreakdown>;
   sheltering: Record<string, number>; // per-region cows under a panel (unit-block indicator)
   attrs?: Record<string, AreaAttrs>;  // optional: absent from an older server
+  // Cows inside NO count area, so no badge is drawn for them. Over half the
+  // corpus, which is why the map says so rather than letting the reader find
+  // the gap by subtracting from the panel above.
+  outside?: number;
   frame: number | null;
 }
 
