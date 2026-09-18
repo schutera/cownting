@@ -57,7 +57,15 @@ export interface User { username:string; role:Role; real_role?:Role; auth_disabl
 
 export interface Site { cameras:string[]; kpis:Kpis; orthophoto:ImgMeta|null; references:Record<string,ImgMeta>; posture_enabled:boolean; pose_enabled:boolean; dataset:string|null; }
 // One data-package (a day's multi-camera shoot) for the day picker.
-export interface DatasetRow { dataset_id:string; day:string|null; label:string|null; status:string; n_frames:number; n_detections:number; n_cameras:number; }
+export interface DatasetRow {
+  dataset_id:string; day:string|null; label:string|null; status:string;
+  n_frames:number; n_detections:number; n_cameras:number;
+  /** Count-area polygons drawn for THIS day (areas are per-day: cameras move).
+      0 means nothing is counted into any area and a breakdown by area is empty. */
+  n_areas?:number;
+  /** Cows standing inside none of them. */
+  n_unassigned?:number;
+}
 // An upload+auto-process job, polled while a newly-uploaded day is processing.
 export interface UploadJob {
   job_id:string; dataset_id:string; label:string;

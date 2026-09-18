@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useDataset } from "../lib/dataset";
 import { useAuth, canManageData } from "../lib/auth";
 import type { DatasetRow, UploadJob } from "../lib/types";
+import { AreaCoverageChip } from "../components/AreaCoverageWarning";
 import { isJobActive, isReady, statusExplainer, statusLabel, useUploadJobs } from "../lib/processing";
 import { Button, SectionLabel } from "../components/ui";
 import { UploadPanel } from "../components/UploadPanel";
@@ -273,11 +274,15 @@ function DayCard({
       >
         <div className={"min-w-0 " + (canManage ? "pr-24" : "")}>
           <div className="font-display text-2xl text-near-black leading-none truncate">{title}</div>
-          <div className="mt-2 flex items-center gap-2">
+          <div className="mt-2 flex flex-wrap items-center gap-2">
             {row.day && row.label ? (
               <span className="font-mono text-[11px] text-gray-tertiary">{row.day.slice(0, 10)}</span>
             ) : null}
             <StatusDot status={row.status} job={job} />
+            {/* A day with no polygons counts nothing into any area and looks
+                exactly like a quiet day everywhere else — so it is flagged on
+                the card, where somebody is already choosing between days. */}
+            <AreaCoverageChip row={row} />
           </div>
         </div>
 

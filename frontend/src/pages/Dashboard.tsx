@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import type { DatasetRow, Site, UploadJob } from "../lib/types";
+import { useAuth, canManageData } from "../lib/auth";
 import { getSite, getFrameMap } from "../lib/api";
 import { useTimeline } from "../lib/timeline";
 import { useDataset } from "../lib/dataset";
@@ -9,6 +11,7 @@ import { AreaMap } from "../components/AreaMap";
 import { DatasetPicker } from "../components/DatasetPicker";
 import { CrossFilter } from "../components/CrossFilter";
 import MomentPanel from "../components/MomentPanel";
+import { AreaCoverageBanner } from "../components/AreaCoverageWarning";
 import { CrossFilterProvider } from "../lib/crossfilter";
 import KpiPanel from "../components/KpiPanel";
 import CameraSegStack from "../components/CameraSegStack";
@@ -155,6 +158,10 @@ export default function Dashboard() {
   // Processing state for the day on screen. `row.status` (durable) says whether
   // the numbers can be trusted yet; `job` (live) supplies the percentage.
   const { datasets, dataset, refresh, loaded: daysLoaded } = useDataset();
+  // Only offer the "draw areas" shortcut to somebody who may actually draw them.
+  const { user } = useAuth();
+  const canManage = canManageData(user);
+  const navigate = useNavigate();
   const { byDataset: jobs, active: activeJobs } = useUploadJobs();
   const row = datasets.find((d) => d.dataset_id === dataset) ?? null;
   const job = dataset ? jobs[dataset] : undefined;
@@ -276,6 +283,13 @@ export default function Dashboard() {
         <div className="grid grid-cols-1 lg:grid-cols-[264px_minmax(0,1fr)_320px] gap-6 items-start">
         {/* Hero — occupancy heatmap, or a camera enlarged in its place (leads on mobile) */}
         <section className="lg:col-start-2 lg:row-start-1">
+          {/* Above the map, because the map is the surface the missing polygons
+              blank out: an empty orthophoto reads as "no cows here" rather than
+              as "nobody drew the areas". */}
+          <AreaCoverageBanner
+            row={datasets.find((d) => d.dataset_id === dataset)}
+            onFix={canManage && dataset ? () => navigate(`/data/${dataset}/cameras`) : undefined}
+          />
           <SectionLabel>{focusCam ? "CAMERA" : "OCCUPANCY"}</SectionLabel>
           <h2 className="font-display text-2xl sm:text-3xl font-light text-near-black leading-tight mt-1 mb-4">
             {focusCam

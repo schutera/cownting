@@ -541,11 +541,28 @@ def create_app(config: Config) -> FastAPI:
     # ------------------------------------------------------------------ datasets
     @app.get("/api/datasets")
     def get_datasets():
-        """The days / data-packages available, newest first, for the day picker."""
+        """The days / data-packages available, newest first, for the day picker.
+
+        Each row also reports its COUNT-AREA COVERAGE — `n_areas` (polygons drawn
+        for that day, read from its own area file) and `n_unassigned` (cows
+        standing in none of them). A day with no areas counts nothing into any
+        area and breaks down to nothing by area, silently: two days shipped that
+        way and nobody noticed for three weeks. The picker says so now.
+        """
         c = con()
         df = db.datasets(c)
         c.close()
-        return _records(df)
+        rows = _records(df)
+        for r in rows:
+            try:
+                areas = regions.load_count_areas(
+                    regions.dataset_area_path(config, r["dataset_id"], "count"))
+                r["n_areas"] = sum(len(v or []) for v in (areas or {}).values())
+            except OSError:
+                # A missing or unreadable file is exactly the "no areas" case the
+                # caller needs to see; it is not an error worth failing the list.
+                r["n_areas"] = 0
+        return rows
 
     @app.delete("/api/datasets/{dataset_id}", dependencies=[Depends(require_poweruser)])
     def delete_dataset(dataset_id: str, confirm: str):

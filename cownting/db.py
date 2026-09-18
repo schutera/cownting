@@ -476,7 +476,7 @@ def latest_dataset(con) -> str | None:
 
 
 DATASET_COLS = ["dataset_id", "day", "label", "status", "created_at", "ingested_at",
-                "n_frames", "n_detections", "n_cameras"]
+                "n_frames", "n_detections", "n_cameras", "n_unassigned"]
 
 
 def datasets(con) -> pd.DataFrame:
@@ -489,7 +489,13 @@ def datasets(con) -> pd.DataFrame:
         SELECT s.dataset_id, s.day, s.label, s.status, s.created_at, s.ingested_at,
                (SELECT count(*) FROM frames f WHERE f.dataset_id = s.dataset_id)          AS n_frames,
                (SELECT count(*) FROM detections d WHERE d.dataset_id = s.dataset_id)      AS n_detections,
-               (SELECT count(DISTINCT camera_id) FROM frames f WHERE f.dataset_id = s.dataset_id) AS n_cameras
+               (SELECT count(DISTINCT camera_id) FROM frames f WHERE f.dataset_id = s.dataset_id) AS n_cameras,
+               -- Cows this day found that fall inside NO count area. Reported per
+               -- day because the answer is per day: areas are drawn per dataset
+               -- (cameras move), so a day can be fully covered while the next one
+               -- has no polygons at all and counts nothing into any area.
+               (SELECT count(*) FROM detections d WHERE d.dataset_id = s.dataset_id
+                  AND d.region_id IS NULL)                                        AS n_unassigned
         FROM datasets s
         ORDER BY s.day DESC NULLS LAST, s.dataset_id DESC
         """
