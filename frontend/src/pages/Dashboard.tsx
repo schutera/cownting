@@ -8,6 +8,7 @@ import { SectionLabel } from "../components/ui";
 import { AreaMap } from "../components/AreaMap";
 import { DatasetPicker } from "../components/DatasetPicker";
 import { CrossFilter } from "../components/CrossFilter";
+import MomentPanel from "../components/MomentPanel";
 import { CrossFilterProvider } from "../lib/crossfilter";
 import KpiPanel from "../components/KpiPanel";
 import CameraSegStack from "../components/CameraSegStack";
@@ -297,9 +298,12 @@ export default function Dashboard() {
             <AreaMap frame={frame} cameras={site.cameras} hidden={hidden} />
           </div>
 
-          {/* Interactive cross-filter: conditional ratios of any stored feature
-              (posture, under-panels, shade, area, camera) grouped by another or
-              by time of day — subsumes the old static time-of-day strips. */}
+          {/* The rail's figures for the instant the map is showing — same
+              blocks, same component, one extra WHERE clause on the server. */}
+          <MomentPanel />
+
+          {/* And the free-form pivot beneath it, for the questions the two
+              summary panels cannot answer between them. */}
           <CrossFilter cameras={site.cameras} />
         </section>
 

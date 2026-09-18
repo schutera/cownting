@@ -595,25 +595,51 @@ def cameras(con, dataset_id: str | None = None) -> list[str]:
     return [r[0] for r in con.execute(sql, params).fetchall()]
 
 
-def kpi_summary(con, dataset_id: str | None = None) -> dict:
+def kpi_summary(con, dataset_id: str | None = None, *,
+                instant: int | None = None, bin_seconds: float = 60.0) -> dict:
+    """The headline figures. With `instant`, the SAME figures for one moment.
+
+    One function rather than two so the rail (whole day) and the panel under the
+    map (this moment) cannot drift in DEFINITION — "cows in view" has to mean the
+    same thing in both or comparing them is meaningless, and that is the entire
+    point of showing them together. `instant` is the cross-camera timestamp
+    bucket (`_instant_expr`), never a frame_idx; see `crosstab`.
+
+    At an instant, `valid_frames` is the number of cameras reporting, so
+    `cows_per_frame` reads as cows per camera — which is the useful per-moment
+    form of the same ratio.
+    """
     # `f` filters processed-frame subqueries, `d` filters detection subqueries;
     # each is empty (whole-DB) when dataset_id is None.
     f = " AND dataset_id = ?" if dataset_id is not None else ""
     dp = " AND dataset_id = ?" if dataset_id is not None else ""
     g = gate_clause()
     p = [dataset_id] if dataset_id is not None else []
+    # Scoping to one instant needs the frame's ts, which `detections` does not
+    # carry, so each detection subquery gains an EXISTS against frames. Appended
+    # to the clause AND to the parameter list in lockstep — the surrounding
+    # SELECT binds positionally per subquery, which is exactly how a filter
+    # silently stops applying to one of them.
+    fi = di = ""
+    ip: list = []
+    if instant is not None:
+        inst = _instant_expr(bin_seconds)
+        fi = f" AND {inst.replace('f.ts', 'frames.ts')} = ?"
+        di = (f" AND EXISTS (SELECT 1 FROM frames f WHERE f.camera_id = detections.camera_id"
+              f" AND f.frame_path = detections.frame_path AND {inst} = ?)")
+        ip = [instant]
     row = con.execute(
         f"""
         SELECT
-            (SELECT count(*) FROM frames WHERE processed{f})                 AS frames,
+            (SELECT count(*) FROM frames WHERE processed{f}{fi})             AS frames,
             -- valid = any processed frame
-            (SELECT count(*) FROM frames WHERE processed{f})                 AS valid_frames,
-            (SELECT count(*) FROM detections WHERE {g}{dp})                  AS detections,
-            (SELECT count(*) FROM detections WHERE posture = 'standing'{dp} AND {g})  AS standing,
-            (SELECT count(*) FROM detections WHERE posture = 'lying'{dp} AND {g})     AS lying,
-            (SELECT count(*) FROM detections WHERE under_panel{dp} AND {g})            AS sheltering
+            (SELECT count(*) FROM frames WHERE processed{f}{fi})             AS valid_frames,
+            (SELECT count(*) FROM detections WHERE {g}{dp}{di})              AS detections,
+            (SELECT count(*) FROM detections WHERE posture = 'standing'{dp} AND {g}{di})  AS standing,
+            (SELECT count(*) FROM detections WHERE posture = 'lying'{dp} AND {g}{di})     AS lying,
+            (SELECT count(*) FROM detections WHERE under_panel{dp} AND {g}{di})            AS sheltering
         """,
-        p + p + p + p + p + p,
+        (p + ip) * 2 + (p + ip) * 4,
     ).fetchone()
     frames, valid_frames, dets, standing, lying, sheltering = row
     # What the M5 crop model says, for the KPI rail. A separate query rather
@@ -632,9 +658,9 @@ def kpi_summary(con, dataset_id: str | None = None) -> dict:
                count(*) FILTER (WHERE attr_sun = 'sun_exposure.shaded')                AS shaded,
                count(*) FILTER (WHERE attr_sun = 'sun_exposure.direct_sun')            AS direct_sun,
                count(*) FILTER (WHERE attr_sun = 'sun_exposure.not_visible')           AS s_not_visible
-        FROM detections WHERE 1=1{dp} AND {g}
+        FROM detections WHERE 1=1{dp} AND {g}{di}
         """,
-        p,
+        p + ip,
     ).fetchone()
     scored, feeding, b_lying, b_standing, b_nv, b_unsure, shaded, direct, s_nv = (
         int(v or 0) for v in a)
@@ -1090,14 +1116,22 @@ def _domain(df: pd.DataFrame, col: str, spec) -> list:
 
 def crosstab(con, primary: str, breakdown: str | None = None, *,
              dataset_id: str | None = None, camera_id: str | None = None,
-             frame: int | None = None):
+             instant: int | None = None, bin_seconds: float = 60.0):
     """Long-form GROUP BY of two whitelisted feature expressions.
 
     Returns (df[primary, breakdown, n], primary_domain, breakdown_domain). Feature
     keys resolve through features.FEATURES — their SQL comes ONLY from that trusted
     registry, never from the argument strings (injection guard). Filters are
-    parameterized. frames is joined only when a temporal_frame feature or a `frame`
-    filter needs frame_idx."""
+    parameterized. frames is joined only when a temporal_frame feature or an
+    `instant` filter needs it.
+
+    `instant` IS NOT A frame_idx. It is the cross-camera timestamp bucket the
+    scrubber and `area_counts` speak in (`_instant_expr`), because cameras are
+    linked by real time rather than by frame number. This parameter was called
+    `frame` and filtered `f.frame_idx = ?`, which silently answered "no cows" for
+    every position of a scrubber whose values run in the tens of millions while
+    frame_idx tops out around 1,400 — a filter that matches nothing looks exactly
+    like a quiet moment. The name carries the distinction now."""
     from . import features as feat
 
     p = feat.resolve(primary)
@@ -1109,7 +1143,7 @@ def crosstab(con, primary: str, breakdown: str | None = None, *,
     # keep whole-DB behaviour; a pre-migration DB (latest_dataset None) stays whole-DB.
     if dataset_id is None and (p.key == "region" or (b is not None and b.key == "region")):
         dataset_id = latest_dataset(con)
-    needs_frames = p.needs_frames or (b is not None and b.needs_frames) or frame is not None
+    needs_frames = p.needs_frames or (b is not None and b.needs_frames) or instant is not None
 
     sel = [f"{p.sql} AS prim", (f"{b.sql} AS brk" if b else "NULL AS brk"),
            "count(d.detection_id) AS n"]
@@ -1125,8 +1159,10 @@ def crosstab(con, primary: str, breakdown: str | None = None, *,
         clauses.append("d.dataset_id = ?"); params.append(dataset_id)
     if camera_id is not None:
         clauses.append("d.camera_id = ?"); params.append(camera_id)
-    if frame is not None:
-        clauses.append("f.frame_idx = ?"); params.append(frame)
+    if instant is not None:
+        # The same expression area_counts filters on, so the two surfaces of one
+        # moment count the same detections (pinned in test_instant_scope).
+        clauses.append(f"{_instant_expr(bin_seconds)} = ?"); params.append(instant)
     sql += " WHERE " + " AND ".join(clauses)
     sql += " GROUP BY 1" + (", 2" if b else "")
 

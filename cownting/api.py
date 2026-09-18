@@ -1415,8 +1415,11 @@ def create_app(config: Config) -> FastAPI:
         c = con()
         try:
             ds = None if dataset == "all" else resolve_ds(c, dataset)
+            # `frame` on the wire is the scrubber's INSTANT bucket, the same as
+            # /api/area-counts means by it — never a frame_idx.
             df, pdom, bdom = db.crosstab(c, primary, breakdown, dataset_id=ds,
-                                         camera_id=camera, frame=frame)
+                                         camera_id=camera, instant=frame,
+                                         bin_seconds=bin_seconds)
         except ValueError as e:
             c.close()
             raise HTTPException(400, str(e))
@@ -1429,6 +1432,23 @@ def create_app(config: Config) -> FastAPI:
                                df.groupby("primary")["n"].sum().items()},
             "total": int(df["n"].sum()) if not df.empty else 0,
         }
+
+    @app.get("/api/moment")
+    def moment(frame: int | None = None, dataset: str | None = None):
+        """The headline figures for ONE instant — the rail's numbers, scoped.
+
+        Same `kpi_summary` the whole-day rail reads, with an instant filter, so
+        the two panels cannot disagree about what "cows in view" counts. `frame`
+        is the scrubber's instant bucket (as everywhere else on the wire).
+        Without it this is simply the whole day, which is what the panel shows
+        before the scrubber has settled.
+        """
+        c = con()
+        try:
+            ds = resolve_ds(c, dataset)
+            return db.kpi_summary(c, ds, instant=frame, bin_seconds=bin_seconds)
+        finally:
+            c.close()
 
     @app.get("/api/export.csv", dependencies=[Depends(require_poweruser)])
     def export_csv(dataset: str | None = None):

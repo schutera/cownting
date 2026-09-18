@@ -14,11 +14,13 @@ function Rule() {
  * the behaviour strip twice in this one panel when the pivot's ratio dimension
  * happened to be Behaviour.
  *
- * So the rail and the pivot now answer different questions. This is the day's
- * baseline and never moves while you scrub; the strips under the map are the
- * instant on screen. Reading one against the other is what makes either of them
- * mean something — "38% of them are lying down right now, against 25% across
- * the day" is a sentence neither surface could produce alone.
+ * So the rail and the panel under the map now answer different questions. This
+ * is the day's baseline and never moves while you scrub; MomentPanel shows the
+ * SAME blocks for the instant on screen, reading the same `kpi_summary` with
+ * one extra clause and importing `AttrStrips` from here rather than
+ * reimplementing it. Reading one against the other is what makes either mean
+ * anything — "38% of them are lying down right now, against 25% across the day"
+ * is a sentence neither surface could produce alone.
  */
 export default function KpiPanel({ kpis }: { kpis: Kpis }) {
   return (
@@ -62,7 +64,9 @@ export default function KpiPanel({ kpis }: { kpis: Kpis }) {
   );
 }
 
-/* What the crop model says, as two composition strips.
+/* What the crop model says, as two composition strips. Exported: MomentPanel
+ * draws the identical thing for one instant, and two copies of this would drift
+ * the first time a colour or an ordering changed in one of them.
  *
  * Deliberately the quietest block on the rail: a 6px bar and one legend line
  * each, tertiary text, no numbers larger than 12px — the hero above is the
@@ -77,7 +81,7 @@ export default function KpiPanel({ kpis }: { kpis: Kpis }) {
  * day — and a day it has not scored says so in words rather than drawing empty
  * bars that read as "nothing happened".
  */
-function AttrStrips({ attrs }: { attrs: AttrKpis }) {
+export function AttrStrips({ attrs }: { attrs: AttrKpis }) {
   if (attrs.scored === 0) {
     return (
       <div>

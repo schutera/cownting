@@ -1,5 +1,6 @@
 import type {
   FrameDetection,
+  Kpis,
   Site,
   CountRow,
   PostureRow,
@@ -530,6 +531,13 @@ export function getAreaCountsOverTime(
 
 // Cross-filter table: counts of `primary` (over its domain), optionally split by
 // `breakdown`, and optionally scoped to one camera and/or a single frame.
+/** The rail's own figures, scoped to one scrubber instant. Same shape as
+ *  `site.kpis`, from the same server-side query — see /api/moment. */
+export function getMoment(frame?: number): Promise<Kpis> {
+  const q = frame === undefined || frame === null ? "" : `?frame=${frame}`;
+  return j<Kpis>(`/api/moment${q}`);
+}
+
 export function getCrosstab(
   primary: string,
   breakdown?: string,

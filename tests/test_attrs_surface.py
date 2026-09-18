@@ -104,6 +104,54 @@ def test_kpi_attrs_keep_unsure_apart_and_apply_the_gate():
             db.set_gate(False)
 
 
+def test_moment_route_mirrors_the_rail():
+    """/api/moment is the rail's own query with one clause added, so the two
+    panels cannot disagree about what a cow in view is.
+
+    The shape must match `kpis` exactly — MomentPanel renders KpiPanel's own
+    AttrStrips from it, so a missing key there is a blank panel rather than an
+    error. And the scoping has to be real: without a frame it is the whole day,
+    with one it is that instant, and the two must differ on a fixture where the
+    day holds more than any single moment does.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        c = _client(d, gate=False)
+        day = c.get("/api/moment").json()
+        check("the route answers", isinstance(day, dict) and "detections" in day, str(day)[:120])
+        for k in ("detections", "valid_frames", "cows_per_frame", "attrs"):
+            check(f"...and carries `{k}`, which the rail's panel reads", k in day, str(list(day)))
+        check("attrs has the same three parts the rail draws",
+              set(day["attrs"]) == {"scored", "behaviour", "sun"}, str(list(day["attrs"])))
+        check("whole day sees every detection in the fixture",
+              day["detections"] == 4, str(day["detections"]))
+
+        # The instant keys come from /api/timeline — the same place the scrubber
+        # gets them, so this exercises the real client flow. Deriving them in the
+        # test instead would hardcode a bucket width (`bin_seconds` is 2.0 here
+        # and 60.0 in production) and silently test nothing.
+        insts = c.get("/api/timeline").json()["frames"]
+        check("the scrubber's instants are not frame_idx values",
+              min(insts) > 1000, str(insts))
+        first = c.get(f"/api/moment?frame={insts[0]}").json()
+        check("scoping to one instant sees fewer cows than the day",
+              first["detections"] == 3, str(first["detections"]))
+        check("...and its model split is scoped with it",
+              first["attrs"]["scored"] == 3, str(first["attrs"]))
+        check("...including the unsure bucket",
+              first["attrs"]["behaviour"]["unsure"] == 1, str(first["attrs"]["behaviour"]))
+
+        second = c.get(f"/api/moment?frame={insts[1]}").json()
+        check("the unscored frame's moment reports cows but nothing scored",
+              second["detections"] == 1 and second["attrs"]["scored"] == 0, str(second))
+
+        # A frame_idx passed where an instant belongs must not quietly look like
+        # a quiet moment — frame_idx 0 exists in this fixture and is not a valid
+        # instant key, so it must come back empty rather than matching frame 0.
+        bogus = c.get("/api/moment?frame=0").json()
+        check("a frame_idx used as an instant finds nothing (it is not an instant)",
+              bogus["detections"] == 0, str(bogus["detections"]))
+
+
 def test_frame_detections_route():
     with tempfile.TemporaryDirectory() as d:
         c = _client(d, gate=False)
@@ -139,6 +187,7 @@ def test_frame_detections_route():
 def main():
     print("=== test_attrs_surface ===")
     test_kpi_attrs_keep_unsure_apart_and_apply_the_gate()
+    test_moment_route_mirrors_the_rail()
     test_frame_detections_route()
     print("==========================")
     if _FAILED:
