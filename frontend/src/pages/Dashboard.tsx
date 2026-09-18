@@ -307,11 +307,12 @@ export default function Dashboard() {
           <CrossFilter cameras={site.cameras} />
         </section>
 
-        {/* Right side panel — the WHOLE DAY only. The cross-filter below the
-            map covers the scrubbed instant; the two are deliberately different
-            scopes rather than two copies of one number (see KpiPanel). */}
+        {/* Right side panel — the WHOLE DAY: headline figures, the model's
+            split, and the chosen breakdown answered across the day. Everything
+            under the map is the scrubbed instant instead, so each pair is two
+            scopes of one question rather than two copies of one number. */}
         <div className="lg:col-start-3 lg:row-start-1">
-          <KpiPanel kpis={site.kpis} />
+          <KpiPanel kpis={site.kpis} cameras={site.cameras} />
         </div>
 
         {/* Left side panel — per-camera instance segmentation at the slider time */}

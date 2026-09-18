@@ -2,6 +2,7 @@ import type { AttrKpis, Kpis } from "../lib/types";
 import { ACTIVE_COLOR, REST_COLOR, FEED_COLOR, SHELTER_COLOR, OPEN_COLOR, CHART_MUTED } from "../lib/palette";
 import { UNSURE_COLOR } from "../lib/features";
 import { Panel, SectionLabel, Stat } from "./ui";
+import { DayBreakdown } from "./DayBreakdown";
 
 function Rule() {
   return <div className="h-px bg-border my-5" />;
@@ -22,7 +23,7 @@ function Rule() {
  * anything — "38% of them are lying down right now, against 25% across the day"
  * is a sentence neither surface could produce alone.
  */
-export default function KpiPanel({ kpis }: { kpis: Kpis }) {
+export default function KpiPanel({ kpis, cameras }: { kpis: Kpis; cameras: string[] }) {
   return (
     <Panel className="lg:sticky lg:top-24">
       <div className="flex items-center gap-2">
@@ -51,6 +52,12 @@ export default function KpiPanel({ kpis }: { kpis: Kpis }) {
           <AttrStrips attrs={kpis.attrs} />
         </>
       ) : null}
+
+      <Rule />
+
+      {/* The pivot chosen under the map, answered across the whole day. The
+          controls stay down there; this follows them. */}
+      <DayBreakdown cameras={cameras} />
 
       <Rule />
 

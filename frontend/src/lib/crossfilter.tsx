@@ -15,11 +15,16 @@ import { FEATURES } from "./features";
  * Shared cross-filter selection + result. The pivot is chosen once and fetched
  * once here; `group` is the crosstab primary, `ratio` the breakdown.
  *
- * SCOPED TO THE SCRUBBER. The fetch carries the timeline's current instant, so
- * the strips under the map describe the moment the map is showing. The KPI rail
- * deliberately does NOT read this context any more — it used to, and rendered a
- * mirror of these very strips a few hundred pixels away. The rail is the day's
- * baseline; this is right now; the pair is worth more than either copy was.
+ * TWO SCOPES, ONE SELECTION. `data` carries the timeline's current instant, so
+ * the strips under the map describe the moment the map is showing; `dayData` is
+ * the same pivot across the whole day, for the rail. The controls exist once,
+ * under the map.
+ *
+ * The rail briefly showed a copy of the centre strips — same pivot, same whole
+ * day, four hundred pixels apart — and that copy was deleted. This is not that:
+ * the two now differ in scope, which is the only thing that made a pair worth
+ * having, and is the same arrangement KpiPanel and MomentPanel use for the
+ * headline figures.
  */
 
 // The "within" (group) dimension: any categorical feature + time-of-day (hour);
@@ -57,8 +62,14 @@ type CrossFilterCtx = {
   ratio: string; // the composition inside each strip — crosstab breakdown
   setGroup: (key: string) => void;
   setRatio: (key: string) => void;
-  data: Crosstab | null;
+  data: Crosstab | null;      // the scrubbed instant
   loading: boolean;
+  // The SAME pivot across the whole day, for the rail. One selection, two
+  // scopes — the pattern the headline figures already use (KpiPanel vs
+  // MomentPanel). Fetched separately because it must NOT refetch on every
+  // scrubber move, only when the pivot itself changes.
+  dayData: Crosstab | null;
+  dayLoading: boolean;
   available: Record<string, boolean>; // feature key -> has data yet
   // feature key -> pivoting on it skips detections with no value (see the API's
   // `drops_unassigned`). The UI has to say so, or the strips look like they are
@@ -87,6 +98,8 @@ export function CrossFilterProvider({ children }: { children: ReactNode }) {
   const [ratio, setRatio] = useState("posture");
   const [data, setData] = useState<Crosstab | null>(null);
   const [loading, setLoading] = useState(false);
+  const [dayData, setDayData] = useState<Crosstab | null>(null);
+  const [dayLoading, setDayLoading] = useState(false);
 
   const available = useMemo(() => {
     const m: Record<string, boolean> = {};
@@ -128,6 +141,21 @@ export function CrossFilterProvider({ children }: { children: ReactNode }) {
     };
   }, [group, ratio, frame]);
 
+  // Whole-day companion for the rail. Depends on the pivot only: a scrub must
+  // not re-fetch it, and re-fetching it would also make the rail flicker while
+  // dragging — the rail is the thing that is supposed to hold still.
+  useEffect(() => {
+    let alive = true;
+    setDayLoading(true);
+    getCrosstab(group, ratio)
+      .then((d) => alive && setDayData(d))
+      .catch(() => alive && setDayData(null))
+      .finally(() => alive && setDayLoading(false));
+    return () => {
+      alive = false;
+    };
+  }, [group, ratio]);
+
   // No `swap` any more: it existed for a ⇄ button between two chip rows, and
   // the sentence replaced both. Swapping is now "change the two dropdowns",
   // which is also honest about the result being a different question rather
@@ -135,7 +163,7 @@ export function CrossFilterProvider({ children }: { children: ReactNode }) {
 
   return (
     <Ctx.Provider
-      value={{ group, ratio, setGroup, setRatio, data, loading,
+      value={{ group, ratio, setGroup, setRatio, data, loading, dayData, dayLoading,
                available, dropsUnassigned, regionLabels, frame }}
     >
       {children}
