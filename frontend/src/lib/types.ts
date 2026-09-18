@@ -16,6 +16,7 @@ export interface FrameDetection {
   attr_sun:string|null; attr_sun_p:number|null;
   attr_behaviour:string|null; attr_behaviour_p:number|null;
   attr_model_rev:string|null;
+  outline:number[][]|null;   // the traced instance polygon in full-frame px; null = untraced (hover falls back to the box)
 }
 // Whole-day totals for one count area: split by posture + how many were under a panel.
 export interface AreaSummaryRow { region_id:string; total:number; standing:number; lying:number; sheltering:number; }
@@ -165,7 +166,7 @@ export type LabelIconName =
   | "standing"
   | "probe"
   | "pixels"
-  | "dot";
+  | "cloud" | "dot";
 
 // One answer option. `description` is required server-side and is what the (i)
 // disclosure reveals: an option with no written definition is the single largest

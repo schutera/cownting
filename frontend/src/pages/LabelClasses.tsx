@@ -86,6 +86,7 @@ const ICON_CHOICES: readonly LabelIconName[] = [
   "lying",
   "standing",
   "probe",
+  "cloud",
   "dot",
 ];
 

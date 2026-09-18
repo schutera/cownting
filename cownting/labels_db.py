@@ -241,8 +241,8 @@ SKIP_REASONS: tuple[str, ...] = ("bad_crop", "no_cow", "multiple_cows", "occlude
 # the frontend also falls back to it for NULL and for any name it does not know, so
 # a value this list once contained can never break the renderer.
 CLASS_ICONS: tuple[str, ...] = (
-    "shade", "sun", "eye-off", "question", "grass", "lying", "standing", "probe", "pixels",
-    "dot",
+    "shade", "sun", "eye-off", "cloud", "question", "grass", "lying", "standing", "probe",
+    "pixels", "dot",
 )
 
 EVENT_KINDS: tuple[str, ...] = (

@@ -54,7 +54,8 @@ def _seed(con) -> None:
         # frame 0: feeding (confident), unsure (looked, declined), rejected by the gate
         dict(base, frame_path="/f/0.jpg", bbox_x1=10.0, bbox_y1=10.0, bbox_x2=60.0, bbox_y2=50.0,
              attr_is_cow=True, attr_cow_p=0.99, attr_sun="sun_exposure.shaded", attr_sun_p=0.9,
-             attr_behaviour="behaviour.feeding", attr_behaviour_p=0.8, attr_model_rev="r1"),
+             attr_behaviour="behaviour.feeding", attr_behaviour_p=0.8, attr_model_rev="r1",
+             mask_poly="[[10,10],[60,10],[60,50],[10,50]]", mask_parts=1),
         dict(base, frame_path="/f/0.jpg", bbox_x1=100.0, bbox_y1=10.0, bbox_x2=150.0, bbox_y2=50.0,
              attr_is_cow=True, attr_cow_p=0.95, attr_sun="sun_exposure.direct_sun", attr_sun_p=0.7,
              attr_behaviour=None, attr_behaviour_p=0.45, attr_model_rev="r1"),
@@ -118,6 +119,10 @@ def test_frame_detections_route():
               and by[100.0]["attr_behaviour_p"] == 0.45, str(by[100.0]))
         check("a gate-rejected row is returned with attr_is_cow=false so the viewer can mark it",
               by[200.0]["attr_is_cow"] is False)
+        check("a traced row carries its outline as a parsed polygon, for hover hit-testing",
+              by[10.0]["outline"] == [[10, 10], [60, 10], [60, 50], [10, 50]], str(by[10.0].get("outline")))
+        check("an untraced row says so with null, so the client falls back to the box",
+              by[100.0]["outline"] is None)
         r1 = c.get("/api/frame-detections?camera=cam1&frame_idx=1&dataset=d1").json()
         check("an unscored frame's row has no rev", len(r1) == 1 and r1[0]["attr_model_rev"] is None)
         db.set_gate(False)

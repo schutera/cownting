@@ -78,6 +78,7 @@ export const CLASS_ICON_NAMES: readonly LabelIconName[] = [
   "shade",
   "sun",
   "eye-off",
+  "cloud",
   "question",
   "grass",
   "lying",
@@ -128,6 +129,15 @@ const GLYPHS: Record<LabelIconName, ReactNode> = {
       <path d="M2 2 22 22" />
     </>
   ),
+  // Overcast — a SINGLE LUMPY CLOSED OUTLINE ON A FLAT BASE, the only glyph
+  // with neither a diagonal, a radial element nor a ground line. Drawn for
+  // sun_exposure.not_visible on the frame overlay, because on this corpus that
+  // class IS the overcast day (M5 §10): 91–98% of detections on four grey
+  // days, 2–3% on sunny ones. `eye-off` stays the annotator's tile — on the
+  // label page the question is "can you see the light?", and the slash is the
+  // honest answer to that; on the dashboard the question is "what was the
+  // light?", and the cloud is. Path from Lucide `cloud` (ISC, credited above).
+  cloud: <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />,
   // Cannot tell — a FULL-FRAME CLOSED RING, the only closed outline touching the
   // frame. Radius 9.5 rather than 9 so it reads as full-frame against the
   // postural glyphs, whose ground line runs the full width. Shared by both

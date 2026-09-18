@@ -33,6 +33,10 @@ export default function CameraDetail({
   const [kind, setKind] = useState<"overlay" | "raw" | "pose">("overlay");
   const [showAttrs, setShowAttrs] = useState(true);
   const [dets, setDets] = useState<FrameDetection[]>([]);
+  // The animal under the pointer (its traced outline, or its box). Its badge
+  // is drawn last and at twice the size — a crowded frame's answer to "which
+  // one is this?". Lives here, not in the layer, so both image paths share it.
+  const [hovered, setHovered] = useState<number | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -47,6 +51,7 @@ export default function CameraDetail({
   useEffect(() => {
     let alive = true;
     setDets([]);
+    setHovered(null);
     if (frameIdx == null) return;
     getFrameDetections(camera, frameIdx)
       .then((rows) => {
@@ -120,6 +125,8 @@ export default function CameraDetail({
                       naturalWidth={meta.width}
                       invScale={invScale}
                       screenScale={screenScale}
+                      hovered={hovered}
+                      onHover={setHovered}
                     />
                   </svg>
                 )
@@ -127,7 +134,13 @@ export default function CameraDetail({
           }
         />
       ) : (
-        <PlainFrame src={src} alt={`${camera} ${kind}`} dets={attrsOn ? dets : []} />
+        <PlainFrame
+          src={src}
+          alt={`${camera} ${kind}`}
+          dets={attrsOn ? dets : []}
+          hovered={hovered}
+          onHover={setHovered}
+        />
       )}
 
       {attrsOn ? <AttrLegend unsure={unsure} total={scored} /> : null}
@@ -140,7 +153,19 @@ export default function CameraDetail({
    there is nothing to counter-scale, but the SVG is CSS-scaled with the image,
    so badges are sized in natural px at (natural / displayed) to land at their
    intended on-screen size. */
-function PlainFrame({ src, alt, dets }: { src: string; alt: string; dets: FrameDetection[] }) {
+function PlainFrame({
+  src,
+  alt,
+  dets,
+  hovered,
+  onHover,
+}: {
+  src: string;
+  alt: string;
+  dets: FrameDetection[];
+  hovered: number | null;
+  onHover: (id: number | null) => void;
+}) {
   const [dims, setDims] = useState<{ w: number; h: number; cssW: number } | null>(null);
   return (
     <div className="relative mx-auto" style={{ maxHeight: "68vh", maxWidth: "100%", width: "fit-content" }}>
@@ -160,7 +185,13 @@ function PlainFrame({ src, alt, dets }: { src: string; alt: string; dets: FrameD
           viewBox={`0 0 ${dims.w} ${dims.h}`}
           preserveAspectRatio="none"
         >
-          <AttrBadges dets={dets} naturalWidth={dims.w} screenScale={dims.w / Math.max(1, dims.cssW)} />
+          <AttrBadges
+            dets={dets}
+            naturalWidth={dims.w}
+            screenScale={dims.w / Math.max(1, dims.cssW)}
+            hovered={hovered}
+            onHover={onHover}
+          />
         </svg>
       ) : null}
     </div>

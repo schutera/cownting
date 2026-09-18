@@ -1155,6 +1155,12 @@ def create_app(config: Config) -> FastAPI:
         `gate_enabled` a rejected detection is not returned, so it is not drawn.
         With the gate off, `attr_is_cow` rides along so the viewer can still
         mark a rejected one rather than present it as a cow.
+
+        `outline` is the segmenter's traced polygon (`mask_poly`, full-frame
+        px), parsed, so the viewer can hit-test the animal's actual shape for
+        hover rather than its box — two lying cows' boxes overlap far more
+        than their outlines do. NULL where a row was never traced; the client
+        falls back to the box.
         """
         c = con()
         try:
@@ -1162,7 +1168,8 @@ def create_app(config: Config) -> FastAPI:
             rows = c.execute(
                 f"""SELECT d.detection_id, d.bbox_x1, d.bbox_y1, d.bbox_x2, d.bbox_y2,
                            d.posture, d.attr_is_cow, d.attr_cow_p, d.attr_sun, d.attr_sun_p,
-                           d.attr_behaviour, d.attr_behaviour_p, d.attr_model_rev
+                           d.attr_behaviour, d.attr_behaviour_p, d.attr_model_rev,
+                           d.mask_poly
                     FROM detections d
                     JOIN frames f ON f.camera_id = d.camera_id AND f.frame_path = d.frame_path
                      AND f.dataset_id IS NOT DISTINCT FROM d.dataset_id
@@ -1176,9 +1183,14 @@ def create_app(config: Config) -> FastAPI:
             c.close()
         keys = ("detection_id", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "posture",
                 "attr_is_cow", "attr_cow_p", "attr_sun", "attr_sun_p",
-                "attr_behaviour", "attr_behaviour_p", "attr_model_rev")
-        return [{k: (float(v) if isinstance(v, float) else v) for k, v in zip(keys, r)}
-                for r in rows]
+                "attr_behaviour", "attr_behaviour_p", "attr_model_rev", "outline")
+
+        def cell(k, v):
+            if k == "outline":
+                return json.loads(v) if v else None
+            return float(v) if isinstance(v, float) else v
+
+        return [{k: cell(k, v) for k, v in zip(keys, r)} for r in rows]
 
     @app.get("/api/attrs/status")
     def attrs_status(dataset: str | None = None):
