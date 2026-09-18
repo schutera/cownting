@@ -151,14 +151,25 @@ instance_attrs:
   # is the 2026-09-17 head_probing merge — 17 to feeding, 41 to standing, each
   # decided by the two trained checkpoints' vote — and its .audit.csv sibling
   # carries both models' probabilities and the original annotator per row.
-  # Since 2026-09-18 the two Cannot tell escapes fold into Not visible: an
-  # instance whose only answer is the escape is a label ("nobody could read
-  # this"), not missing data, and dropping it had made the trained class one
-  # annotator's convention (docs/roadmap/M5_instance_attrs.md §2.3). An escape
-  # still yields to a substantive answer from any other rater.
-  merge_classes:
-    sun_exposure.cannot_tell: sun_exposure.not_visible
-    behaviour.cannot_tell: behaviour.not_visible
+  # MEASURED AND REJECTED (2026-09-18), left here as the record. Folding the
+  # `cannot_tell` escapes into `not_visible` recovers 427 instances the builder
+  # had been dropping — and costs accuracy on every class the dashboard shows:
+  #
+  #   behaviour coverage 73.1% -> 70.0%, precision of shown 90.7% -> 88.4%
+  #   sun shade/direct read correctly 80.4% -> 78.4% (identical 1,052 crops)
+  #   sun `shaded` F1 0.787 -> 0.710 (identical 439 crops, fold std 0.011)
+  #
+  # `not_visible` grows 686 -> 1,005 and stops being one thing: "too little of
+  # the body is visible" is a property of the pixels and trains to 0.87, while
+  # "the body is visible but it will not resolve" is the annotator's epistemic
+  # state and is not predictable from the crop. The mixed class bleeds into
+  # `shaded`, whose precision drops 0.83 -> 0.70. So the escape stays OUT of
+  # training, exactly as `is_escape` always intended.
+  #
+  # The taxonomy fix is separate and stands: there is now ONE no-answer option
+  # per question, because two annotators split the same unanswerable crops
+  # between two of them in opposite proportions (45% vs 18%).
+  merge_classes: {}
   relabels: config/instance_attrs_relabels.csv
   device: auto                     # cuda > mps > cpu; train on a GPU box, serve on CPU
   # Split. The unit is a contiguous run of frames from ONE camera on ONE day —

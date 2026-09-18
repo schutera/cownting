@@ -303,10 +303,11 @@ export default function Dashboard() {
           <CrossFilter cameras={site.cameras} />
         </section>
 
-        {/* Right side panel — whole-day aggregates + a live mirror of the
-            cross-filter pivot (see KpiPanel) */}
+        {/* Right side panel — the WHOLE DAY only. The cross-filter below the
+            map covers the scrubbed instant; the two are deliberately different
+            scopes rather than two copies of one number (see KpiPanel). */}
         <div className="lg:col-start-3 lg:row-start-1">
-          <KpiPanel kpis={site.kpis} cameras={site.cameras} />
+          <KpiPanel kpis={site.kpis} />
         </div>
 
         {/* Left side panel — per-camera instance segmentation at the slider time */}

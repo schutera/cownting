@@ -2,19 +2,25 @@ import type { AttrKpis, Kpis } from "../lib/types";
 import { ACTIVE_COLOR, REST_COLOR, FEED_COLOR, SHELTER_COLOR, OPEN_COLOR, CHART_MUTED } from "../lib/palette";
 import { UNSURE_COLOR } from "../lib/features";
 import { Panel, SectionLabel, Stat } from "./ui";
-import { CrossFilterSummary } from "./CrossFilterSummary";
 
 function Rule() {
   return <div className="h-px bg-border my-5" />;
 }
 
 /**
- * Right-rail KPIs — whole-day aggregates up top (big scannable numbers), then
- * what the crop model says the herd is doing (AttrStrips), then a live mirror
- * of the cross-filter pivot (CrossFilterSummary): pick a "ratio of" dimension
- * in the cross-filter and that section follows it.
+ * Right-rail KPIs: the WHOLE DAY, across every camera, and deliberately nothing
+ * else. It used to end with a live mirror of the cross-filter pivot, which was
+ * the same composition already drawn in full 400px below it — and could repeat
+ * the behaviour strip twice in this one panel when the pivot's ratio dimension
+ * happened to be Behaviour.
+ *
+ * So the rail and the pivot now answer different questions. This is the day's
+ * baseline and never moves while you scrub; the strips under the map are the
+ * instant on screen. Reading one against the other is what makes either of them
+ * mean something — "38% of them are lying down right now, against 25% across
+ * the day" is a sentence neither surface could produce alone.
  */
-export default function KpiPanel({ kpis, cameras }: { kpis: Kpis; cameras: string[] }) {
+export default function KpiPanel({ kpis }: { kpis: Kpis }) {
   return (
     <Panel className="lg:sticky lg:top-24">
       <div className="flex items-center gap-2">
@@ -46,14 +52,11 @@ export default function KpiPanel({ kpis, cameras }: { kpis: Kpis; cameras: strin
 
       <Rule />
 
-      <CrossFilterSummary cameras={cameras} />
-
-      <Rule />
-
       <div className="text-[12px] text-gray-tertiary leading-relaxed">
         <div>
           <span className="text-gray-mid">{kpis.valid_frames.toLocaleString()}</span> clear frames
         </div>
+        <div className="mt-1">across the whole day · all cameras</div>
       </div>
     </Panel>
   );

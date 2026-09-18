@@ -8,15 +8,18 @@ import {
 } from "react";
 import type { Areas, Crosstab, FeatureInfo } from "./types";
 import { getAreas, getCrosstab, getFeatures } from "./api";
+import { useTimeline } from "./timeline";
 import { FEATURES } from "./features";
 
 /**
- * Shared cross-filter selection + result. The pivot is chosen once (Within =
- * `group`, ratio of = `ratio`) and fetched once here, so several views can render
- * the same selection without refetching or drifting apart: the interactive strips
- * under the heatmap (CrossFilter) and the right-rail mirror in the KPI panel
- * (CrossFilterSummary) both read this context. `group` is the crosstab primary,
- * `ratio` the breakdown.
+ * Shared cross-filter selection + result. The pivot is chosen once and fetched
+ * once here; `group` is the crosstab primary, `ratio` the breakdown.
+ *
+ * SCOPED TO THE SCRUBBER. The fetch carries the timeline's current instant, so
+ * the strips under the map describe the moment the map is showing. The KPI rail
+ * deliberately does NOT read this context any more — it used to, and rendered a
+ * mirror of these very strips a few hundred pixels away. The rail is the day's
+ * baseline; this is right now; the pair is worth more than either copy was.
  */
 
 // The "within" (group) dimension: any categorical feature + time-of-day (hour);
@@ -54,17 +57,26 @@ type CrossFilterCtx = {
   ratio: string; // the composition inside each strip — crosstab breakdown
   setGroup: (key: string) => void;
   setRatio: (key: string) => void;
-  swap: () => void; // exchange group ⇄ ratio (only between two categoricals)
-  canSwap: boolean;
   data: Crosstab | null;
   loading: boolean;
   available: Record<string, boolean>; // feature key -> has data yet
   regionLabels: Record<string, string>; // region id -> camera-based display label
+  // The instant this pivot is scoped to, straight from the scrubber. null =
+  // whole day. Exposed so the chart can SAY which it is: the same strip means
+  // two very different things at 08:00 and across the day, and a reader who
+  // cannot tell them apart will quote one as the other.
+  frame: number | null;
 };
 
 const Ctx = createContext<CrossFilterCtx | null>(null);
 
 export function CrossFilterProvider({ children }: { children: ReactNode }) {
+  // THE PIVOT FOLLOWS THE SCRUBBER, the right rail does not. The two surfaces
+  // were showing the same whole-day numbers in two places — the rail literally
+  // mirrored the strips 400px below it — so they now answer different
+  // questions: the rail is the day's baseline, this is the moment on screen,
+  // and the comparison between them is the point.
+  const { frame } = useTimeline();
   const [features, setFeatures] = useState<FeatureInfo[]>([]);
   const [regionLabels, setRegionLabels] = useState<Record<string, string>>({});
   const [group, setGroup] = useState("panel");
@@ -94,26 +106,27 @@ export function CrossFilterProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    getCrosstab(group, ratio)
+    // `frame ?? undefined` and not `frame ?? 0`: the route reads a missing
+    // frame as "whole day" and frame 0 as a real instant, and 0 is a legitimate
+    // bucket key (the first capture of the day).
+    getCrosstab(group, ratio, { frame: frame ?? undefined })
       .then((d) => alive && setData(d))
       .catch(() => alive && setData(null))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
     };
-  }, [group, ratio]);
+  }, [group, ratio, frame]);
 
-  // GROUPS and RATIOS now accept the same dimensions (categoricals + hour), so
-  // exchanging group ⇄ ratio is always valid.
-  const canSwap = true;
-  const swap = () => {
-    setGroup(ratio);
-    setRatio(group);
-  };
+  // No `swap` any more: it existed for a ⇄ button between two chip rows, and
+  // the sentence replaced both. Swapping is now "change the two dropdowns",
+  // which is also honest about the result being a different question rather
+  // than the same one rearranged.
 
   return (
     <Ctx.Provider
-      value={{ group, ratio, setGroup, setRatio, swap, canSwap, data, loading, available, regionLabels }}
+      value={{ group, ratio, setGroup, setRatio, data, loading,
+               available, regionLabels, frame }}
     >
       {children}
     </Ctx.Provider>

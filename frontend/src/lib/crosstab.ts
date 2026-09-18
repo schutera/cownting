@@ -22,9 +22,10 @@ export interface Pivot {
 /**
  * Shared pivot math for a Within(group = primary) × ratio-of(ratio = breakdown)
  * crosstab: per-group segment counts plus the overall aggregate, with stable
- * per-value colours from the feature registry. Both the interactive strips under
- * the heatmap (CrossFilter/RatioStrips) and the right-rail mirror in the KPI
- * panel (CrossFilterSummary) render from this, so the two views can never drift.
+ * per-value colours from the feature registry. Rendered by the strips under the
+ * map (CrossFilter/RatioStrips). The `aggregate`/`aggTotal` half fed a right-rail
+ * mirror that has since been removed — the rail now carries the whole day and
+ * these strips the scrubbed instant, so there is nothing left to keep in sync.
  */
 export function pivot(
   data: Crosstab,
