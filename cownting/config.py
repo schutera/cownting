@@ -163,6 +163,32 @@ class AnnotationCfg(BaseModel):
     clear_instance_px: int = 60     # at/above -> served first
     small_share: float = 0.15       # of sub-clear instances, promoted anyway
 
+    # ASK ABOUT WHAT THE MODEL CANNOT ANSWER (futurework.md, "the second, larger
+    # version"). Once M5 has scored the corpus, every detection carries the
+    # model's own confidence, so the queue can stop sampling uniformly and spend
+    # annotator time where a label actually teaches something: the crops it
+    # abstained on (M5 §9.3 — `attr_behaviour` NULL with a rev) and the ones it
+    # called with thin support. `uncertain_below` is that cut, applied to
+    # `attr_behaviour_p`, which an abstained row keeps precisely so this decision
+    # has a number to read. An UNSCORED row has no probability, reads as 0, and
+    # is therefore asked about — which is what makes this a no-op on a corpus the
+    # model has never touched: everything is equally worth asking, and the order
+    # falls through to the same per-annotator permutation as before.
+    #
+    # `uniform_share` is the price of admission, and it is not optional. A corpus
+    # selected by model uncertainty is no longer a random sample of the herd, so
+    # prevalence ("how much of the day do they spend in shade") and the agreement
+    # statistics computed over it quietly stop meaning what they say. This
+    # fraction is therefore held OUT of the uncertainty rule and kept as a marked
+    # uniform sample. Membership is `md5('uni' || instance_key)` — like the
+    # deep-overlap and small-crop subsets — so it needs no table, every annotator
+    # agrees on it without coordination, and, the part that matters, it stays
+    # recomputable from the key forever: an analysis run next year can recover
+    # exactly the unbiased slice even though `queue_reason` records only what was
+    # true at serve time.
+    uncertain_below: float = 0.75   # ask when the model's posture confidence is under this
+    uniform_share: float = 0.25     # held out of the rule, as a marked random sample
+
 
 class BackupCfg(BaseModel):
     """Weekly zip of the label store, posted to a Discord webhook.

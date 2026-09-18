@@ -245,6 +245,17 @@ def verify_anchor(instance_key: str, anchor: AnchorLike) -> bool:
     return bool(instance_key) and recomputed == instance_key
 
 
+# The vocabulary `_scan_sql`'s queue_reason CASE can emit, and therefore the
+# only values the submit route will store. Ordered as the CASE tests them.
+QUEUE_REASONS: tuple[str, ...] = (
+    "uniform",         # held out of the uncertainty rule, as a marked random sample
+    "unscored",        # the model has no opinion on this crop yet
+    "abstained",       # it looked and declined to name a posture (M5 §9.3)
+    "low_confidence",  # it named one, with support under annotation.uncertain_below
+    "confident",       # it is sure; served only once the others are exhausted
+)
+
+
 def hex_threshold(fraction: float) -> str:
     """The cut point for the deep-overlap subset: `substr(instance_key,1,4) < this`.
 
@@ -313,10 +324,12 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
     # The trailing two are the annotator, once for the `mine` anti-join and once
     # for `mymask`. Order matters: these are positional and must match the order
     # the joins appear in the CTE below.
-    # Positional and order-sensitive: clear-tier (2), overlap (1), target CASE
-    # (3), mine (1), mymask (1), then the hard floor (1) — matching the order the
-    # placeholders appear in the SQL below.
+    # Positional and order-sensitive: clear-tier (2), ask-tier (2), overlap (1),
+    # target CASE (3), mine (1), mymask (1), then the hard floor (1) — matching
+    # the order the placeholders appear in the SQL below.
     params += [cfg.clear_instance_px, hex_threshold(cfg.small_share),
+               cfg.uncertain_below, hex_threshold(cfg.uniform_share),
+               hex_threshold(cfg.uniform_share), cfg.uncertain_below,
                threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance,
                annotator, annotator, cfg.min_instance_px]
 
@@ -356,6 +369,32 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    -- same reason, as the deep-overlap subset above.
                    (greatest(k.bbox_x2 - k.bbox_x1, k.bbox_y2 - k.bbox_y1) >= ?
                     OR substr(md5('sm' || k.instance_key), 1, 4) < ?) AS clear,
+                   -- WORTH ASKING ABOUT: the crop model cannot answer this one,
+                   -- or it is part of the held-out uniform sample. A second
+                   -- front-tier partition exactly like `clear` above, and for
+                   -- the same reason it is a promoted MINORITY rather than a
+                   -- strict tier: the servable pool is ~40x everything labelled
+                   -- to date, so anything sorted strictly behind is never
+                   -- reached at all.
+                   --
+                   -- `coalesce(..., 0)` is what makes this degrade correctly.
+                   -- An unscored row has no probability, reads as 0, and is
+                   -- asked about; on a corpus the model has never scored EVERY
+                   -- row reads as 0, the partition is uniformly true, and the
+                   -- order falls through to the permutation below unchanged.
+                   -- An abstained row keeps `attr_behaviour_p` (M5 §9.3) and so
+                   -- lands here on its merits rather than through the coalesce.
+                   (coalesce(k.attr_behaviour_p, 0) < ?
+                    OR substr(md5('uni' || k.instance_key), 1, 4) < ?) AS worth_asking,
+                   -- Why it was served, recorded on the annotation so a later
+                   -- analysis can separate the uniform sample from the actively
+                   -- selected one. `uniform` is checked FIRST: a row can satisfy
+                   -- both, and the unbiased slice is the claim that must survive.
+                   CASE WHEN substr(md5('uni' || k.instance_key), 1, 4) < ? THEN 'uniform'
+                        WHEN k.attr_model_rev IS NULL                       THEN 'unscored'
+                        WHEN k.attr_behaviour IS NULL                       THEN 'abstained'
+                        WHEN k.attr_behaviour_p < ?                         THEN 'low_confidence'
+                        ELSE 'confident' END AS queue_reason,
                    -- The MODEL's outline. `ranked` is SELECT d.* so it arrives
                    -- here for free, but this projection is explicit, so without
                    -- naming it the column is dropped before _item ever sees it.
@@ -495,6 +534,13 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         # promoted minority of smaller ones) come first. It is a stable partition
         # of the pool, not a per-annotator preference, so it cannot desynchronise
         # two annotators the way ordering on coverage would.
+        #
+        # `NOT s.worth_asking` follows it, and the order of the two is the whole
+        # policy: legibility first, because a crop nobody can answer teaches
+        # nothing however uncertain the model is about it, and only then the
+        # model's uncertainty. Reversing them would walk straight back into the
+        # problem the size floor was built to fix — the model is least confident
+        # on exactly the tiny crops a human cannot read either.
         day_term = "s.day DESC NULLS LAST, " if order == "fresh" else ""
         params.append(annotator)
         params.append(n)
@@ -502,7 +548,7 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             SELECT s.*, count(*) OVER () AS matching
             FROM scoped s
             WHERE {' AND '.join(where)}
-            ORDER BY {day_term}(NOT s.clear), md5(? || s.instance_key)
+            ORDER BY {day_term}(NOT s.clear), (NOT s.worth_asking), md5(? || s.instance_key)
             LIMIT ?
             """, params)
 
@@ -679,6 +725,13 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
     return {
         "instance_key": row["instance_key"],
         "dataset_id": row["dataset_id"],
+        # Why the queue picked this one, echoed back on submit and stored on the
+        # annotation. Recorded rather than recomputed because the uncertainty
+        # half is not recoverable later — a re-score overwrites the probability
+        # this decision was made on. (The `uniform` half always is: it is a hash
+        # of the key.) Read it to separate the unbiased sample from the actively
+        # selected one before quoting any prevalence.
+        "queue_reason": row.get("queue_reason"),
         "day": day.isoformat() if day is not None else None,
         "camera_id": row["camera_id"],
         "frame_file": frame_file,

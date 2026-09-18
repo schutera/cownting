@@ -224,6 +224,11 @@ export interface Taxonomy {
 export interface LabelItem {
   instance_key: string;
   dataset_id: string | null;
+  // Why the queue picked this one. Echoed back on submit so the label store can
+  // separate the held-out uniform sample from the actively-selected rest; the
+  // page never shows it, because telling an annotator the model is unsure would
+  // anchor their answer.
+  queue_reason?: string | null;
   day: string | null;                       // ISO date; NOT the clock time
   camera_id: string;
   frame_file: string;
@@ -489,6 +494,7 @@ export interface LabelSubmitReq {
   client_elapsed_ms?: number | null;   // client ACTIVE time; the tab-away detector
   input_mode?: LabelInputMode | null;
   note?: string | null;
+  queue_reason?: string | null;        // echoed from the item; see LabelItem
 }
 // Flagging an instance the annotator cannot answer. `explanation` is REQUIRED
 // and must not be whitespace — that requirement is the entire point of replacing
@@ -502,6 +508,7 @@ export interface LabelSubmitReq {
 export interface LabelFlagReq {
   instance_key: string;
   anchor: InstanceAnchor;
+  queue_reason?: string | null;        // echoed from the item; see LabelItem
   reason: LabelSkipReason;
   /** Optional. The mandatory written justification was removed: the reason
       codes carry the signal it stood in for, and a blank one is stored as

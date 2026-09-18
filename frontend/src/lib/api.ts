@@ -487,10 +487,25 @@ export function savePanelAreas(areas: Areas): Promise<{ ok: boolean }> {
   });
 }
 
+// The crop model's read of one count area's animals. `scored` is the
+// denominator — the rows it has an opinion on — so `scored === 0` means "the
+// model has not been here", which is NOT the same as every class being zero.
+export interface AreaAttrs {
+  scored: number;
+  feeding: number;
+  lying: number;
+  standing: number;
+  unsure: number; // looked at, declined to call a posture
+  direct_sun: number;
+  shaded: number;
+  sun_nv: number; // no light reading: overcast, too dark, too little visible
+}
+
 export interface AreaCounts {
   counts: Record<string, number>;
   postures: Record<string, PostureBreakdown>;
   sheltering: Record<string, number>; // per-region cows under a panel (unit-block indicator)
+  attrs?: Record<string, AreaAttrs>;  // optional: absent from an older server
   frame: number | null;
 }
 

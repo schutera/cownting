@@ -192,6 +192,10 @@ function optNum(v: unknown): number | null {
   return typeof v === "number" ? v : null;
 }
 
+function optStr(v: unknown): string | null {
+  return typeof v === "string" && v !== "" ? v : null;
+}
+
 function parsePolygon(v: unknown): [number, number][] | null {
   if (!Array.isArray(v) || v.length < 3) return null;
   const out: [number, number][] = [];
@@ -232,6 +236,7 @@ function parseWrite(v: unknown): LabelWrite | null {
         answers,
         taxonomy_revision: req.taxonomy_revision,
         serve_event_id: optNum(req.serve_event_id),
+        queue_reason: optStr(req.queue_reason),
         session_id,
         client_elapsed_ms: optNum(req.client_elapsed_ms),
         input_mode: parseMode(req.input_mode),
@@ -260,6 +265,7 @@ function parseWrite(v: unknown): LabelWrite | null {
         reason,
         explanation,
         serve_event_id: optNum(req.serve_event_id),
+        queue_reason: optStr(req.queue_reason),
         session_id,
         client_elapsed_ms: optNum(req.client_elapsed_ms),
       },

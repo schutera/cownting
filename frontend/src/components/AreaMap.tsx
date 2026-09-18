@@ -1,13 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { Areas, PostureBreakdown } from "../lib/types";
+import type { AreaAttrs } from "../lib/api";
 import { getAreas, getAreaCounts, orthoImg } from "../lib/api";
-import {
-  HEAT_HOT,
-  SHELTER_COLOR,
-  CHART_MUTED,
-  REST_COLOR,
-  ACTIVE_COLOR,
-} from "../lib/palette";
+import { HEAT_HOT, SHELTER_COLOR, CHART_MUTED, OPEN_COLOR } from "../lib/palette";
+import { lightTintFor, ringFor, ringLegend, type Ring } from "../lib/areaAttrs";
 import { Card } from "../components/ui";
 
 const PULSE_MS = 650; // duration of the on-change pulse per area badge
@@ -22,6 +18,14 @@ const PULSE_MS = 650; // duration of the on-change pulse per area badge
  * warm heat, falling => cool teal, flat => neutral) with a subtle pulse on
  * change. The count is the cows present in each area AT THE CURRENT FRAME
  * (`frame`); it does not accumulate over a window.
+ *
+ * The badge ring and the aura's hue both come from `lib/areaAttrs` — the ring
+ * is the crop model's behaviour mix where it has scored the area and the
+ * segmenter's posture proxy where it has not, and the hue is the light those
+ * animals are in. Those two decisions are pure functions with their own tests,
+ * because everything here is drawn into a <canvas> and cannot be asserted on.
+ * Where the model has not scored, both fall back and this is the map it has
+ * always been: proxy ring, delta-coloured aura.
  */
 export function AreaMap({
   frame,
@@ -36,6 +40,9 @@ export function AreaMap({
   const [counts, setCounts] = useState<Record<string, number>>({});
   // Per-area posture composition (standing/lying/unknown) driving the badge ring.
   const [postures, setPostures] = useState<Record<string, PostureBreakdown>>({});
+  // Per-area crop-model composition — behaviour + light. Empty on a day the
+  // model has not scored, and on a server too old to send it.
+  const [attrs, setAttrs] = useState<Record<string, AreaAttrs>>({});
   // Per-area cows under a panel — drawn as unit blocks stacked above the circle.
   const [sheltering, setSheltering] = useState<Record<string, number>>({});
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -67,6 +74,7 @@ export function AreaMap({
         setCounts(d.counts ?? {});
         setPostures(d.postures ?? {});
         setSheltering(d.sheltering ?? {});
+        setAttrs(d.attrs ?? {});
       })
       .catch(() => {
         /* counts are optional — the map still renders the area outlines */
@@ -126,6 +134,8 @@ export function AreaMap({
       count: number;
       pulse: number;
       auraColor: string;
+      ring: Ring;        // what the composition arc shows, and from which source
+      lightLabel: string | null; // the aura's meaning, for the hover title
     };
     const items: Item[] = [];
     Object.entries(areas).forEach(([cam, list]) => {
@@ -149,9 +159,19 @@ export function AreaMap({
           const t = (now - start) / PULSE_MS;
           if (t >= 0 && t < 1) pulse = Math.sin(Math.PI * t) * (1 - t);
         }
-        // Aura hue by delta vs the previous render.
+        // Aura hue: the light these animals are in where the model has scored
+        // them, else — exactly as before — the sign of the change since the
+        // last render. The pulse fires on change either way, so "this area
+        // just moved" survives the swap.
+        const tint = lightTintFor(attrs[rid]);
         const d = deltaRef.current[rid] ?? 0;
-        const auraColor = d > 0 ? HEAT_HOT : d < 0 ? SHELTER_COLOR : CHART_MUTED;
+        const auraColor = tint
+          ? tint.color
+          : d > 0
+            ? HEAT_HOT
+            : d < 0
+              ? SHELTER_COLOR
+              : CHART_MUTED;
         items.push({
           area,
           rid,
@@ -163,6 +183,8 @@ export function AreaMap({
           count: counts[rid] ?? 0,
           pulse,
           auraColor,
+          ring: ringFor(attrs[rid], postures[rid]),
+          lightLabel: tint ? `${Math.round(tint.share * 100)}% ${tint.label}` : null,
         });
       });
     });
@@ -285,17 +307,13 @@ export function AreaMap({
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // Posture composition ring around the badge: three arcs sized by the
-      // standing / resting / unknown split for this area (reused proxy).
-      const pb = postures[rid];
-      const pbTotal = pb ? pb.standing + pb.lying + pb.unknown : 0;
+      // Composition ring around the badge: one arc per class of whichever
+      // source ringFor picked (the crop model where it has scored this area,
+      // the posture proxy where it has not).
+      const segs = it.ring.segments.map((s) => ({ v: s.value, c: s.color }));
+      const segTotal = it.ring.total;
       let ringOuter = badgeR; // used to place the name label clear of the ring
-      if (pb && count > 0 && pbTotal > 0) {
-        const segs = [
-          { v: pb.standing, c: ACTIVE_COLOR }, // amber — standing / active
-          { v: pb.lying, c: REST_COLOR }, // sage — lying / resting
-          { v: pb.unknown, c: CHART_MUTED }, // muted — unclassified
-        ].filter((s) => s.v > 0);
+      if (count > 0 && segs.length > 0 && segTotal > 0) {
         const ringW = Math.max(2.5, badgeR * 0.3);
         const ringR = badgeR + ringW * 0.5 + 3;
         ringOuter = ringR + ringW * 0.5;
@@ -305,7 +323,7 @@ export function AreaMap({
         ctx.lineWidth = ringW;
         ctx.lineCap = "butt";
         segs.forEach((s) => {
-          const sweep = (s.v / pbTotal) * span;
+          const sweep = (s.v / segTotal) * span;
           ctx.beginPath();
           ctx.strokeStyle = hexToRgba(s.c, 0.95);
           ctx.arc(cx, cy, ringR, a0, a0 + sweep);
@@ -389,7 +407,7 @@ export function AreaMap({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [areas, counts, postures, sheltering, cameras, hidden]);
+  }, [areas, counts, postures, sheltering, attrs, cameras, hidden]);
 
   if (!areas) {
     return (
@@ -409,6 +427,14 @@ export function AreaMap({
       acc + list.reduce((s, a) => s + (counts[`${cam}::${a.id}`] ?? 0), 0)
     );
   }, 0);
+
+  // The key describes the SOURCE the badges are drawing from, computed over the
+  // visible areas only — hiding a camera can change which source is in play.
+  const visibleRids = Object.entries(areas).flatMap(([cam, list]) =>
+    hidden?.has(cam) ? [] : list.map((a) => `${cam}::${a.id}`),
+  );
+  const legend = ringLegend(visibleRids.map((rid) => ringFor(attrs[rid], postures[rid])));
+  const anyLight = visibleRids.some((rid) => lightTintFor(attrs[rid]) !== null);
 
   return (
     <div className="animate-fade-slide-in">
@@ -431,12 +457,23 @@ export function AreaMap({
               nAreas === 1 ? "" : "s"
             } · ${frame == null ? "peak, whole day" : "this frame"}`}
       </div>
-      {nAreas > 0 ? (
-        <div className="flex items-center gap-3 mt-1.5 text-[11px] text-gray-tertiary">
-          <span className="text-gray-mid">ring:</span>
-          <LegendDot color={ACTIVE_COLOR} label="standing" />
-          <LegendDot color={REST_COLOR} label="resting" />
-          <LegendDot color={CHART_MUTED} label="unknown" />
+      {nAreas > 0 && legend.entries.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1.5 text-[11px] text-gray-tertiary">
+          <span className="text-gray-mid">
+            {legend.source === "model" ? "ring · doing:" : "ring · posture:"}
+          </span>
+          {legend.entries.map((e) => (
+            <LegendDot key={e.key} color={e.color} label={e.label} />
+          ))}
+          {anyLight ? (
+            <>
+              <span className="text-border">|</span>
+              <span className="text-gray-mid">glow · light:</span>
+              <LegendDot color={OPEN_COLOR} label="sun" />
+              <LegendDot color={SHELTER_COLOR} label="shade" />
+              <LegendDot color={CHART_MUTED} label="not readable" />
+            </>
+          ) : null}
         </div>
       ) : null}
     </div>

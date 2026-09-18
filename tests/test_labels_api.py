@@ -456,6 +456,69 @@ def test_serve_event_and_time_on_task():
               row is not None and row[1] is not None and int(row[1]) > 0, str(row))
 
 
+def test_queue_reason_is_served_and_stored():
+    """The mark that keeps a prevalence estimate honest.
+
+    Once the queue prefers crops the model is unsure about, the label store is
+    no longer a random sample of the herd — so every annotation has to record
+    WHY its instance was served, or "what fraction of the day do they spend in
+    shade" silently becomes "...among the crops the model found difficult".
+    The value only survives the round trip if the queue emits it, the item
+    carries it, and the submit route stores it; a break anywhere in that chain
+    is invisible, because the column simply stays NULL.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        items = client.get("/api/label/queue").json()["items"]
+        rev = _rev(client)
+        check("every served item says why it was picked",
+              all(it.get("queue_reason") in labeling.QUEUE_REASONS for it in items),
+              str({it.get("queue_reason") for it in items}))
+
+        item = items[0]
+        r = _submit(client, item, rev, queue_reason=item["queue_reason"])
+        check("submit with a queue_reason -> 200", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+        aid = r.json().get("annotation_id") if r.status_code == 200 else None
+        lc = db.connect(config.paths.labels_db_path)
+        got = lc.execute("SELECT queue_reason FROM annotations WHERE annotation_id = ?",
+                         [aid]).fetchone()
+        lc.close()
+        check("...and it reaches the annotation",
+              got is not None and got[0] == item["queue_reason"], str(got))
+
+        # A client is not trusted with this field any more than with any other
+        # telemetry: an invented category would quietly survive a later
+        # "restrict to the uniform sample" filter, so it is dropped, not stored.
+        other = items[1]
+        r = _submit(client, other, rev, queue_reason="handpicked-by-me")
+        check("an invented reason is still accepted as a submission",
+              r.status_code == 200, f"{r.status_code}: {r.text[:120]}")
+        aid = r.json().get("annotation_id") if r.status_code == 200 else None
+        lc = db.connect(config.paths.labels_db_path)
+        got = lc.execute("SELECT queue_reason FROM annotations WHERE annotation_id = ?",
+                         [aid]).fetchone()
+        lc.close()
+        check("...but the off-vocabulary value is dropped rather than stored",
+              got is not None and got[0] is None, str(got))
+
+        # And a flag carries it too: an instance nobody could answer is part of
+        # the same sampling story as one that got an answer.
+        third = items[2]
+        r = client.post("/api/label/skip", json={
+            "instance_key": third["instance_key"], "anchor": _anchor(third),
+            "reason": "low_resolution", "queue_reason": third["queue_reason"]})
+        check("flag with a queue_reason -> 200", r.status_code == 200,
+              f"{r.status_code}: {r.text[:120]}")
+        lc = db.connect(config.paths.labels_db_path)
+        got = lc.execute(
+            "SELECT queue_reason FROM annotations WHERE instance_key = ? AND outcome = 'skipped'",
+            [third["instance_key"]]).fetchone()
+        lc.close()
+        check("...and the flag records it as well", got is not None and got[0] == third["queue_reason"],
+              str(got))
+
+
 def test_decision_event_detail_is_stored():
     """The `answered` payload (M3 UX §6.1) must survive the API boundary.
 
@@ -1293,6 +1356,7 @@ def main():
     test_queue_policy()
     test_multi_annotator_default()
     test_serve_event_and_time_on_task()
+    test_queue_reason_is_served_and_stored()
     test_decision_event_detail_is_stored()
     test_undo_is_scoped_to_me()
     test_mask_fix_roundtrip_and_validation()

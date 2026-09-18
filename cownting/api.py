@@ -94,6 +94,13 @@ class LabelSubmitReq(BaseModel):
     client_elapsed_ms: int | None = None
     input_mode: str | None = None         # 'key' | 'mouse'
     note: str | None = None
+    # Why the queue picked this instance, echoed back from the item. Echoed
+    # rather than recomputed for the same reason `serve_event_id` is: this route
+    # NEVER opens the main DB (M3 §4.3), and the model probabilities the choice
+    # was made against live there and are overwritten by the next re-score.
+    # Untrusted like every other telemetry field; the half that matters for an
+    # unbiased estimate (`uniform`) stays recomputable from the instance key.
+    queue_reason: str | None = None
 
 
 class LabelSkipReq(BaseModel):
@@ -112,6 +119,7 @@ class LabelSkipReq(BaseModel):
     client_elapsed_ms: int | None = None
     note: str | None = None
     explanation: str | None = None
+    queue_reason: str | None = None        # see LabelSubmitReq
 
 
 class LabelMaskFixReq(BaseModel):
@@ -923,6 +931,13 @@ def create_app(config: Config) -> FastAPI:
         (`{region_id: {standing, lying, unknown}}`) for the per-area composition
         ring, and `sheltering` (`{region_id: n}`) = that area's cows under a panel,
         for the unit-block indicator. Posture is the reused proxy; NULL -> unknown.
+
+        `attrs` (`{region_id: {scored, feeding, lying, standing, unsure,
+        direct_sun, shaded, sun_nv}}`) is the crop model's view of the same
+        rows: what the animals in the area are doing and the light they are in.
+        `scored` is its denominator; an area with scored=0 has nothing from the
+        model and the map falls back to the posture proxy for its ring. Same
+        gate as every count.
         """
         c = con()
         ds = resolve_ds(c, dataset)
@@ -939,33 +954,40 @@ def create_app(config: Config) -> FastAPI:
                 }
                 for r in df.itertuples()
             }
+            attrs = {r.region_id: db.area_attrs_dict(r) for r in df.itertuples()}
             return {
                 "counts": counts,
                 "postures": postures,
                 "sheltering": sheltering,
+                "attrs": attrs,
                 "frame": None,
             }
         ds_filter = " AND f.dataset_id = ?" if ds else ""
-        rows = c.execute(
-            "SELECT d.region_id, coalesce(d.posture, 'unknown') AS posture, "
-            "       count(*) AS n, count(*) FILTER (WHERE d.under_panel) AS shel "
+        df = c.execute(
+            "SELECT d.region_id, count(*) AS n, count(*) FILTER (WHERE d.under_panel) AS shel, "
+            "       count(*) FILTER (WHERE d.posture = 'standing') AS standing, "
+            "       count(*) FILTER (WHERE d.posture = 'lying')    AS lying, "
+            "       count(*) FILTER (WHERE coalesce(d.posture, 'unknown') "
+            "                        NOT IN ('standing', 'lying')) AS unknown, "
+            + db.AREA_ATTR_COLS +
             "FROM detections d "
             "JOIN frames f ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path "
             f"WHERE d.region_id IS NOT NULL AND {db._instant_expr(bin_seconds)} = ?{ds_filter} "
-            "GROUP BY d.region_id, posture",
+            f"  AND {db.gate_clause('d')} "
+            "GROUP BY d.region_id",
             [frame] + ([ds] if ds else []),
-        ).fetchall()
+        ).df()
         c.close()
-        counts: dict[str, int] = {}
-        postures: dict[str, dict[str, int]] = {}
-        sheltering: dict[str, int] = {}
-        for rid, posture, n, shel in rows:
-            n = int(n)
-            counts[rid] = counts.get(rid, 0) + n
-            sheltering[rid] = sheltering.get(rid, 0) + int(shel or 0)
-            slot = postures.setdefault(rid, {"standing": 0, "lying": 0, "unknown": 0})
-            slot[posture if posture in slot else "unknown"] += n
-        return {"counts": counts, "postures": postures, "sheltering": sheltering, "frame": frame}
+        counts = {r.region_id: int(r.n) for r in df.itertuples()}
+        sheltering = {r.region_id: int(r.shel) for r in df.itertuples()}
+        postures = {
+            r.region_id: {"standing": int(r.standing), "lying": int(r.lying),
+                          "unknown": int(r.unknown)}
+            for r in df.itertuples()
+        }
+        attrs = {r.region_id: db.area_attrs_dict(r) for r in df.itertuples()}
+        return {"counts": counts, "postures": postures, "sheltering": sheltering,
+                "attrs": attrs, "frame": frame}
 
     @app.get("/api/day-series")
     def day_series(dataset: str | None = None):
@@ -1478,13 +1500,18 @@ def create_app(config: Config) -> FastAPI:
     def _label_telemetry(request: Request, user: dict, *, revision: int,
                          session_id: str | None, serve_event_id: int | None,
                          client_elapsed_ms: int | None, input_mode: str | None = None,
-                         skip_reason: str | None = None, note: str | None = None) -> dict:
+                         skip_reason: str | None = None, note: str | None = None,
+                         queue_reason: str | None = None) -> dict:
         """Everything a submission reports about the act of answering. The role
         columns record the acting-preview split (§3.3) and `auth_disabled`, so
         reporting can exclude both populations from the headline agreement
         numbers instead of discovering them later."""
         return {
             "skip_reason": skip_reason,
+            # Constrained to the vocabulary the queue emits, so a client cannot
+            # invent a category that a later "restrict to the uniform sample"
+            # filter would silently fail to exclude.
+            "queue_reason": queue_reason if queue_reason in labeling.QUEUE_REASONS else None,
             "flag_note": _clip(note, config.annotation.max_note_chars),
             "session_id": _clip(session_id, 64),
             "serve_event_id": serve_event_id,
@@ -1886,7 +1913,8 @@ def create_app(config: Config) -> FastAPI:
                         session_id=body.session_id,
                         serve_event_id=body.serve_event_id,
                         client_elapsed_ms=body.client_elapsed_ms,
-                        input_mode=body.input_mode, note=body.note),
+                        input_mode=body.input_mode, note=body.note,
+                        queue_reason=body.queue_reason),
                 )
             except ValueError as e:
                 # The lost UNIQUE (instance_key, annotator, version) race — a
@@ -1961,7 +1989,8 @@ def create_app(config: Config) -> FastAPI:
                         session_id=body.session_id,
                         serve_event_id=body.serve_event_id,
                         client_elapsed_ms=body.client_elapsed_ms,
-                        skip_reason=body.reason, note=explanation or None),
+                        skip_reason=body.reason, note=explanation or None,
+                        queue_reason=body.queue_reason),
                 )
             except ValueError as e:
                 raise HTTPException(409, str(e))

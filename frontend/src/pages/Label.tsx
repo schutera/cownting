@@ -859,6 +859,9 @@ export default function Label() {
         answers: ans,
         taxonomy_revision: taxonomy.revision,
         serve_event_id: item.serve_event_id,
+        // Straight from the item, never re-derived here: it records why the
+        // QUEUE chose this instance, which only the server knows.
+        queue_reason: item.queue_reason ?? null,
         session_id: sessionId,
         client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
         input_mode: mode,
@@ -994,6 +997,7 @@ export default function Label() {
       anchor: anchorOf(current),
       reason,
       serve_event_id: current.serve_event_id,
+      queue_reason: current.queue_reason ?? null,
       session_id: sessionId,
       client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
     };

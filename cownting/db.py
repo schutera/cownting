@@ -834,6 +834,40 @@ def area_summary(con, dataset_id: str | None = None) -> pd.DataFrame:
     ).df()
 
 
+# The crop model, per count area, for the occupancy map's badge rings. One
+# string so the whole-day and the per-instant queries cannot drift apart. `d`
+# is the detections alias. `unsure` is a row the model looked at and declined
+# (rev set, class NULL) — and, defensively, a row an older checkpoint scored as
+# the not_visible class outright; today's scorer never writes that class, it
+# abstains instead, and the map must not grow a fourth grey for it.
+AREA_ATTR_COLS = """
+       count(d.attr_model_rev)                                              AS scored,
+       count(*) FILTER (WHERE d.attr_behaviour = 'behaviour.feeding')       AS feeding,
+       count(*) FILTER (WHERE d.attr_behaviour = 'behaviour.lying')         AS b_lying,
+       count(*) FILTER (WHERE d.attr_behaviour = 'behaviour.standing')      AS b_standing,
+       count(*) FILTER (WHERE d.attr_model_rev IS NOT NULL
+                          AND (d.attr_behaviour IS NULL
+                               OR d.attr_behaviour = 'behaviour.not_visible')) AS unsure,
+       count(*) FILTER (WHERE d.attr_sun = 'sun_exposure.direct_sun')       AS direct_sun,
+       count(*) FILTER (WHERE d.attr_sun = 'sun_exposure.shaded')           AS shaded,
+       count(*) FILTER (WHERE d.attr_sun = 'sun_exposure.not_visible')      AS sun_nv
+"""
+AREA_ATTR_KEYS = ("scored", "feeding", "b_lying", "b_standing", "unsure",
+                  "direct_sun", "shaded", "sun_nv")
+
+
+def area_attrs_dict(row) -> dict[str, int]:
+    """The per-area attrs block the API returns, from a row that carries
+    AREA_ATTR_COLS (attribute access, e.g. an itertuples row)."""
+    return {
+        "scored": int(row.scored),
+        "feeding": int(row.feeding), "lying": int(row.b_lying),
+        "standing": int(row.b_standing), "unsure": int(row.unsure),
+        "direct_sun": int(row.direct_sun), "shaded": int(row.shaded),
+        "sun_nv": int(row.sun_nv),
+    }
+
+
 def area_counts_whole_day(con, dataset_id: str | None = None, bin_seconds: float = 60.0) -> pd.DataFrame:
     """Whole-day occupancy per count area for the map's "whole day" toggle.
 
@@ -843,10 +877,16 @@ def area_counts_whole_day(con, dataset_id: str | None = None, bin_seconds: float
     standing/lying/unknown are whole-day cumulative counts, used only for the
     posture ring's proportions; `sheltering` is the peak simultaneous under-panel
     count. Empty frame => no rows (not a blank latest frame).
+
+    The AREA_ATTR_COLS block is the crop model's whole-day composition per area,
+    cumulative like the posture proxy and for the same ring. The gate applies
+    to every CTE here, so a rejected detection is neither counted nor part of
+    any composition — with the gate off (`coalesce(attr_is_cow, TRUE)`) this is
+    the query it always was.
     """
     dwhere = " AND d.dataset_id = ?" if dataset_id is not None else ""
-    where = " AND dataset_id = ?" if dataset_id is not None else ""
-    params = ([dataset_id, dataset_id] if dataset_id is not None else [])
+    gate = gate_clause("d")
+    params = ([dataset_id] * 3 if dataset_id is not None else [])
     return con.execute(
         f"""
         WITH per_frame AS (
@@ -855,7 +895,7 @@ def area_counts_whole_day(con, dataset_id: str | None = None, bin_seconds: float
                    count(*) FILTER (WHERE d.under_panel) AS shel
             FROM detections d
             JOIN frames f ON d.camera_id = f.camera_id AND d.frame_path = f.frame_path
-            WHERE d.region_id IS NOT NULL{dwhere}
+            WHERE d.region_id IS NOT NULL{dwhere} AND {gate}
             GROUP BY d.region_id, instant
         ),
         peak AS (
@@ -863,15 +903,23 @@ def area_counts_whole_day(con, dataset_id: str | None = None, bin_seconds: float
             FROM per_frame GROUP BY region_id
         ),
         posture AS (
-            SELECT region_id,
-                   count(*) FILTER (WHERE coalesce(posture, 'unknown') = 'standing') AS standing,
-                   count(*) FILTER (WHERE coalesce(posture, 'unknown') = 'lying')     AS lying,
-                   count(*) FILTER (WHERE coalesce(posture, 'unknown')
-                                          NOT IN ('standing', 'lying'))               AS unknown
-            FROM detections WHERE region_id IS NOT NULL{where} GROUP BY region_id
+            SELECT d.region_id,
+                   count(*) FILTER (WHERE coalesce(d.posture, 'unknown') = 'standing') AS standing,
+                   count(*) FILTER (WHERE coalesce(d.posture, 'unknown') = 'lying')     AS lying,
+                   count(*) FILTER (WHERE coalesce(d.posture, 'unknown')
+                                          NOT IN ('standing', 'lying'))                 AS unknown
+            FROM detections d WHERE d.region_id IS NOT NULL{dwhere} AND {gate}
+            GROUP BY d.region_id
+        ),
+        attrs AS (
+            SELECT d.region_id, {AREA_ATTR_COLS}
+            FROM detections d WHERE d.region_id IS NOT NULL{dwhere} AND {gate}
+            GROUP BY d.region_id
         )
-        SELECT p.region_id, p.peak, p.sheltering, o.standing, o.lying, o.unknown
-        FROM peak p JOIN posture o USING (region_id)
+        SELECT p.region_id, p.peak, p.sheltering, o.standing, o.lying, o.unknown,
+               a.scored, a.feeding, a.b_lying, a.b_standing, a.unsure,
+               a.direct_sun, a.shaded, a.sun_nv
+        FROM peak p JOIN posture o USING (region_id) JOIN attrs a USING (region_id)
         ORDER BY p.peak DESC
         """,
         params,
