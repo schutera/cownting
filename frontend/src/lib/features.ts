@@ -2,17 +2,7 @@
 // The SQL that produces each feature's crosstab lives in the backend; here we
 // only carry how a feature is labelled, what kind of axis it is, and how its
 // category values map to the shared palette. Keys MUST match the backend.
-import {
-  ACTIVE_COLOR,
-  REST_COLOR,
-  CHART_MUTED,
-  SHELTER_COLOR,
-  OPEN_COLOR,
-  ACCENT_COLORS,
-  HEAT,
-  heatRamp,
-  cameraColor,
-} from "./palette";
+import { ACTIVE_COLOR, REST_COLOR, CHART_MUTED, SHELTER_COLOR, OPEN_COLOR, ACCENT_COLORS, HEAT, heatRamp, cameraColor, FEED_COLOR } from "./palette";
 
 export type FeatureKind = "categorical" | "temporal_frame" | "temporal_hour";
 
@@ -91,7 +81,7 @@ export const FEATURES: FeatureDef[] = [
         : value === "lying"
           ? REST_COLOR
           : value === "feeding"
-            ? ACCENT_COLORS[0]
+            ? FEED_COLOR
             : value === "unsure"
               ? UNSURE_COLOR
               : CHART_MUTED,

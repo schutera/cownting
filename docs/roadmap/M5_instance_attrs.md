@@ -325,3 +325,25 @@ number to watch is the `unsure` bucket in the behaviour pivot and the KPI rail.
   a different farm, and the block split does not test that. Treat cross-site
   performance as unmeasured.
 - **`head_probing` is unlearnable at n=56** — pooled F1 ≤ 0.12 in every one of the eleven CV configurations tried. It is visually near-identical to `feeding` and should be merged into it or dropped from the model's head; keeping it costs the headline metric ~0.02 for nothing.
+
+**Seen in the first production pass (2026-09-17).** Two things the numbers
+say that the CV could not:
+
+- *Sun has no word for overcast.* `sun_exposure.not_visible` is 2–3% of
+  detections on 06-29, 07-02 and 07-05 and 91–98% on 07-04, 08-30, 09-01 and
+  09-02 — all day long, every hour (07-04: 98% at 08:00, 91% at 10:00), not a
+  dawn artefact and not a crop-size effect (≈45% in every size band). Those are
+  overcast days: neither "shaded" nor "in direct sun" is true of anything, and
+  the model reaches for the only remaining class. It is doing what the
+  taxonomy allows. The annotator did the same — 56% of the labelled instances
+  are `not_visible`. A fourth class ("diffuse / no direct light") would turn
+  the largest bucket on the dashboard into an answer; until then, read the
+  light strip per day, not across days.
+- *The gate has found a fixed false positive.* 9.5% of detections would be
+  rejected at p<0.5, but 17.5% on camera_04 against 4–9% elsewhere, and 921 of
+  camera_04's rejections sit in one 100-px cell (x 0–100, y 600–700) across 12
+  different days — something the segmenter reads as a cow at that spot, day
+  after day, that the crop model reads as not one. That is the gate's whole
+  purpose, and a good first thing to look at (frames 169/175/179 of
+  2025-07-04 · camera_04 show five or six of them struck through) before
+  deciding on `gate_enabled`.

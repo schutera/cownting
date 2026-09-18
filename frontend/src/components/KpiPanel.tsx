@@ -1,5 +1,5 @@
 import type { AttrKpis, Kpis } from "../lib/types";
-import { ACTIVE_COLOR, REST_COLOR, ACCENT_COLORS, SHELTER_COLOR, OPEN_COLOR, CHART_MUTED } from "../lib/palette";
+import { ACTIVE_COLOR, REST_COLOR, FEED_COLOR, SHELTER_COLOR, OPEN_COLOR, CHART_MUTED } from "../lib/palette";
 import { UNSURE_COLOR } from "../lib/features";
 import { Panel, SectionLabel, Stat } from "./ui";
 import { CrossFilterSummary } from "./CrossFilterSummary";
@@ -86,7 +86,7 @@ function AttrStrips({ attrs }: { attrs: AttrKpis }) {
   const b = attrs.behaviour;
   const s = attrs.sun;
   const behaviour = [
-    { key: "feeding", label: "feeding", n: b.feeding, color: ACCENT_COLORS[0] },
+    { key: "feeding", label: "feeding", n: b.feeding, color: FEED_COLOR },
     { key: "lying", label: "lying", n: b.lying, color: REST_COLOR },
     { key: "standing", label: "standing", n: b.standing, color: ACTIVE_COLOR },
     { key: "not_visible", label: "not visible", n: b.not_visible, color: CHART_MUTED },

@@ -109,13 +109,18 @@ export default function CameraDetail({
           title={`${camera} · ${kind}`}
           overlay={
             attrsOn
-              ? (invScale) => (
+              ? (invScale, screenScale) => (
                   <svg
                     className="absolute inset-0 w-full h-full"
                     viewBox={`0 0 ${meta.width} ${meta.height}`}
                     preserveAspectRatio="none"
                   >
-                    <AttrBadges dets={dets} naturalWidth={meta.width} invScale={invScale} />
+                    <AttrBadges
+                      dets={dets}
+                      naturalWidth={meta.width}
+                      invScale={invScale}
+                      screenScale={screenScale}
+                    />
                   </svg>
                 )
               : undefined

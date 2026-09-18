@@ -70,12 +70,33 @@ export function ImageClicker({
   maxHeight?: string;
   /** Extra layer drawn INSIDE the zoom/pan transform, in natural-pixel
       coordinates, on top of the image. Receives 1/scale so a caller can keep
-      on-screen sizes constant across zoom (the same trick the markers use).
+      on-screen sizes constant across zoom (the same trick the markers use),
+      AND the number of natural px per CSS px at scale 1 — because a 1920-px
+      frame shown 900 px wide already halves anything sized in natural px
+      before the zoom is even considered. Multiply the two and a length is in
+      CSS px on screen, at every zoom and every viewport width.
       Pointer-transparent: it annotates, it never intercepts. */
-  overlay?: (invScale: number) => ReactNode; // any CSS length — caps the viewport so a tall image still fits on screen
+  overlay?: (invScale: number, screenScale: number) => ReactNode; // any CSS length — caps the viewport so a tall image still fits on screen
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
+
+  // CSS px per natural px when the image exactly fills the viewport. Tracked
+  // with a ResizeObserver rather than computed once: the rail collapses on
+  // narrow screens and the viewport is height-capped for tall frames, so the
+  // fit changes without the image changing.
+  const [fit, setFit] = useState(1);
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp || typeof ResizeObserver === "undefined") return;
+    const measure = () => {
+      if (vp.clientWidth > 0) setFit(vp.clientWidth / naturalWidth);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(vp);
+    return () => ro.disconnect();
+  }, [naturalWidth]);
 
   // View transform. Refs mirror state so wheel/pan math never reads stale values.
   const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 });
@@ -280,7 +301,7 @@ export function ImageClicker({
         >
           <img ref={imgRef} src={src} className="w-full block" draggable={false} />
           {overlay ? (
-            <div className="absolute inset-0 pointer-events-none">{overlay(invScale)}</div>
+            <div className="absolute inset-0 pointer-events-none">{overlay(invScale, fit > 0 ? 1 / fit : 1)}</div>
           ) : null}
           {mode === "polyline" ? (
             <div className="absolute inset-0 pointer-events-none">

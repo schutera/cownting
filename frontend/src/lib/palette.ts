@@ -21,6 +21,11 @@ export function heatRamp(t: number): string {
 // Resting vs. active split.
 export const REST_COLOR = "#5f8b6a";      // sage
 export const ACTIVE_COLOR = "#e58a3c";    // amber
+// The crop model's third posture. Named, because "ACCENT_COLORS[0]" is sage
+// too and feeding and lying shipped in the same colour once; plum is the one
+// hue in the accent list far from both of these AND from the light strip's
+// teal/gold, which sits directly beneath the behaviour strip on the rail.
+export const FEED_COLOR = "#9b6bb0";      // plum
 
 // Under panels vs. open sky split. Teal reads as "shade/shelter" and stays
 // distinct from the fence's terracotta orange on the heatmap overlay.

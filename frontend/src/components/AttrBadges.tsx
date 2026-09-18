@@ -23,9 +23,12 @@ import { ClassGlyph } from "./ClassIcon";
  * gets nothing: an absent badge is "unscored", and drawing a placeholder there
  * would make the unscored day look annotated.
  *
- * Sizes are in natural pixels divided by `invScale`'s inverse — i.e. the
- * caller passes 1/zoom and everything here scales by it — so a badge is the
- * same size on screen at every zoom, like the viewer's own markers.
+ * Sizes below are CSS px ON SCREEN. They are multiplied by `invScale`
+ * (1/zoom) and `screenScale` (natural px per CSS px at zoom 1) to land in the
+ * natural-px coordinate space this layer is drawn in, so a badge is the same
+ * size on screen at every zoom and every viewport width. The first version
+ * forgot the second factor on the zoom-viewer path and drew 18-px badges at
+ * ~8 px on a 1920-px frame — legible to nobody.
  */
 
 const BEHAVIOUR_GLYPH: Record<string, string> = {
@@ -40,12 +43,14 @@ const SUN_GLYPH: Record<string, string> = {
   "sun_exposure.not_visible": "eye-off",
 };
 
-// On-screen size of the badge, in px, before the zoom counter-scale. 18px is
-// the smallest height at which a 1.75-unit stroke on a 24-unit glyph still
-// resolves as a line rather than a smudge.
-const BADGE_H = 18;
-const GLYPH = 12;
-const PAD = 3;
+// On-screen size of the badge in CSS px. 22 px tall with 14-px glyphs is the
+// smallest that reads at arm's length over a photo; the stroke is heavier than
+// the legend's (2.5 vs 1.75 glyph units) because white-on-dark on a busy
+// ground needs more line than grey-on-white beside a word.
+const BADGE_H = 22;
+const GLYPH = 14;
+const PAD = 4;
+const STROKE = 2.5;
 
 export function scoredCount(dets: readonly FrameDetection[]): number {
   return dets.filter((d) => d.attr_model_rev !== null).length;
@@ -101,7 +106,7 @@ export function AttrBadges({
             <g
               fill="none"
               stroke="#fff"
-              strokeWidth={1.75}
+              strokeWidth={STROKE}
               strokeLinecap="round"
               strokeLinejoin="round"
               color="#fff"
@@ -109,7 +114,6 @@ export function AttrBadges({
               <g
                 transform={`translate(${x + pad} ${y + (h - g) / 2}) scale(${g / 24})`}
                 opacity={unsure ? 0.6 : 1}
-                vectorEffect="non-scaling-stroke"
               >
                 <ClassGlyph name={beh} />
               </g>
