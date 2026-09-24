@@ -57,7 +57,10 @@ ALLOWED_EXT = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 
 
 def valid_camera_id(name: str) -> bool:
-    return bool(CAMERA_ID_RE.match(name))
+    # fullmatch, not match: Python's `$` also matches immediately before a
+    # trailing newline, so "camera_01\n" passed the `$`-anchored pattern and then
+    # became a real path segment and upload filename.
+    return bool(CAMERA_ID_RE.fullmatch(name))
 
 
 def allowed_ext(filename: str) -> bool:

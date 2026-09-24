@@ -51,7 +51,20 @@ def dataset_area_path(config, dataset_id, kind):
     legacy = config.paths.count_areas if kind == "count" else config.paths.panel_areas
     if dataset_id is None:
         return Path(legacy)
-    return Path(config.paths.artifacts_dir).parent / "areas" / dataset_id / f"{kind}_areas.json"
+    root = (Path(config.paths.artifacts_dir).parent / "areas").resolve()
+    path = root / dataset_id / f"{kind}_areas.json"
+    # `dataset_id` reaches here from a query param. The API validates it, but the
+    # invariant belongs with the path builder as well: this function is called
+    # from pipeline and CLI paths that never saw that check, and a traversal here
+    # is an arbitrary file read on the load side and an arbitrary JSON write
+    # (with mkdir -p) on the save side. Resolve and confirm containment.
+    try:
+        resolved = path.resolve()
+    except (ValueError, OSError) as e:
+        raise ValueError(f"unusable dataset id {dataset_id!r}") from e
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"dataset id {dataset_id!r} escapes the areas directory")
+    return path
 
 
 def assign_regions(ground_px, areas, camera_id) -> list:

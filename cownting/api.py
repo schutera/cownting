@@ -229,13 +229,24 @@ def _records(df) -> list[dict]:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
+# One path segment: starts alphanumeric, then alphanumerics and . _ - only.
+# A WHITELIST, deliberately. The blocklist this replaces ("no /, no \\, no ..")
+# admitted a NUL byte and a trailing newline, both of which reach os.stat() and
+# raise ValueError rather than OSError — a 500 instead of a 400. Enumerating what
+# is allowed cannot be short a case the way enumerating what is forbidden can.
+_PATH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
 def _safe_path_id(value: str) -> bool:
-    """True if `value` is safe to use as a single filesystem path segment — no
-    separators, no parent refs, not empty/dot. Dataset ids are normally clean ISO
-    day slugs, but they can be set via CLI/config (DatasetCfg does no slug check),
-    so any id that becomes an rmtree/mkdir path segment is checked before use."""
-    return bool(value) and value not in (".", "..") \
-        and "/" not in value and "\\" not in value and ".." not in value
+    """True if `value` is safe to use as a single filesystem path segment.
+
+    Dataset ids are normally clean ISO day slugs, but they arrive from query
+    params and can be set via CLI/config (DatasetCfg does no slug check), so any
+    id that becomes an open/mkdir/rmtree path segment is checked before use.
+    `fullmatch`, never `match`: Python's `$` also matches before a trailing
+    newline, so "2025-07-03\n" would pass a `$`-anchored test and then become a
+    real filename."""
+    return bool(value) and value not in (".", "..") and bool(_PATH_ID_RE.fullmatch(value))
 
 
 # A frame filename as ingest writes it: digits + ".jpg", nothing else. This is a
@@ -357,6 +368,25 @@ def create_app(config: Config) -> FastAPI:
                 "acting_role": acting_role}
 
     app = FastAPI(title="Cownting API", dependencies=[Depends(require_login)])
+
+    @app.middleware("http")
+    async def _reject_null_bytes(request: Request, call_next):
+        """A NUL anywhere in the URL is a 404, never a 500.
+
+        No legitimate request to this app contains one; they arrive from scanners
+        trying %00-truncation tricks that work against other stacks. They matter
+        because os.stat() rejects a NUL with ValueError, NOT OSError, so it
+        escapes every `except OSError` in pathlib and posixpath and surfaces as an
+        unhandled ASGI exception — a 500 plus a full traceback into the ops alert
+        channel. One burst of 44 probes on 2026-09-22 did exactly that.
+
+        Middleware rather than a per-route guard because Starlette's own
+        StaticFiles mount (/assets) calls os.path.realpath() unguarded and is
+        matched BEFORE any route of ours, so no route-level fix could cover it."""
+        if "\x00" in request.url.path or "\x00" in (request.url.query or ""):
+            return JSONResponse({"detail": "not found"}, status_code=404)
+        return await call_next(request)
+
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
     # SessionMiddleware must be added AFTER CORS here so it ends up the inner
     # middleware — it needs to have populated request.session before the
@@ -418,8 +448,22 @@ def create_app(config: Config) -> FastAPI:
     def resolve_ds(c, requested: str | None) -> str | None:
         """The dataset to serve: the requested one, else the latest package. Returns
         None only when no dataset dimension exists yet (pre-migration DB) -> every
-        db helper then runs whole-DB, exactly as before this feature."""
-        return requested if requested is not None else db.latest_dataset(c)
+        db helper then runs whole-DB, exactly as before this feature.
+
+        VALIDATES. A dataset id is not only a SQL parameter: `regions
+        .dataset_area_path` interpolates it into a filesystem path, so
+        `?dataset=../../x` used to read and write files outside the areas root
+        (arbitrary read for any logged-in user, arbitrary JSON write with mkdir -p
+        for a poweruser). This is the one place every `?dataset=` consumer passes
+        through, so the check lives here rather than in each of the dozen routes
+        that would each have to remember it. `regions.dataset_area_path` asserts
+        containment again — the invariant belongs with the path builder too, and
+        a future caller may not come through here."""
+        if requested is None:
+            return db.latest_dataset(c)
+        if not _safe_path_id(requested):
+            raise HTTPException(400, "invalid dataset id")
+        return requested
 
     # Width of a cross-camera "instant" bucket: the capture interval for a
     # time-lapse, else the real-time bin. Cameras are linked by this timestamp
@@ -2371,7 +2415,16 @@ def create_app(config: Config) -> FastAPI:
             # Resolve and confirm the target stays within dist/ before serving, so a
             # "../" in the path can't escape the static root and read arbitrary files.
             root = dist.resolve()
-            candidate = (dist / full_path).resolve()
+            try:
+                candidate = (dist / full_path).resolve()
+            except (ValueError, OSError):
+                # Unresolvable for ANY reason — a NUL the middleware somehow did
+                # not catch, a name too long, a symlink loop — is a 404. Fail
+                # closed: without a resolved candidate there is nothing to
+                # containment-check, so serving is not an option. The .resolve()
+                # itself must stay: its `..` normalisation IS the traversal guard
+                # on the next line.
+                raise HTTPException(404, "not found")
             if full_path and (candidate == root or root in candidate.parents) and candidate.is_file():
                 return FileResponse(str(candidate))
             # index.html MUST NOT be cached. Its asset filenames are content-hashed
