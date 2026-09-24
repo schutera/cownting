@@ -110,7 +110,7 @@ backup:
   # Discord rejects (rather than truncates) an upload over ~10 MiB, so past this
   # budget the run degrades: full zip -> CSV-only zip -> a message naming the file it
   # kept on disk. All three still count as a run.
-  max_upload_bytes: 9500000
+  max_upload_bytes: 8000000    # below Discord's 8 MiB FLOOR, not its 10 MiB ceiling
   # --- Label-count milestones ---
   # A ping each time the labeled-instance count crosses a multiple of
   # `milestone_step`: 500, then 1000, then 1500. Announced once per level, and

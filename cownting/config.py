@@ -198,7 +198,11 @@ class BackupCfg(BaseModel):
     enabled: bool = False
     every_days: int = 7
     keep: int = 8
-    max_upload_bytes: int = 9_500_000   # Discord's unboosted cap, with headroom
+    # Discord's attachment cap is 8 MiB (8,388,608) on an unboosted guild and
+    # 10 MiB on some endpoints. Sit below the FLOOR, not the ceiling: the old
+    # 9,500,000 had headroom against 10 MiB only, so a zip in the 8-9.5 MB
+    # window passed our own ladder, got POSTed, and came back 413.
+    max_upload_bytes: int = 8_000_000
 
     # --- Label-count milestones -------------------------------------------
     # A ping every time the labeled-instance count crosses a multiple of

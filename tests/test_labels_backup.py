@@ -14,9 +14,12 @@ No pytest. Run either way:
 from __future__ import annotations
 
 import csv
+import io
+import json
 import os
 import sys
 import tempfile
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -70,13 +73,25 @@ class _Recorder:
     full webhook URL embedded in the message, which is exactly what _redact()
     must scrub before anything is printed or stored."""
 
-    def __init__(self, fail: bool = False):
+    def __init__(self, fail: bool = False, oversize: int | None = None,
+                 discord_code: int | None = None):
         self.calls: list[tuple[str, str, Path | None]] = []
         self.fail = fail
+        # `oversize`: refuse any post CARRYING A FILE with this HTTP status, the
+        # way Discord refuses an attachment our own budget thought was fine.
+        # 413, or 400 with body {"code": 40005}. Posts with no file always
+        # succeed — that is what makes the summary rung the guaranteed floor.
+        self.oversize = oversize
+        self.discord_code = discord_code
 
     def __call__(self, webhook: str, content: str, file_path: Path | None) -> None:
         if self.fail:
             raise RuntimeError(f"HTTP Error 500: {webhook} rejected the upload")
+        if self.oversize is not None and file_path is not None:
+            body = json.dumps({"code": self.discord_code}).encode() if self.discord_code else b"{}"
+            raise urllib.error.HTTPError(
+                webhook, self.oversize, "Payload Too Large", {},  # type: ignore[arg-type]
+                io.BytesIO(body))
         self.calls.append((webhook, content, file_path))
 
 
@@ -278,7 +293,7 @@ def test_oversize_ladder_and_retention():
               set(left) == expect and len(left) == 2, f"left={left}")
 
 
-def test_failure_holds_the_watermark_and_redacts():
+def test_a_failed_delivery_still_completes_the_backup():
     with tempfile.TemporaryDirectory() as d:
         config = _config(d)
         os.environ[labels_backup.WEBHOOK_ENV] = _WEBHOOK
@@ -296,25 +311,128 @@ def test_failure_holds_the_watermark_and_redacts():
             annotator="bob", outcome="labeled", choices=[_SHADED])
         con.close()
 
+        # DELIVERY IS NOT THE BACKUP. This assertion is the inverse of what it
+        # used to be. Posting used to sit inside the try that marks a run
+        # failed, so a rejected upload discarded a complete, valid zip: the
+        # watermark was held, a 6-hour cooldown armed, rotation skipped. One
+        # broken webhook meant no backup ever completed again while zips piled
+        # up unrotated. The zip on disk IS the backup; Discord is a copy.
         r2 = labels_backup.run_backup(config, trigger="cli", force=True,
                                       poster=_Recorder(fail=True))
-        check("a Discord outage is a genuine failure", r2["status"] == "failed", str(r2))
-        err = r2["error"] or ""
+        check("a Discord outage does NOT fail the backup", r2["status"] == "done", str(r2))
+        check("...and is recorded as a delivery failure", r2["discord"] == "failed", str(r2))
+        check("...with the zip actually on disk",
+              r2["zip_path"] and Path(r2["zip_path"]).is_file(), str(r2.get("zip_path")))
+        err = r2.get("error") or ""
         check("the returned error is redacted (no URL, no token)",
               _WEBHOOK not in err and _TOKEN not in err, err)
         check("...and shows the placeholder instead", "<discord-webhook>" in err, err)
 
         con = db.connect(config.paths.labels_db_path)
         stored = con.execute(
-            "SELECT error FROM backup_runs WHERE status = 'failed' "
-            "ORDER BY run_id DESC LIMIT 1").fetchone()
+            "SELECT error, discord FROM backup_runs ORDER BY run_id DESC LIMIT 1").fetchone()
         check("the STORED error (it travels inside the next zip) is redacted too",
               stored is not None and stored[0]
               and _WEBHOOK not in stored[0] and _TOKEN not in stored[0], str(stored))
+        check("...and history can tell 'rejected' from 'never attempted'",
+              stored is not None and stored[1] == "failed", str(stored))
         w2 = labels_db.get_meta(con, labels_backup.META_WATERMARK)
-        check("the failed run held the watermark (nothing silently dropped)",
-              w2 == w1, f"{w1} -> {w2}")
+        check("a delivered-nowhere backup still ADVANCES the watermark "
+              "(the data is safely in the zip)", w2 != w1, f"{w1} -> {w2}")
+        check("...and does not arm the cooldown, so the weekly run is not wedged",
+              "cooling down" not in labels_backup.due(con, config.backup)[1],
+              str(labels_backup.due(con, config.backup)))
         con.close()
+
+
+def test_a_genuine_failure_still_fails():
+    """The other half of the split: if no backup EXISTS, the run must fail, hold
+    the watermark and arm the cooldown. Making a delivery failure benign must not
+    make a real one benign too."""
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d)
+        os.environ[labels_backup.WEBHOOK_ENV] = _WEBHOOK
+        con, _ = _seed(config, labeled=1)
+        con.close()
+        r1 = labels_backup.run_backup(config, trigger="cli", poster=_Recorder())
+        check("baseline run succeeds", r1["status"] == "done", str(r1))
+        con = db.connect(config.paths.labels_db_path)
+        w1 = labels_db.get_meta(con, labels_backup.META_WATERMARK)
+        con.close()
+
+        # Something new must be waiting, or the due-gate answers "nothing new
+        # since the last backup" and never reaches the cooldown clause at all.
+        con = db.connect(config.paths.labels_db_path)
+        labels_db.submit_annotation(
+            con, instance_key=labels_db.instance_key(
+                "2026-07-03", "camera_01", "00000077.jpg", [10, 20, 110, 220], 0),
+            annotator="bob", outcome="labeled", choices=[_SHADED])
+        con.close()
+
+        # Break the zip step — i.e. the backup itself, not its delivery.
+        real = labels_backup._write_zip
+        labels_backup._write_zip = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        try:
+            r2 = labels_backup.run_backup(config, trigger="cli", force=True,
+                                          poster=_Recorder())
+        finally:
+            labels_backup._write_zip = real
+        check("a real failure is still a failure", r2["status"] == "failed", str(r2))
+        con = db.connect(config.paths.labels_db_path)
+        check("...and holds the watermark",
+              labels_db.get_meta(con, labels_backup.META_WATERMARK) == w1)
+        check("...and arms the cooldown so it does not spin",
+              "cooling down" in labels_backup.due(con, config.backup)[1],
+              str(labels_backup.due(con, config.backup)))
+        con.close()
+
+
+def test_discord_refusing_an_attachment_walks_the_ladder():
+    """Our budget is a GUESS about a limit that varies by guild and endpoint.
+    When the guess is wrong the POST comes back 413 (or 400 + code 40005) — that
+    must drop a rung, not fail the run. The last rung carries no file, so it
+    cannot be refused for size."""
+    for status, code, label in ((413, None, "413"), (400, 40005, "400 + code 40005")):
+        with tempfile.TemporaryDirectory() as d:
+            config = _config(d)
+            os.environ[labels_backup.WEBHOOK_ENV] = _WEBHOOK
+            con, _ = _seed(config, labeled=2)
+            con.close()
+            rec = _Recorder(oversize=status, discord_code=code)
+            r = labels_backup.run_backup(config, trigger="cli", poster=rec)
+            check(f"[{label}] the run completes", r["status"] == "done", str(r))
+            check(f"[{label}] it lands on the summary rung",
+                  r["discord"] == "posted_summary", str(r["discord"]))
+            check(f"[{label}] the file rungs were tried first, then abandoned",
+                  len(rec.calls) == 1 and rec.calls[0][2] is None,
+                  f"{len(rec.calls)} recorded calls")
+            body = rec.calls[0][1]
+            check(f"[{label}] the message names the size and the retained path",
+                  "MB" in body and str(r["zip_path"]) in body, body[:160])
+
+
+def test_retention_still_runs_when_delivery_fails():
+    """Rotation used to be unreachable after a delivery failure, so a broken
+    webhook also meant zips accumulated forever."""
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d, keep=2)
+        os.environ[labels_backup.WEBHOOK_ENV] = _WEBHOOK
+        con, _ = _seed(config, labeled=1)
+        con.close()
+        for _ in range(4):
+            labels_backup.run_backup(config, trigger="cli", force=True,
+                                     poster=_Recorder(fail=True))
+        zips = sorted(Path(config.paths.backups_dir, "labels").glob("labels-*.zip"))
+        check("keep=2 is honoured even though every delivery failed",
+              len(zips) == 2, f"{len(zips)} zips: {[z.name for z in zips]}")
+
+
+def test_the_upload_budget_sits_below_discords_floor():
+    """8 MiB is the cap on an unboosted guild. A budget above it lets a zip pass
+    our own ladder and get refused by the server instead."""
+    check("default max_upload_bytes <= 8 MiB",
+          BackupCfg().max_upload_bytes <= 8 * 1024 * 1024,
+          str(BackupCfg().max_upload_bytes))
 
 
 def test_contention_is_skipped_not_failed():
@@ -378,7 +496,11 @@ def main():
     test_csv_contains_the_answers()
     test_snapshot_is_a_real_db()
     test_oversize_ladder_and_retention()
-    test_failure_holds_the_watermark_and_redacts()
+    test_a_failed_delivery_still_completes_the_backup()
+    test_a_genuine_failure_still_fails()
+    test_discord_refusing_an_attachment_walks_the_ladder()
+    test_retention_still_runs_when_delivery_fails()
+    test_the_upload_budget_sits_below_discords_floor()
     test_contention_is_skipped_not_failed()
     test_unset_webhook_is_a_clean_noop()
     print("==========================")

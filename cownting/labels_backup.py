@@ -570,6 +570,28 @@ def _prune(out_dir: Path, keep: int) -> list[str]:
 
 # ------------------------------------------------------------------- discord
 
+def _is_too_large(exc: BaseException) -> bool:
+    """Is this the server telling us the attachment was too big?
+
+    413 is the plain answer. Discord also returns 400 with its own JSON code
+    40005 ("Request entity too large"), which is indistinguishable from a
+    malformed request unless the body is read — so read it. Anything else is a
+    real delivery error and must not be mistaken for an oversize."""
+    code = getattr(exc, "code", None)
+    if code == 413:
+        return True
+    if code != 400:
+        return False
+    try:
+        body = exc.read()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — body already consumed, or not an HTTPError
+        return False
+    try:
+        return int(json.loads(body or b"{}").get("code", 0)) == 40005
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 def _discord_poster(webhook: str, content: str, file_path: Path | None) -> None:
     """Default poster: stdlib urllib + a hand-rolled multipart encoder.
 
@@ -627,14 +649,23 @@ def _deliver(
 ) -> str:
     """Post the bundle, walking the oversize ladder. Returns the recorded mode.
 
-    Ladder against `max_upload_bytes` (Discord's unboosted cap is 10 MiB and it
-    rejects rather than truncating): full zip -> CSV-only zip (the `.duckdb` is
+    Ladder against `max_upload_bytes`: full zip -> CSV-only zip (the `.duckdb` is
     the bulky page-aligned part; the analytically useful CSV stays small far
     longer) -> a summary message naming the retained on-disk path. Every rung
     advances the watermark, because re-running would produce the same oversize
     zip. Unset/blank webhook is a clean no-op; a non-Discord URL is refused
-    without logging its value. Poster exceptions propagate — they are the
-    genuine-failure class."""
+    without logging its value.
+
+    A rung is skipped when OUR budget says it is too big, and ALSO when Discord
+    says so — the two disagree. `max_upload_bytes` is a guess about a limit that
+    varies by guild (8 MiB on many, 10 MiB on others) and by endpoint; when the
+    guess is wrong the POST comes back 413, or 400 with code 40005. Treating
+    that as a rung failure rather than a run failure is the whole point: the
+    last rung carries no file at all, so it cannot be rejected for size, and it
+    names the byte count and the on-disk path the operator needs.
+
+    Other poster exceptions still propagate — but `run_backup` no longer treats
+    them as a failed BACKUP, only as a failed delivery."""
     if not enabled:
         return "disabled"
     if not webhook:
@@ -649,27 +680,36 @@ def _deliver(
         f"Label backup {stamp}: {run.get('annotations')} annotations "
         f"({run.get('new_annotations')} new)."
     )
-    if zip_bytes <= budget:
-        poster(webhook, base, zip_path)
-        return "posted"
-    csv_zip = staging / f"labels-{stamp}-csv.zip"
-    csv_bytes = _write_zip(csv_zip, list(csv_members))
-    if csv_bytes <= budget:
-        print(f"{_ALERT} oversize: full zip is {zip_bytes} B (cap {budget} B) — posting CSV-only")
-        poster(
-            webhook,
-            base + f" Full zip is {zip_bytes / 1e6:.1f} MB — over the upload cap, so the "
-            f"CSV bundle is attached; the full zip is retained on the box at {zip_path}.",
-            csv_zip,
-        )
-        return "posted_csv_only"
-    print(f"{_ALERT} oversize: even CSV-only is {csv_bytes} B (cap {budget} B) — posting a summary")
-    poster(
-        webhook,
-        base + f" Bundle exceeds the upload cap even CSV-only "
-        f"({csv_bytes / 1e6:.1f} MB) — retained on the box at {zip_path}.",
-        None,
-    )
+    # Built lazily: the CSV-only zip costs a second compression pass, which is
+    # wasted work on the overwhelmingly common first-rung success.
+    def _csv_rung() -> tuple[Path, int]:
+        csv_zip = staging / f"labels-{stamp}-csv.zip"
+        return csv_zip, _write_zip(csv_zip, list(csv_members))
+
+    for rung in ("full", "csv", "summary"):
+        if rung == "full":
+            path, size, content = zip_path, zip_bytes, base
+        elif rung == "csv":
+            path, size = _csv_rung()
+            content = (base + f" Full zip is {zip_bytes / 1e6:.1f} MB — over the upload "
+                       f"cap, so the CSV bundle is attached; the full zip is retained "
+                       f"on the box at {zip_path}.")
+        else:
+            path, size = None, 0
+            content = (base + f" Bundle is {zip_bytes / 1e6:.1f} MB, over the upload cap "
+                       f"— retained on the box at {zip_path}.")
+        if path is not None and size > budget:
+            print(f"{_ALERT} oversize: {rung} is {size} B (cap {budget} B) — dropping a rung")
+            continue
+        try:
+            poster(webhook, content, path)
+        except Exception as e:  # noqa: BLE001 — only size is a rung failure
+            if path is not None and _is_too_large(e):
+                print(f"{_ALERT} oversize: Discord rejected {size} B though our cap is "
+                      f"{budget} B — dropping a rung")
+                continue
+            raise
+        return {"full": "posted", "csv": "posted_csv_only", "summary": "posted_summary"}[rung]
     return "posted_summary"
 
 
@@ -774,14 +814,11 @@ def run_backup(
             zip_path = out_dir / f"labels-{stamp}-{run['run_id']:06d}.zip"
             zip_bytes = _write_zip(zip_path, members)
             result.update(zip_path=str(zip_path), zip_bytes=zip_bytes)
-            mode = _deliver(
-                webhook=webhook, enabled=discord, poster=post,
-                budget=config.backup.max_upload_bytes,
-                zip_path=zip_path, zip_bytes=zip_bytes,
-                csv_members=members[1:], staging=sdir, stamp=stamp, run=run,
-            )
-            result["discord"] = mode
         except Exception as e:  # noqa: BLE001 — the genuine-failure class
+            # Everything above this line is what MAKES the backup: the snapshot,
+            # the exports, the manifest, the zip. If any of it raises, no backup
+            # exists and the run has genuinely failed — hold the watermark, arm
+            # the cooldown, alert.
             err = _redact(str(e) or repr(e), webhook)
             _finish(
                 lcon, run["run_id"], status="failed",
@@ -790,10 +827,38 @@ def run_backup(
             print(f"{_ALERT} failed run {run['run_id']}: {err}")
             result.update(status="failed", error=err)
             return result
+
+        # DELIVERY IS NOT THE BACKUP. The zip on disk is; Discord is a
+        # convenience copy. Posting used to sit inside the try above, so one
+        # rejected upload marked the whole run failed even though a complete,
+        # valid zip was sitting in data/backups/labels/ — and a failed run holds
+        # the watermark, arms a 6-hour cooldown, and skips rotation. A broken
+        # webhook therefore turned into: no backup ever completes again, zips
+        # accumulate unrotated, four re-zips a day, forever. That path was
+        # unreachable while the webhook was unset (every run recorded
+        # 'skipped'); configuring it on 2026-09-18 armed it.
+        deliver_err = None
+        try:
+            mode = _deliver(
+                webhook=webhook, enabled=discord, poster=post,
+                budget=config.backup.max_upload_bytes,
+                zip_path=zip_path, zip_bytes=zip_bytes,
+                csv_members=members[1:], staging=sdir, stamp=stamp, run=run,
+            )
+        except Exception as e:  # noqa: BLE001 — never fails the backup
+            mode = "failed"
+            deliver_err = _redact(str(e) or repr(e), webhook)
+            print(f"{_ALERT} delivery failed run {run['run_id']}: {deliver_err} — the "
+                  f"backup itself SUCCEEDED and is retained at {zip_path}")
+        result["discord"] = mode
+        # Surfaced on a 'done' run: the backup worked, its copy did not, and the
+        # caller (CLI, /api/labels/backup/status) has to be able to say so.
+        result["error"] = deliver_err
+
         # Success: close the row, THEN advance the watermark, THEN rotate.
         _finish(
             lcon, run["run_id"], status="done", discord=mode,
-            zip_path=str(zip_path), zip_bytes=zip_bytes,
+            zip_path=str(zip_path), zip_bytes=zip_bytes, error=deliver_err,
         )
         if run["watermark_to"] is not None:
             labels_db.set_meta(lcon, META_WATERMARK, str(run["watermark_to"]))
