@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import db
+from . import pipeline
 from .config import CameraCfg, Config, DatasetCfg
 from .pipeline import ingest as run_ingest
 from .pipeline import ingest_one_camera as run_ingest_one
@@ -79,7 +80,7 @@ class Job:
     # is NOT tied to one day's arrival and must therefore be kept out of the
     # per-dataset job map the dashboard builds, or it would displace the upload
     # job for whichever day it happens to name.
-    kind: str = "upload"        # upload | remask | attrs_score
+    kind: str = "upload"        # upload | remask | attrs_score | reoverlay
     progress: float = 0.0       # 0..1, coarse (stage boundaries + per-frame during segment)
     message: str = "Queued"
     error: Optional[str] = None
@@ -185,6 +186,9 @@ _INTERRUPTED = {
     "attrs_score": ("Interrupted by a server restart — start scoring again "
                     "(POST /api/attrs/score, or the request file); rows already "
                     "scored are kept and the pass resumes where it stopped."),
+    "reoverlay": ("Interrupted by a server restart — start the overlay repaint "
+                  "again (POST /api/reoverlay); overlays already repainted carry "
+                  "the model rev they were painted for and are skipped."),
 }
 
 
@@ -474,8 +478,77 @@ def _run_attrs_score(job: Job, base: Config, dataset_id: str | None,
             msg += (" CROP GEOMETRY DIFFERS from training "
                     f"({stats['geometry_mismatch']}) — accuracy will be below the "
                     "reported validation figures.")
+        # The verdicts just changed, so every overlay that showed them is stale.
+        # Chained here rather than left to the operator because an overlay is a
+        # CACHE of a model's opinion: scoring without repainting leaves the
+        # dashboard showing the previous model's masks with no sign anything
+        # moved. Cheap next to the scoring itself, and never fatal — the scores
+        # are written and correct either way.
+        try:
+            _update(job, stage="repainting", message="Repainting frame overlays…")
+
+            def on_paint(done: int, total: int) -> None:
+                _update(job, message=f"Repainting frame overlays… {done}/{total}")
+
+            rp = pipeline.reoverlay(base, dataset_id=dataset_id, camera_id=camera_id,
+                                    on_progress=on_paint, should_stop=_upload_waiting)
+            msg += (f" Repainted {rp['painted']} overlay(s); "
+                    f"{rp['hidden']} rejected mask(s) are no longer drawn.")
+        except Exception as e:  # noqa: BLE001 — the scores are the product
+            msg += f" Overlay repaint failed ({e}); run POST /api/reoverlay."
+
         _update(job, status="done", stage="done", progress=1.0,
                 detections=stats["scored"], frames=stats["frames"], message=msg)
+    except Exception as e:  # noqa: BLE001 — surface it in the UI, never kill the worker
+        _update(job, status="failed", error=str(e), message=f"Failed: {e}")
+
+
+def start_reoverlay_job(base: Config, dataset_id: str | None = None,
+                        camera_id: str | None = None, limit: int | None = None,
+                        force: bool = False) -> Job:
+    """Repaint overlays so they match the current model's verdicts.
+
+    In-process for the same reason as remask and scoring: DuckDB allows one
+    read-write process per file and the server holds it. Normally chained
+    automatically after a score, so this is the backfill entry point — footage
+    whose overlays predate the model, or a run that was interrupted."""
+    scope = dataset_id or "all days"
+    job = Job(job_id=uuid.uuid4().hex, dataset_id=dataset_id or "",
+              label=f"Overlays · {scope}", kind="reoverlay")
+    with _LOCK:
+        _JOBS[job.job_id] = job
+        _persist(force=True)
+    _enqueue(_run_reoverlay, job, base, dataset_id, camera_id, limit, force)
+    return job
+
+
+def _run_reoverlay(job: Job, base: Config, dataset_id: str | None,
+                   camera_id: str | None, limit: int | None, force: bool) -> None:
+    try:
+        _update(job, status="running", stage="repainting", progress=0.02,
+                message="Looking for overlays the model has outgrown…")
+
+        def on_frame(done: int, total: int) -> None:
+            frac = done / total if total else 1.0
+            _update(job, progress=0.02 + 0.96 * frac,
+                    message=f"Repainting overlays… frame {done}/{total}")
+
+        stats = pipeline.reoverlay(base, dataset_id=dataset_id, camera_id=camera_id,
+                                   limit=limit, on_progress=on_frame,
+                                   should_stop=_upload_waiting, force=force)
+        if stats["stopped"]:
+            _update(job, status="queued", stage="queued",
+                    message=(f"Paused for an upload — {stats['painted']} overlay(s) "
+                             "repainted so far; resumes when the day is processed."))
+            _enqueue(_run_reoverlay, job, base, dataset_id, camera_id, limit, force)
+            return
+        msg = (f"Repainted {stats['painted']} of {stats['frames']} overlay(s); "
+               f"{stats['hidden']} rejected mask(s) are no longer drawn.")
+        if stats["missing_frames"]:
+            msg += (f" {stats['missing_frames']} frame(s) are gone from disk and kept "
+                    "their existing overlay.")
+        _update(job, status="done", stage="done", progress=1.0,
+                frames=stats["painted"], message=msg)
     except Exception as e:  # noqa: BLE001 — surface it in the UI, never kill the worker
         _update(job, status="failed", error=str(e), message=f"Failed: {e}")
 
@@ -539,6 +612,15 @@ def _score_stage(job: Job, cfg: Config, *, dataset_id: str, camera_id: str | Non
             out.append("the attribute model was trained on differently-cut crops "
                        f"({stats['geometry_mismatch']}), so its accuracy will be "
                        "below the reported validation figures")
+        # Repaint what was just scored, so a new day never displays a mask the
+        # model already rejected. Same never-fail-the-upload contract as the
+        # scoring above it: the day is usable either way.
+        try:
+            pipeline.reoverlay(cfg, dataset_id=dataset_id, camera_id=camera_id)
+        except Exception as e:  # noqa: BLE001
+            out.append(f"overlay repaint failed ({e}); the day is complete but its "
+                       f"overlays may still show rejected detections — "
+                       f"re-run POST /api/reoverlay")
         return out
     except Exception as e:  # noqa: BLE001 — the day is already usable; say so and move on
         return [f"cow-attribute scoring failed ({e}); the day is complete but its "

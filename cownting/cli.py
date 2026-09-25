@@ -75,6 +75,48 @@ def segment(config: str = CONFIG_OPT, limit: int = typer.Option(None, help="Only
 
 
 @app.command()
+def reoverlay(
+    config: str = CONFIG_OPT,
+    dataset: str = typer.Option(None, help="Scope to one dataset (default: whole DB)."),
+    camera: str = typer.Option(None, help="Scope to one camera."),
+    limit: int = typer.Option(None, help="Only repaint N frames."),
+    force: bool = typer.Option(False, "--force",
+                               help="Repaint even frames already on the current rev."),
+):
+    """Repaint frame overlays from the database so they match the current model.
+
+    The overlay is painted during `segment`, BEFORE the crop model has judged
+    anything — so at the moment the masks are burned in, nothing knows which of
+    them are cows. The verdict lands minutes later and changes again with every
+    retrain. This rebuilds each image from the stored outline (`mask_poly`) and
+    `attr_is_cow`, hiding the detections the model rejected.
+
+    No GPU and no segmenter: minutes for a corpus, against hours for `remask`.
+    Frames carry the rev their overlay was painted for, so this is idempotent,
+    resumable, and a no-op until a score changes something.
+
+    Fidelity: the stored outline is the largest external contour only, so a cow
+    split by an occluding panel comes back as its bigger half. Only `remask` (a
+    full segmenter pass) can recover the rest.
+
+    LIKE EVERY WRITING COMMAND, this holds a DuckDB write handle for its whole
+    pass, which takes a live server off the air. Use POST /api/reoverlay against
+    a running deployment; this is for offline boxes.
+    """
+    from .pipeline import reoverlay as run
+
+    cfg = _load(config)
+    stats = run(cfg, dataset_id=dataset, camera_id=camera, limit=limit, force=force)
+    typer.secho(
+        f"repainted {stats['painted']} of {stats['frames']} overlay(s); "
+        f"{stats['hidden']} rejected mask(s) hidden"
+        + (f"; {stats['missing_frames']} frame(s) missing from disk"
+           if stats["missing_frames"] else ""),
+        fg=typer.colors.GREEN,
+    )
+
+
+@app.command()
 def remask(
     config: str = CONFIG_OPT,
     dataset: str = typer.Option(None, help="Scope to one dataset (default: whole DB)."),

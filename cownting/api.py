@@ -1210,6 +1210,30 @@ def create_app(config: Config) -> FastAPI:
                                            camera_id=camera, limit=limit)
         return uploads_mod.job_dict(job)
 
+    @app.post("/api/reoverlay", dependencies=[Depends(require_poweruser)])
+    def reoverlay(dataset: str | None = None, camera: str | None = None,
+                  limit: int | None = None, force: bool = False):
+        """Repaint frame overlays so they match the current model's verdicts.
+
+        An overlay is a CACHE of a model's opinion: `segment` burns the masks in
+        before the crop model has looked at anything, and every re-score changes
+        which detections should have been drawn. This rebuilds the images from
+        the stored outlines and `attr_is_cow` — no GPU, no segmenter — and stamps
+        the rev it painted for, so re-running is free and an interrupted pass
+        resumes.
+
+        Normally chained automatically after scoring; this is the backfill entry
+        point for footage whose overlays predate the model. `force` repaints
+        even frames already on the current rev, for when the RENDERING changed
+        rather than the verdicts.
+
+        In-process for the usual DuckDB single-writer reason (see /api/remask).
+        """
+        job = uploads_mod.start_reoverlay_job(config, dataset_id=dataset,
+                                              camera_id=camera, limit=limit,
+                                              force=force)
+        return uploads_mod.job_dict(job)
+
     @app.post("/api/attrs/score", dependencies=[Depends(require_poweruser)])
     def attrs_score(dataset: str | None = None, camera: str | None = None,
                     limit: int | None = None, rescore: bool = False):

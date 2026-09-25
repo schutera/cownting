@@ -177,7 +177,14 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
             frame_path  VARCHAR,
             overlay_path VARCHAR,
             pose_overlay_path VARCHAR,
-            processed   BOOLEAN DEFAULT FALSE
+            processed   BOOLEAN DEFAULT FALSE,
+            -- Which attribute-model revision this frame's overlay was painted
+            -- for. The overlay hides the masks of detections the model rejected,
+            -- so it goes stale the moment a new model disagrees. Comparing this
+            -- against the rev on the frame's own detections is what makes the
+            -- repaint pass resumable, idempotent, and automatically triggered by
+            -- a re-score. NULL = painted by `segment`, before any model looked.
+            overlay_rev VARCHAR
         );
         """
     )
@@ -228,6 +235,8 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("ALTER TABLE detections ADD COLUMN IF NOT EXISTS dataset_id VARCHAR")
     # Forward-compat: pose overlay for DBs created before the pose stage.
     con.execute("ALTER TABLE frames ADD COLUMN IF NOT EXISTS pose_overlay_path VARCHAR")
+    # Forward-compat: which model rev the overlay was painted for (see the DDL).
+    con.execute("ALTER TABLE frames ADD COLUMN IF NOT EXISTS overlay_rev VARCHAR")
     # Forward-compat: the persisted instance outline, for DBs created before it.
     # LAST of the detections ALTERs on purpose. ALTER always appends at the tail,
     # so this is what keeps a long-deployed DB in the same column order as a
@@ -924,6 +933,22 @@ def detections_outside_areas(con, dataset_id: str | None = None, *,
     return int(con.execute(
         f"SELECT count(*) FROM detections d {join} WHERE {' AND '.join(where)}",
         params).fetchone()[0])
+
+
+def mask_drawn_clause(alias: str = "") -> str:
+    """Is this detection's mask DRAWN on the overlay?
+
+    The same body as `gate_clause`'s enabled branch, deliberately NOT gated on
+    the config flag. The two answer different questions: `gate_enabled` decides
+    what COUNTS — turning it on moves every historical number, so it needs a
+    deliberate opt-in — while this decides what is PAINTED, and nobody needs to
+    opt in to not having a fence post tinted as a cow.
+
+    `coalesce(..., TRUE)` and never `NOT attr_is_cow`: NULL means "never scored",
+    which is most of the corpus most of the time, and NULL propagates through
+    NOT to NULL, so the naive form would blank every unscored frame."""
+    a = f"{alias}." if alias else ""
+    return f"coalesce({a}attr_is_cow, TRUE)"
 
 
 def area_counts_whole_day(con, dataset_id: str | None = None, bin_seconds: float = 60.0) -> pd.DataFrame:

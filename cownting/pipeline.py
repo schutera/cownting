@@ -14,7 +14,8 @@ from .config import Config, resolve_dataset
 from .detect import build_pose_estimator, build_segmenter
 from .detect.base import Instance
 from .detect.geometry import mask_to_polygon
-from .detect.overlay import render_overlay, render_pose_overlay
+from .detect.overlay import (render_overlay, render_overlay_from_polygons,
+                             render_pose_overlay)
 from .ingest import index_video
 from .scene import regions
 
@@ -95,6 +96,124 @@ def ingest_one_camera(config: Config, dataset_id: str, cam) -> int:
         con.close()
     print(f"[ingest_one] {cam.id}: {len(frames)} frames into {dataset_id!r}")
     return len(frames)
+
+
+def reoverlay(config: Config, *, dataset_id: str | None = None,
+              camera_id: str | None = None, limit: int | None = None,
+              on_progress: Callable[[int, int], None] | None = None,
+              should_stop: Callable[[], bool] | None = None,
+              force: bool = False) -> dict:
+    """Repaint frame overlays from the database, hiding rejected detections.
+
+    WHY THIS EXISTS. The overlay is painted by `segment`, which runs BEFORE the
+    crop model has scored anything — so at the moment the masks are burned in,
+    nothing knows which of them are cows. The verdict arrives minutes later, and
+    changes again every time a new model is trained. An overlay is therefore a
+    CACHE of a model's opinion, and this is its invalidation pass: it rebuilds
+    the image from `mask_poly` + `attr_is_cow`, with no GPU and no segmenter,
+    and stamps `frames.overlay_rev` with the rev it painted for.
+
+    That stamp is what makes the pass idempotent, resumable, and automatic: a
+    frame is selected only when its overlay_rev differs from the rev its own
+    detections now carry, so re-running is free, an interrupted run continues,
+    and a re-score marks exactly the affected frames dirty without anybody
+    having to remember to say so.
+
+    A detection is hidden iff `attr_is_cow IS FALSE` — the model looked and said
+    no. NULL means never scored, which is most of the corpus most of the time,
+    and must render exactly as it does today (`db.mask_drawn_clause`).
+
+    Deliberately NOT gated on `instance_attrs.gate_enabled`. That flag decides
+    what counts; this decides what is painted. Nobody opts in to not having a
+    false positive tinted as a cow.
+
+    FIDELITY: the stored outline is the largest external contour only, so a cow
+    split by an occluding panel comes back as its bigger half (`mask_parts`
+    records the original count). Recovering the rest means re-running the
+    segmenter — hours, against minutes for this.
+    """
+    con = db.connect(config.paths.db_path)
+    try:
+        db.init_db(con)     # `overlay_rev` may predate this deployment
+        where = [
+            "f.processed = TRUE", "f.overlay_path IS NOT NULL", "f.overlay_path <> ''",
+            "f.frame_path IS NOT NULL", "f.frame_path <> ''",
+        ]
+        params: list = []
+        if dataset_id:
+            where.append("f.dataset_id = ?")
+            params.append(dataset_id)
+        if camera_id:
+            where.append("f.camera_id = ?")
+            params.append(camera_id)
+        # The staleness predicate, and the reason the pass needs no bookkeeping:
+        # a frame is dirty when the model rev its detections carry is not the rev
+        # its overlay was painted for. `max(attr_model_rev)` over the frame's
+        # detections is the frame's rev — a frame mid-score can hold two, and
+        # picking either leaves it dirty until scoring finishes, which is right.
+        stale = ("(SELECT max(d.attr_model_rev) FROM detections d "
+                 "WHERE d.frame_path = f.frame_path AND d.camera_id = f.camera_id "
+                 "AND d.dataset_id IS NOT DISTINCT FROM f.dataset_id)")
+        if not force:
+            where.append(f"f.overlay_rev IS DISTINCT FROM {stale}")
+        sql = (f"SELECT f.dataset_id, f.camera_id, f.frame_path, f.overlay_path, {stale} AS rev "
+               f"FROM frames f WHERE {' AND '.join(where)} "
+               f"ORDER BY f.dataset_id, f.camera_id, f.frame_idx")
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        frames = con.execute(sql, params).fetchall()
+
+        total = len(frames)
+        painted = missing = unchanged = hidden = 0
+        stopped = False
+        for done, (ds, cam, frame_path, overlay_path, rev) in enumerate(frames, start=1):
+            # Between frames, like remask: this pass is minutes and an upload is
+            # minutes too, but a corpus-wide run should still yield rather than
+            # make someone wait. Resuming costs nothing — the staleness predicate
+            # picks up exactly where this stopped.
+            if should_stop is not None and should_stop():
+                stopped = True
+                break
+            rows = con.execute(
+                f"""SELECT mask_poly, ground_px_x, ground_px_y, {db.mask_drawn_clause()}
+                    FROM detections
+                    WHERE frame_path = ? AND camera_id = ?
+                      AND dataset_id IS NOT DISTINCT FROM ?
+                    ORDER BY detection_id""",
+                [frame_path, cam, ds],
+            ).fetchall()
+            image = cv2.imread(frame_path)
+            if image is None:
+                # The raw frame is gone (a clipped camera, a pruned day). Leave
+                # the existing overlay alone rather than destroying it, and leave
+                # the frame dirty so a later run retries.
+                missing += 1
+                if on_progress:
+                    on_progress(done, total)
+                continue
+            items = []
+            for poly, gx, gy, draw in rows:
+                pts = json.loads(poly) if poly else None
+                ground = (gx, gy) if gx is not None and gy is not None else None
+                items.append((pts, ground, bool(draw)))
+                if not draw:
+                    hidden += 1
+            render_overlay_from_polygons(image, items, overlay_path)
+            con.execute(
+                "UPDATE frames SET overlay_rev = ? WHERE frame_path = ? AND camera_id = ? "
+                "AND dataset_id IS NOT DISTINCT FROM ?",
+                [rev, frame_path, cam, ds],
+            )
+            painted += 1
+            if on_progress:
+                on_progress(done, total)
+        return {"frames": total, "painted": painted, "hidden": hidden,
+                "missing_frames": missing, "unchanged": unchanged, "stopped": stopped}
+    finally:
+        # Same DuckDB single-writer rule as every other pass: a leaked write
+        # handle is a lock every later request fails on for the life of the
+        # process, not merely a leaked descriptor.
+        con.close()
 
 
 def remask(config: Config, limit: int | None = None,

@@ -43,6 +43,56 @@ def render_overlay(image_bgr: np.ndarray, instances: list[Instance], out_path: s
     return out_path
 
 
+def render_overlay_from_polygons(
+    image_bgr: np.ndarray,
+    items: "list[tuple[list | None, tuple[float, float] | None, bool]]",
+    out_path: str,
+) -> str:
+    """Repaint an overlay from STORED outlines instead of live mask rasters.
+
+    `items` is one entry per detection ON THIS FRAME, **in the same order the
+    segmenter produced them** (detection_id ascending), as
+    `(polygon | None, ground_point | None, draw)`. Order is load-bearing: the
+    palette is indexed positionally, so a skipped detection must still consume
+    its index — otherwise hiding one animal recolours every animal after it, on
+    every frame, and the whole corpus shimmers. Hence `draw` as a flag and a
+    `continue`, never a pre-filtered list.
+
+    `draw=False` means the crop model said not-a-cow. Nothing is painted for it:
+    no fill, no outline, and no ground dot either — a lone red dot hovering where
+    a mask used to be is still "showing something there".
+
+    This is deliberately a SECOND renderer rather than a parameter on
+    `render_overlay`: that one consumes `Instance` objects carrying full boolean
+    rasters that exist only inside a segmentation pass and are never persisted.
+    This one runs from the database, months later, with no GPU and no segmenter —
+    which is the entire point, because the cow/not-cow verdict does not exist yet
+    when `segment` first paints the frame.
+
+    FIDELITY: `mask_poly` holds the LARGEST external contour only
+    (`mask_to_polygon`), so a cow split by an occluding panel comes back as its
+    bigger half. `mask_parts` records how many there were. Re-running the
+    segmenter is the only way to recover the rest, and it costs hours per corpus
+    against minutes for this.
+    """
+    canvas = image_bgr.copy()
+    for i, (poly, ground, draw) in enumerate(items):
+        color = _PALETTE[i % len(_PALETTE)]   # positional: index consumed even if skipped
+        if not draw:
+            continue
+        if poly:
+            pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+            colored = np.zeros_like(canvas)
+            cv2.fillPoly(colored, [pts], color)
+            canvas = cv2.addWeighted(canvas, 1.0, colored, 0.45, 0)
+            cv2.polylines(canvas, [pts], True, color, 2)
+        if ground is not None:
+            cv2.circle(canvas, (int(ground[0]), int(ground[1])), 4, (0, 0, 255), -1)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(out_path, canvas)
+    return out_path
+
+
 def render_pose_overlay(image_bgr: np.ndarray, instances: list[Instance], out_path: str,
                         min_kpt_conf: float = 0.3) -> str:
     """Frame with AP-10K skeletons drawn per instance, coloured by posture.
