@@ -68,8 +68,19 @@ annotation:
   # label teaches the model something. Every served crop records WHY it was
   # chosen (`queue_reason` on the annotation), which is what lets the next round
   # be audited against the model it produced rather than guessed at.
+  #
+  # Measured over 1,164 served instances: only 43.8% produced a substantive
+  # answer. The rest were 563 `low_resolution` flags plus 54 answers of
+  # not_visible/cannot_tell — the same annotator minute, nothing learned.
+  # P(substantive) by the animal's longer side in SOURCE pixels:
+  #   <25px 13.6% | 25-35 26.3% | 35-45 29.8% | 45-60 35.1% | 60-90 46.4% | 90+ 76.0%
   min_instance_px: 25              # hard floor; never served below this
   clear_instance_px: 60            # at/above -> served first
+  # Yield keeps climbing as the floor rises (76% at 90px) and it is tempting to
+  # cut there. Don't: a corpus of only near animals teaches the model nothing
+  # about distant ones, which are exactly the ones the detector is worst at. So
+  # smaller-but-not-hopeless crops are deprioritised rather than banned, and this
+  # share of them is promoted into the front of the queue anyway.
   small_share: 0.15                # of sub-clear instances, promoted anyway
   uncertain_below: 0.75            # ask when the posture confidence is under this
   uniform_share: 0.25              # held OUT of every rule, as a marked random
@@ -108,20 +119,6 @@ annotation:
   # "Cannot tell" answers about nothing, contaminating the statistic we're after.
   max_banner_fraction: 0.6
   max_note_chars: 500              # per-annotation free-text note cap
-  # --- what is worth asking about ---
-  # Measured over 1,164 served instances: only 43.8% produced a substantive
-  # answer. The rest were 563 `low_resolution` flags plus 54 answers of
-  # not_visible/cannot_tell — the same annotator minute, nothing learned.
-  # P(substantive) by the animal's longer side in SOURCE pixels:
-  #   <25px 13.6% | 25-35 26.3% | 35-45 29.8% | 45-60 35.1% | 60-90 46.4% | 90+ 76.0%
-  min_instance_px: 25              # hard floor — never served below this
-  clear_instance_px: 60            # at/above this, served FIRST
-  # Yield keeps climbing as the floor rises (76% at 90px) and it is tempting to
-  # cut there. Don't: a corpus of only near animals teaches the model nothing
-  # about distant ones, which are exactly the ones the detector is worst at. So
-  # smaller-but-not-hopeless crops are deprioritised rather than banned, and this
-  # share of them is promoted into the front of the queue anyway.
-  small_share: 0.15
 
 # --- Weekly off-box backup of the annotation store ---
 # data/labels.duckdb is the only state here a re-ingest cannot rebuild: frames,
@@ -271,21 +268,29 @@ finetune:                          # `cownting train` + `eval-detect`
   val_fraction: 0.2
   split_by_time_block: true        # keep near-duplicate minutes out of the val set
 
-shade:
-  enabled: false                   # Stage 3 (observed-from-imagery); off in this build
-  margin_px: 0                     # px a cow's ground point must sit inside a footprint edge to count as sheltering; within it = boundary/uncertain
 
 flags:
   within_camera_tracking: false    # Stage 3 (motion/bouts)
   global_reid: false               # Stage 4 (cross-camera/day identity)
   pose_enabled: false              # Stage 4 (head-down grazing / lameness)
 
+# --- Login gate for the served dashboard ---
+# Only these three live here. The session secret and the bootstrap admin
+# credentials come from the environment (COWNTING_SECRET, COWNTING_ADMIN_USER,
+# COWNTING_ADMIN_PASSWORD) so no secret is ever committed to a YAML file.
+auth:
+  enabled: true                    # disable ONLY for tests / a trusted-LAN demo
+  session_max_age: 43200           # cookie lifetime in seconds (12 h)
+  https_only: false                # set true when served behind TLS — .env.example
+                                   # tells you to flip this on a real deployment
+
 paths:
   artifacts_dir: data/artifacts
   db_path: data/cownting.duckdb
+  archive_db_path: data/cownting_archive.duckdb  # deleted days move HERE, not away
   count_areas: data/count_areas.json  # per-camera count-area polygons; drawn via the camera gear icon
   orthophoto: null                    # path to a top-down site image; backdrop for the count-area map
-  panels: data/panels.json            # per-camera + ortho panel footprints (shelter test)
+  panel_areas: data/panel_areas.json  # per-camera + ortho panel footprints (shelter test)
   # Annotations live in their OWN DuckDB file. A re-ingest purges that day's
   # detections from the main DB and deleting a day moves them to the archive, so
   # labels kept in there would be destroyed by routine data management. Nothing in

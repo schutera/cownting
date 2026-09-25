@@ -141,10 +141,20 @@ def active_job_for(dataset_id: str) -> Optional[Job]:
     replacement, which would pull the videos out from under a running ingest, and
     ingest itself purges the dataset. Different days queue up fine; the same day
     twice at once does not.
+
+    `kind == "upload"` and nothing else — the same positive predicate
+    `_upload_waiting` was rewritten to use, for the same reason. The hazard above
+    is created only by an upload; a remask, a scoring pass or a repaint names the
+    same `dataset_id` but touches none of those files. Matching them too turns
+    any backfill into a re-upload block, and because a yielding backfill
+    re-queues itself as `queued` (still ACTIVE, still naming the day), the block
+    outlives the upload it stepped aside for. The endpoint has by then already
+    landed the videos it is about to refuse.
     """
     with _LOCK:
         for j in _JOBS.values():
-            if j.dataset_id == dataset_id and j.status in ACTIVE:
+            if (j.kind == "upload" and j.dataset_id == dataset_id
+                    and j.status in ACTIVE):
                 return j
     return None
 
@@ -213,7 +223,14 @@ def recover_jobs(config: Config) -> None:
             if job.status in ACTIVE:
                 job.status = "failed"
                 job.error = "interrupted by a server restart"
-                job.message = _INTERRUPTED.get(job.kind, _INTERRUPTED["upload"])
+                # No `.get` default. The whole point of this dict is that the
+                # recovery instruction differs per kind — telling someone to
+                # "re-upload this day" for an interrupted corpus-wide pass sent
+                # them to the wrong page once already. A kind added without a
+                # message here should be obvious, not silently mislabelled.
+                job.message = _INTERRUPTED.get(
+                    job.kind,
+                    "Interrupted by a server restart — start this job again.")
             _JOBS[job.job_id] = job
         _persist(force=True)
 
@@ -494,6 +511,19 @@ def _run_attrs_score(job: Job, base: Config, dataset_id: str | None,
                                     on_progress=on_paint, should_stop=_upload_waiting)
             msg += (f" Repainted {rp['painted']} overlay(s); "
                     f"{rp['hidden']} rejected mask(s) are no longer drawn.")
+            if rp.get("failed"):
+                msg += (f" {rp['failed']} frame(s) could not be repainted and are "
+                        "still on the previous model's masks.")
+            if rp["stopped"]:
+                # It yielded to an upload part-way. Scoring is finished and
+                # correct, so this job IS done — but the repaint is not, and
+                # saying nothing would leave the rest of the corpus showing the
+                # PREVIOUS model's masks with the job marked complete, which is
+                # the exact failure the chaining exists to prevent. Re-queue the
+                # remainder; the staleness predicate resumes where this stopped.
+                msg += " Repaint paused for an upload; re-queued to finish."
+                start_reoverlay_job(base, dataset_id=dataset_id,
+                                    camera_id=camera_id, force=False)
         except Exception as e:  # noqa: BLE001 — the scores are the product
             msg += f" Overlay repaint failed ({e}); run POST /api/reoverlay."
 
@@ -701,7 +731,13 @@ def _run(
             _update(job, progress=0.15 + 0.75 * frac,
                     message=f"Detecting cows… frame {done}/{total}")
 
-        n_det = run_segment(cfg, on_progress=on_seg)
+        # Scoped to THIS day, for the same reason `_run_add_camera` scopes to the
+        # camera: unscoped, `run_segment` sweeps every `processed = FALSE` frame
+        # in the database. A day whose own upload was interrupted mid-segment
+        # would then be segmented by the NEXT day's job — and `run_localize`
+        # below is scoped, so those detections would keep `region_id IS NULL`
+        # for good and every count area on that day would read zero.
+        n_det = run_segment(cfg, on_progress=on_seg, dataset_id=dataset_id)
 
         _update(job, stage="localizing", progress=0.90, detections=n_det,
                 message="Assigning cows to count areas…")

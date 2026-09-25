@@ -164,7 +164,7 @@ def reoverlay(config: Config, *, dataset_id: str | None = None,
         frames = con.execute(sql, params).fetchall()
 
         total = len(frames)
-        painted = missing = unchanged = hidden = 0
+        painted = missing = unchanged = hidden = failed = 0
         stopped = False
         for done, (ds, cam, frame_path, overlay_path, rev) in enumerate(frames, start=1):
             # Between frames, like remask: this pass is minutes and an upload is
@@ -191,24 +191,40 @@ def reoverlay(config: Config, *, dataset_id: str | None = None,
                 if on_progress:
                     on_progress(done, total)
                 continue
-            items = []
-            for poly, gx, gy, draw in rows:
-                pts = json.loads(poly) if poly else None
-                ground = (gx, gy) if gx is not None and gy is not None else None
-                items.append((pts, ground, bool(draw)))
-                if not draw:
-                    hidden += 1
-            render_overlay_from_polygons(image, items, overlay_path)
+            # Per-frame isolation. Without it one unparseable `mask_poly` ends
+            # the whole pass, and because the frame order is deterministic and
+            # `overlay_rev` is only stamped on success, every retry dies on the
+            # same row — so every frame after it stays on the old model's masks
+            # for good. Count it, leave the frame dirty, keep going.
+            try:
+                items = []
+                hid = 0
+                for poly, gx, gy, draw in rows:
+                    pts = json.loads(poly) if poly else None
+                    ground = (gx, gy) if gx is not None and gy is not None else None
+                    items.append((pts, ground, bool(draw)))
+                    if not draw:
+                        hid += 1
+                render_overlay_from_polygons(image, items, overlay_path)
+            except Exception as e:  # noqa: BLE001 — one bad frame is not a failed pass
+                failed += 1
+                print(f"[cownting.reoverlay] {frame_path}: {type(e).__name__}: {e}")
+                if on_progress:
+                    on_progress(done, total)
+                continue
+            # Only now, with the JPEG proven written, is the frame current.
             con.execute(
                 "UPDATE frames SET overlay_rev = ? WHERE frame_path = ? AND camera_id = ? "
                 "AND dataset_id IS NOT DISTINCT FROM ?",
                 [rev, frame_path, cam, ds],
             )
+            hidden += hid
             painted += 1
             if on_progress:
                 on_progress(done, total)
         return {"frames": total, "painted": painted, "hidden": hidden,
-                "missing_frames": missing, "unchanged": unchanged, "stopped": stopped}
+                "missing_frames": missing, "unchanged": unchanged,
+                "failed": failed, "stopped": stopped}
     finally:
         # Same DuckDB single-writer rule as every other pass: a leaked write
         # handle is a lock every later request fails on for the life of the
@@ -462,6 +478,25 @@ def segment(config: Config, limit: int | None = None,
             rows.append(row)
 
         if rows:
+            # DELETE BEFORE INSERT, so a re-segmented frame replaces rather than
+            # accumulates. The insert and the `mark_processed` stamp below are
+            # two autocommitted statements with an overlay render between them,
+            # and `unprocessed_frames` selects on `NOT processed` — so a kill in
+            # that window (a redeploy, an OOM, mid-way through the stage that
+            # runs for hours) leaves durable detections on a frame still marked
+            # unprocessed. The next pass segments it again and appends a SECOND
+            # full set of rows with fresh detection_ids, and that frame then
+            # reports twice its cows in every count, every area total and every
+            # whole-day peak, permanently and with nothing to detect it.
+            #
+            # Idempotent rather than transactional because the frame is the unit
+            # of work and this makes re-doing one free. Scoped by the same triple
+            # `mark_processed` uses.
+            con.execute(
+                "DELETE FROM detections WHERE frame_path = ? AND camera_id = ? "
+                "AND dataset_id IS NOT DISTINCT FROM ?",
+                [fr["frame_path"], fr["camera_id"], ds],
+            )
             db.insert_detections(con, pd.DataFrame(rows))
             n_det += len(rows)
 

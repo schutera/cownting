@@ -30,6 +30,14 @@ services:
       - ./config/cownting.prod.yaml:/app/config/cownting.prod.yaml:ro
     expose:
       - "8000"
+    # Docker's json-file driver has NO default size limit. uvicorn logs a line
+    # per request and the ticker adds its own, so on a small VPS
+    # /var/lib/docker/containers/*-json.log grows until the disk fills — which
+    # then fails the weekly label backup with "No space left on device". These
+    # logs are also what `alerts/watch.py` tails, so losing them loses alerting.
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
     # Reach the app directly (bypassing Caddy) for a quick local test:
     # ports:
     #   - "8000:8000"
@@ -38,13 +46,21 @@ services:
     image: caddy:2-alpine
     restart: unless-stopped
     depends_on:
-      - cownting
+      # `service_healthy`, not the short form. The short form waits only for the
+      # container to START, and the Dockerfile HEALTHCHECK has a 45 s start
+      # period (torch import + weights load), so Caddy served 502s for the first
+      # three quarters of a minute of every single deploy.
+      cownting:
+        condition: service_healthy
     environment:
       # A domain (cownting.example.com) -> automatic HTTPS. ":80" -> plain HTTP.
       CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:-:80}
     ports:
       - "80:80"
       - "443:443"
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

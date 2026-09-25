@@ -1329,6 +1329,68 @@ TELEMETRY_COLS: tuple[str, ...] = (
 )
 
 
+def resolve_effective_key(con, instance_key: str) -> str:
+    """The key this instance is CURRENTLY filed under, following any alias.
+
+    `reconcile_dataset` records `old_key -> new_key` in `instance_key_aliases`
+    when a re-ingest shifts a box, and `_reattach` moves the existing rows onto
+    the new `effective_key`. But the WRITE path never consulted that table: a
+    client still holding a pre-re-ingest item — whose anchor genuinely hashes to
+    the old key, so `verify_anchor` passes — resubmitted under the dead key, and
+    the supersede matched on `instance_key`, retiring the annotator's already-
+    reconciled answer and inserting a replacement nothing downstream can see.
+
+    Measured: two annotators on K1, reconcile to K2 (coverage K2 = 2), one stale
+    resubmit, and coverage becomes K1 = 1, K2 = 1 — the live instance drops below
+    `targets_per_instance`, re-enters everyone's queue, and the annotator is
+    asked the same cow again while their newest answer is invisible to
+    `v_instance_coverage`, to the agreement queries and to the training-set
+    build until someone re-runs the reconciler.
+
+    `idx_alias_old` on `(old_key)` already existed for this lookup; nothing had
+    ever used it.
+    """
+    row = con.execute(
+        "SELECT new_key FROM instance_key_aliases WHERE old_key = ?",
+        [instance_key]).fetchone()
+    return row[0] if row and row[0] else instance_key
+
+
+class VersionRace(ValueError):
+    """Two writes for the same (instance, annotator, version) collided.
+
+    A subclass of ValueError so every existing `except ValueError` still catches
+    it, but a distinct type so the API can map THIS to 409 ("re-fetch and
+    resubmit", which the client should retry) without also mapping the six other
+    ValueErrors these writers raise for genuinely bad input — a malformed skip
+    reason answered with 409 is a client that retries a bad request forever.
+    """
+
+
+def _rollback(con) -> None:
+    """Roll back if there is anything to roll back.
+
+    Bare `con.execute("ROLLBACK")` in an error handler is a trap: when the
+    failure happened AT COMMIT the transaction is already gone, so the rollback
+    itself raises `cannot rollback - no transaction is active` — and that
+    exception REPLACES the one being handled, so the real cause never reaches
+    the log. Cleanup must not be able to destroy the diagnosis."""
+    try:
+        con.execute("ROLLBACK")
+    except Exception:  # noqa: BLE001 — cleanup, never the story
+        pass
+
+
+# DuckDB does not report a lost UNIQUE race the same way every time. When the
+# rival row was already committed before this BEGIN it is a ConstraintException;
+# when both transactions are in flight the check is DEFERRED TO COMMIT and it
+# surfaces as a TransactionException ("Failed to commit: PRIMARY KEY or UNIQUE
+# constraint violation", or "Conflict on update!"). Only the first was caught,
+# so the common case — two submits actually racing — returned 500 instead of the
+# 409 the client knows how to retry.
+_RACE_ERRORS = (duckdb.ConstraintException, duckdb.TransactionException)
+
+
 def submit_annotation(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -1379,7 +1441,9 @@ def submit_annotation(
         raise ValueError(f"skip_reason must be one of {SKIP_REASONS}")
     if outcome == "labeled" and not choices:
         raise ValueError("a labeled annotation needs at least one class choice")
-    effective_key = effective_key or instance_key
+    # Follow an alias when the caller did not resolve one itself, so a client
+    # holding a pre-reconciliation item files under the LIVE key.
+    effective_key = effective_key or resolve_effective_key(con, instance_key)
 
     # The served event is the server's own clock. Scoped to this annotator so one
     # client cannot borrow another's older serve to claim a longer time-on-task.
@@ -1444,14 +1508,14 @@ def submit_annotation(
             detail=str(tel.get("skip_reason")) if outcome == "skipped" else None,
         )
         con.execute("COMMIT")
-    except duckdb.ConstraintException as e:
-        con.execute("ROLLBACK")
-        raise ValueError(
+    except _RACE_ERRORS as e:
+        _rollback(con)
+        raise VersionRace(
             f"{annotator!r} already has version {version} of {instance_key!r} — a "
             "concurrent submit won the race; re-fetch and resubmit"
         ) from e
     except Exception:
-        con.execute("ROLLBACK")
+        _rollback(con)
         raise
     return int(annotation_id)
 
@@ -1559,7 +1623,7 @@ def submit_mask_edit(
 
     prov = _picked(provenance, PROVENANCE_COLS, "provenance")
     tel = _picked(telemetry, TELEMETRY_COLS, "telemetry")
-    effective_key = effective_key or instance_key
+    effective_key = effective_key or resolve_effective_key(con, instance_key)
 
     cols = ["edit_id", "instance_key", "effective_key", "key_version", "annotator",
             "version", "kind", "polygon", "n_vertices", "area_px", "iou_source",
@@ -1643,14 +1707,14 @@ def submit_mask_edit(
             detail=f"mask_{kind}",
         )
         con.execute("COMMIT")
-    except duckdb.ConstraintException as e:
-        con.execute("ROLLBACK")
-        raise ValueError(
+    except _RACE_ERRORS as e:
+        _rollback(con)
+        raise VersionRace(
             f"{annotator!r} already has version {version} of the outline for "
             f"{instance_key!r} — a concurrent submit won the race; re-fetch and resubmit"
         ) from e
     except Exception:
-        con.execute("ROLLBACK")
+        _rollback(con)
         raise
     return int(edit_id)
 

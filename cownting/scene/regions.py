@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -30,16 +31,28 @@ def load_count_areas(path) -> dict[str, list[dict]]:
     p = Path(path)
     if not p.exists():
         return {}
-    with open(p) as f:
+    with open(p, encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_count_areas(path, data) -> None:
-    """Write the count-area mapping as pretty JSON, creating the parent dir if needed."""
+    """Write the count-area mapping as pretty JSON, creating the parent dir if needed.
+
+    Written to a sibling temp file and moved into place, because `open(p, "w")`
+    TRUNCATES FIRST: a kill, an OOM or a full disk between the truncate and the
+    flush leaves a half-written JSON document where the areas used to be. Nothing
+    ever repairs that file, and every reader of it — the day picker, the area
+    editor, the localize worker — then fails on a day that previously worked.
+    `os.replace` is atomic on both POSIX and Windows, so a reader sees either the
+    old file or the new one and never a partial one."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w") as f:
+    tmp = p.with_name(p.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
 
 
 def dataset_area_path(config, dataset_id, kind):

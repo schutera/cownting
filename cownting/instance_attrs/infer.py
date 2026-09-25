@@ -104,6 +104,8 @@ def score_detections(
     """
     import torch
 
+    from . import train as _T   # _forward: the same one `fit` evaluates with
+
     cfg = config.instance_attrs
     ckpt_path = Path(weights) if weights is not None else Path(cfg.weights)
     if not ckpt_path.exists():
@@ -181,7 +183,15 @@ def score_detections(
 
         if tensors:
             with torch.no_grad():
-                out = net(torch.stack(tensors).to(device))
+                # Through the SAME forward the trainer evaluates with. Scoring
+                # called `net(...)` directly, so `tta_hflip` was honoured at
+                # eval and ignored here: turn it on and every CV number — and
+                # the abstention thresholds calibrated against those numbers —
+                # would describe a TTA-averaged softmax that production never
+                # computes. It is off by default, so this was latent, which is
+                # precisely why nothing would have reported it.
+                out = _T._forward(net, torch.stack(tensors).to(device),
+                                  tta_hflip=cfg.tta_hflip)
             probs = {h: torch.softmax(v, dim=1).cpu() for h, v in out.items()}
             for i, det_id in enumerate(ids):
                 vals: dict[str, Any] = {}

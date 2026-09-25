@@ -41,6 +41,12 @@ def long_side(item: dict) -> float:
 
 
 def band_of(side: float) -> str:
+    # The trailing return exists to catch the open-ended top band (hi = inf). It
+    # also caught NEGATIVES, so an inverted or zero-area bbox was reported in the
+    # band the model performs BEST in — quietly flattering the stratified report
+    # and, under `size_reweight`, handing that row the 90+ sampling multiplier.
+    if not side > 0:
+        return SIZE_BANDS[0][0]
     for name, lo, hi in SIZE_BANDS:
         if lo <= side < hi:
             return name

@@ -43,6 +43,10 @@ const STAGE_LABEL: Record<UploadJob["stage"], string> = {
   localizing: "Placing in areas",
   scoring: "Scoring cow crops",
   remasking: "Tracing outlines",
+  // `attrs_score` chains a repaint after scoring, so an upload really does reach
+  // this stage. It was missing from the union, so the lookup returned undefined
+  // and the progress line went blank at the very end of a day's processing.
+  repainting: "Repainting overlays",
   done: "Done",
 };
 

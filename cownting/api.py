@@ -236,6 +236,19 @@ def _records(df) -> list[dict]:
 # is allowed cannot be short a case the way enumerating what is forbidden can.
 _PATH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
+# DuckDB's `date_trunc(?, ts)` takes an extract specifier, and anything outside
+# its vocabulary is a ConversionException — an unhandled 500 on a plain GET.
+# Bound as a parameter, so this was never an injection; it was four routes that
+# crashed on a typo. `/api/crosstab` already whitelists its analogous `primary`
+# param and answers 400; these are the ones that were missed.
+_TRUNCS = ("minute", "hour", "day", "week", "month")
+
+
+def _valid_trunc(value: str) -> str:
+    if value not in _TRUNCS:
+        raise HTTPException(400, f"trunc must be one of {list(_TRUNCS)}")
+    return value
+
 
 def _safe_path_id(value: str) -> bool:
     """True if `value` is safe to use as a single filesystem path segment.
@@ -367,7 +380,16 @@ def create_app(config: Config) -> FastAPI:
         return {"username": user.get("username"), "role": user.get("role"),
                 "acting_role": acting_role}
 
-    app = FastAPI(title="Cownting API", dependencies=[Depends(require_login)])
+    # `require_login` returns early for any path outside /api/, which is what lets
+    # the SPA's own assets load — but FastAPI's /docs, /redoc and /openapi.json
+    # live outside /api/ too, so on an authenticated deployment they served the
+    # complete route table, every admin path and every request model to anyone
+    # who asked. Nothing needs them in production; a dev box runs with auth off
+    # and keeps them.
+    _docs = {} if auth_on else {"docs_url": "/docs", "redoc_url": "/redoc"}
+    app = FastAPI(title="Cownting API", dependencies=[Depends(require_login)],
+                  openapi_url=None if auth_on else "/openapi.json",
+                  docs_url=_docs.get("docs_url"), redoc_url=_docs.get("redoc_url"))
 
     @app.middleware("http")
     async def _reject_null_bytes(request: Request, call_next):
@@ -552,12 +574,27 @@ def create_app(config: Config) -> FastAPI:
 
     @app.patch("/api/admin/users/{username}", dependencies=[Depends(require_admin)])
     def admin_update_user(username: str, body: UpdateUserReq):
+        """Change a user's password, role, or both.
+
+        VALIDATE EVERYTHING BEFORE WRITING ANYTHING. The two setters used to run
+        in sequence, so a request carrying a new password AND an invalid role
+        rotated the credential and then returned 400: the admin UI reported the
+        edit as failed while the user was already locked out of an account whose
+        new password nobody had recorded. `set_role` also refuses to demote the
+        last admin, which is the same shape — a legitimate refusal arriving after
+        an illegitimate write."""
         c = con()
         try:
+            if body.role is not None and body.role not in auth_mod.ROLES:
+                raise ValueError(f"role must be one of {tuple(auth_mod.ROLES)}")
+            if not auth_mod.user_exists(c, username):
+                raise ValueError(f"no such user: {username!r}")
+            if body.role is not None:
+                # Ordered so the refusal that can still come from the store (the
+                # last-admin guard) happens BEFORE the password write, not after.
+                auth_mod.set_role(c, username, body.role)
             if body.password is not None:
                 auth_mod.set_password(c, username, body.password)
-            if body.role is not None:
-                auth_mod.set_role(c, username, body.role)
         except ValueError as e:
             c.close()
             raise HTTPException(400, str(e))
@@ -602,14 +639,25 @@ def create_app(config: Config) -> FastAPI:
                 areas = regions.load_count_areas(
                     regions.dataset_area_path(config, r["dataset_id"], "count"))
                 r["n_areas"] = sum(len(v or []) for v in (areas or {}).values())
-            except OSError:
-                # A missing or unreadable file is exactly the "no areas" case the
-                # caller needs to see; it is not an error worth failing the list.
+            except (OSError, ValueError):
+                # A missing, unreadable or CORRUPT file is exactly the "no areas"
+                # case the caller needs to see; it is not an error worth failing
+                # the list. ValueError covers both JSONDecodeError (a truncated
+                # write) and dataset_area_path's containment guard — and this
+                # route backs the app-wide dataset provider, so a raise here
+                # takes out every page, not just the picker.
                 r["n_areas"] = 0
         return rows
 
     @app.delete("/api/datasets/{dataset_id}", dependencies=[Depends(require_poweruser)])
     def delete_dataset(dataset_id: str, confirm: str):
+        # Whitelist the id before it becomes a path segment, exactly as
+        # delete_camera / add_camera / clip_camera do. This route rmtree's
+        # `<artifacts>/../areas/<dataset_id>` directly, bypassing
+        # `regions.dataset_area_path`'s containment assert, and it was the only
+        # one of the four without the check.
+        if not _safe_path_id(dataset_id):
+            raise HTTPException(400, "invalid dataset id")
         """Remove a day from the dashboard by MOVING it into the archive DB — the
         day vanishes from every view but its rows are preserved, not destroyed.
 
@@ -911,14 +959,14 @@ def create_app(config: Config) -> FastAPI:
     @app.get("/api/counts")
     def counts(camera: str, trunc: str = "hour", dataset: str | None = None):
         c = con()
-        df = db.counts_over_time(c, camera, trunc, resolve_ds(c, dataset))
+        df = db.counts_over_time(c, camera, _valid_trunc(trunc), resolve_ds(c, dataset))
         c.close()
         return _records(df)
 
     @app.get("/api/posture")
     def posture(camera: str, trunc: str = "hour", dataset: str | None = None):
         c = con()
-        df = db.posture_over_time(c, camera, trunc, resolve_ds(c, dataset))
+        df = db.posture_over_time(c, camera, _valid_trunc(trunc), resolve_ds(c, dataset))
         c.close()
         if df.empty:
             return []
@@ -932,6 +980,21 @@ def create_app(config: Config) -> FastAPI:
         c.close()
         return _records(df[["frame_idx", "ts"]])
 
+    def _load_areas_or_empty(ds: str | None, kind: str) -> dict:
+        """Areas for a dataset, or {} if the file is missing or unreadable.
+
+        A truncated `count_areas.json` — the shape a kill or a full disk used to
+        leave behind — is a JSONDecodeError, which is a ValueError and NOT an
+        OSError, so it escaped every handler here and 500'd the editor. "No
+        areas" is the honest answer and the UI already has prominent copy for
+        it; a stack trace is not."""
+        try:
+            return regions.load_count_areas(
+                regions.dataset_area_path(config, ds, kind)) or {}
+        except (OSError, ValueError) as e:
+            print(f"[cownting.api] unreadable {kind} areas for {ds!r}: {e}")
+            return {}
+
     @app.get("/api/areas")
     def get_areas(dataset: str | None = None):
         # Areas are per-dataset now: the same camera name is re-framed by each
@@ -940,7 +1003,7 @@ def create_app(config: Config) -> FastAPI:
         c = con()
         ds = resolve_ds(c, dataset)
         c.close()
-        return regions.load_count_areas(regions.dataset_area_path(config, ds, "count"))
+        return _load_areas_or_empty(ds, "count")
 
     @app.post("/api/areas", dependencies=[Depends(require_poweruser)])
     def set_areas(req: AreasReq, dataset: str | None = None):
@@ -964,7 +1027,7 @@ def create_app(config: Config) -> FastAPI:
         c = con()
         ds = resolve_ds(c, dataset)
         c.close()
-        return regions.load_count_areas(regions.dataset_area_path(config, ds, "panel"))
+        return _load_areas_or_empty(ds, "panel")
 
     @app.post("/api/panel-areas", dependencies=[Depends(require_poweruser)])
     def set_panel_areas(req: AreasReq, dataset: str | None = None):
@@ -1085,7 +1148,7 @@ def create_app(config: Config) -> FastAPI:
     @app.get("/api/area-counts/over-time")
     def area_counts_over_time(camera: str | None = None, trunc: str = "hour", dataset: str | None = None):
         c = con()
-        df = db.area_counts_over_time(c, camera, trunc, resolve_ds(c, dataset))
+        df = db.area_counts_over_time(c, camera, _valid_trunc(trunc), resolve_ds(c, dataset))
         c.close()
         return {"series": _records(df)}
 
@@ -1173,7 +1236,7 @@ def create_app(config: Config) -> FastAPI:
         aggregates across all cameras."""
         cam = None if camera == "all" else camera
         c = con()
-        df = db.shelter_over_time(c, cam, trunc, resolve_ds(c, dataset))
+        df = db.shelter_over_time(c, cam, _valid_trunc(trunc), resolve_ds(c, dataset))
         c.close()
         return _records(df)
 
@@ -2027,10 +2090,14 @@ def create_app(config: Config) -> FastAPI:
                         input_mode=body.input_mode, note=body.note,
                         queue_reason=body.queue_reason),
                 )
-            except ValueError as e:
+            except labels_db.VersionRace as e:
                 # The lost UNIQUE (instance_key, annotator, version) race — a
                 # concurrent submit won; the client re-fetches and resubmits.
                 raise HTTPException(409, str(e))
+            except ValueError as e:
+                # Everything else these writers reject is bad input. It must not
+                # be a 409: the client retries those, forever.
+                raise HTTPException(400, str(e))
             version = _annotation_version(lc, annotation_id)
         finally:
             lc.close()
@@ -2103,8 +2170,14 @@ def create_app(config: Config) -> FastAPI:
                         skip_reason=body.reason, note=explanation or None,
                         queue_reason=body.queue_reason),
                 )
-            except ValueError as e:
+            except labels_db.VersionRace as e:
+                # 409 means 're-fetch and resubmit', and the client retries on
+                # it. Only the lost race deserves that: the other ValueErrors
+                # these writers raise are bad input, and answering those with
+                # 409 is a client retrying a malformed request forever.
                 raise HTTPException(409, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
             version = _annotation_version(lc, annotation_id)
         finally:
             lc.close()
@@ -2208,11 +2281,13 @@ def create_app(config: Config) -> FastAPI:
                         serve_event_id=body.serve_event_id,
                         client_elapsed_ms=body.client_elapsed_ms),
                 )
-            except ValueError as e:
+            except labels_db.VersionRace as e:
                 # Same split as the other two writes: a lost UNIQUE race is a
                 # 409 the client retries, a rejected shape is a 400 it must not.
-                if "already has version" in str(e):
-                    raise HTTPException(409, str(e))
+                # Typed now rather than sniffed from the message text — the
+                # substring match broke silently the moment the wording changed.
+                raise HTTPException(409, str(e))
+            except ValueError as e:
                 raise HTTPException(400, str(e))
             row = lc.execute(
                 "SELECT version FROM mask_edits WHERE edit_id = ?", [edit_id]

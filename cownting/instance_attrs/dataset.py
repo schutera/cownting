@@ -141,8 +141,19 @@ def split_blocks(
             got += n
         else:
             out[k] = "train"
-    # Degenerate corpora (one block, or val_fraction 0) must still produce both
-    # splits rather than an empty val the trainer would divide by.
+    # A SINGLE block cannot be split without leakage — the whole point of
+    # blocking is that instances within one are near-duplicates of each other.
+    # The degenerate guard below used to force that one block to "val", leaving
+    # ZERO training items; `fit` then built an empty DataLoader, divided by
+    # `max(1, len(tl))`, ran its epochs and saved a checkpoint holding random
+    # head weights. Refuse instead: failing here is recoverable, a confidently
+    # served random model is not.
+    if len(keys) == 1:
+        raise ValueError(
+            f"only one time block ({keys[0]!r}) — a leakage-free train/val split "
+            f"needs at least two. Label instances from more than one camera-day.")
+    # Other degenerate corpora (val_fraction 0) must still produce both splits
+    # rather than an empty val the trainer would divide by.
     if got == 0 and keys:
         out[keys[0]] = "val"
     if all(v == "val" for v in out.values()) and len(keys) > 1:

@@ -89,7 +89,14 @@ def render_overlay_from_polygons(
         if ground is not None:
             cv2.circle(canvas, (int(ground[0]), int(ground[1])), 4, (0, 0, 255), -1)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(out_path, canvas)
+    # `imwrite` REPORTS failure, it does not raise: a read-only file, a full
+    # disk, or a Windows sharing violation while a FileResponse still holds the
+    # JPEG open all return False and log to stderr. The caller stamps
+    # `frames.overlay_rev` on the strength of this call, and a frame stamped
+    # current is never selected again — so a swallowed False is a frame frozen
+    # on the old model's masks until someone thinks to pass force=True.
+    if not cv2.imwrite(out_path, canvas):
+        raise OSError(f"could not write overlay {out_path}")
     return out_path
 
 

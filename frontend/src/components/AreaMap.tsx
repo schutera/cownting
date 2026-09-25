@@ -81,7 +81,20 @@ export function AreaMap({
         setOutside(d.outside ?? 0);
       })
       .catch(() => {
-        /* counts are optional — the map still renders the area outlines */
+        // CLEAR, never keep. The counts are optional — the map still renders the
+        // area outlines without them — but the previous instant's counts are not
+        // an acceptable stand-in: the heading says "where the herd is at this
+        // time" and the caption says "this frame", so leaving 14:19's badges up
+        // while the scrubber reads 14:20 states a number about a minute that
+        // number was never about. Every sibling panel already clears on failure
+        // (Dashboard's frame map, the crossfilter, MomentPanel); this was the one
+        // surface that lied.
+        if (!alive) return;
+        setCounts({});
+        setPostures({});
+        setSheltering({});
+        setAttrs({});
+        setOutside(0);
       });
     return () => {
       alive = false;

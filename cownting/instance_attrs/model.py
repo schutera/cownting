@@ -183,7 +183,27 @@ def class_weights(counts: Sequence[int], *, power: float = 1.0, device=None):
     """
     import torch
 
-    c = torch.tensor([max(1.0, float(n)) for n in counts], dtype=torch.float32)
+    raw = [float(n) for n in counts]
+    # A class with ZERO training examples must not be floored at 1.0. Inverse
+    # frequency then hands it an enormous weight, and normalising to mean 1
+    # crushes every real class in the head with it: counts [800,500,600,686]
+    # give weights ~[0.89,1.13,1.03,0.96], but [800,500,600,0] give
+    # ~[0.13,0.16,0.15,3.57] — the three real classes keep their ratios but lose
+    # 7x of their absolute scale. `masked_loss` SUMS the per-head mean losses, so
+    # that head silently contributes 7x less gradient to the shared trunk than
+    # the other two. This fires whenever a block split puts all of a rare class
+    # in val, which is exactly when a fold is already hardest to interpret.
+    #
+    # Floored proportionally instead, so an absent class is treated as "rarest
+    # present" rather than "infinitely rare".
+    present = [n for n in raw if n > 0]
+    floor = max(min(present) if present else 1.0, max(raw + [1.0]) * 1e-3)
+    if len(present) < len(raw):
+        missing = [i for i, n in enumerate(raw) if n <= 0]
+        print(f"[cownting.attrs] WARNING: class index {missing} has no training "
+              f"examples — its weight is floored, and this head's macro-F1 averages "
+              f"over fewer classes than the others")
+    c = torch.tensor([max(floor, n) for n in raw], dtype=torch.float32)
     w = (c.sum() / (len(c) * c)) ** float(power)
     w = w / w.mean()
     return w.to(device) if device is not None else w

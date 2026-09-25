@@ -17,8 +17,6 @@ import numpy as np
 from ..config import Config
 from ..detect.geometry import mask_to_polygon
 
-_MIN_POLY_PTS = 3          # a polygon needs >= 3 vertices
-_MIN_MASK_PX = 20          # ignore speck masks
 
 
 def _mask_to_polygon(mask: np.ndarray, box_px, img_w: int, img_h: int) -> list[float] | None:
@@ -83,11 +81,21 @@ def build_dataset(config: Config) -> Path:
     samples = sorted(ds, key=lambda s: s.filepath)   # time order (zero-padded frame idx)
     n = len(samples)
     block = max(1, n // 20)
-    stride = max(2, round(1.0 / cfg.val_fraction)) if cfg.split_by_time_block else 2
+    stride = max(2, round(1.0 / cfg.val_fraction))
+    # `split_by_time_block` chooses HOW to hold frames out, not WHETHER to. It
+    # used to be ANDed into the split condition itself, so turning it off sent
+    # every frame to train and wrote `images/val/` and `labels/val/` as empty
+    # directories — with a `data.yaml` still pointing at them. `train()` then
+    # early-stopped on an empty val set and `evaluate()` reported mAP over
+    # nothing, so the knob's "off" position produced a silently meaningless
+    # fine-tune rather than a differently-split one. Off means a strided sample
+    # of individual frames; on means whole contiguous blocks, which is the one
+    # that actually prevents near-duplicate leakage.
+    group = block if cfg.split_by_time_block else 1
 
     n_train = n_val = n_inst = 0
     for i, s in enumerate(samples):
-        split = "val" if (cfg.split_by_time_block and (i // block) % stride == 0) else "train"
+        split = "val" if (i // group) % stride == 0 else "train"
         w = s.metadata.width
         h = s.metadata.height
         stem = f"{Path(s.filepath).parent.name}__{Path(s.filepath).stem}"

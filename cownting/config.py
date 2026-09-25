@@ -515,9 +515,48 @@ class Config(BaseModel):
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
-        with open(path) as f:
+        # encoding="utf-8" explicitly: the shipped example contains ±, – and " in
+        # its comments, and bare open() uses the platform default — cp1252 on a
+        # German Windows box, which mojibakes those and would raise outright on a
+        # non-ASCII VALUE. The container is safe (LANG=C.UTF-8); a dev box is not.
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
+        if data is None:
+            raise ValueError(f"{path}: the config file is empty")
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: expected a YAML mapping, got {type(data).__name__}")
+        # BEFORE constructing, so an unknown key is still reported when the file
+        # also fails validation for some unrelated reason — which is exactly when
+        # someone is staring at the config wondering what is wrong with it.
+        _warn_unknown_keys(path, data, cls)
         return cls(**data)
+
+
+def _warn_unknown_keys(path, data: dict, model, prefix: str = "") -> None:
+    """Print a warning for every YAML key that is not a field on any model.
+
+    Pydantic's default is to IGNORE unknown keys, so a typo is silent: the
+    shipped example had `paths.panels` (the real field is `panel_areas`) and a
+    whole inert `shade:` block, and an operator who tuned either got the default
+    with no indication whatsoever. That is the worst kind of config bug — the
+    system does something other than what its own config file says.
+
+    A warning and not `extra="forbid"`, deliberately. Refusing to construct would
+    turn a stale key in a long-lived deployment's config into a container that
+    will not boot, discovered during a deploy. The point is to make the drift
+    visible, not to make it fatal. The line is tagged so `alerts/watch.py`
+    forwards it — see tests/test_alerts.py.
+    """
+    from pydantic import BaseModel as _BM
+    fields = getattr(model, "model_fields", {})
+    for key, value in data.items():
+        if key not in fields:
+            print(f"[cownting.alert] CONFIG unknown key '{prefix}{key}' in {path} "
+                  f"— ignored, so its value has no effect", flush=True)
+            continue
+        ann = fields[key].annotation
+        if isinstance(value, dict) and isinstance(ann, type) and issubclass(ann, _BM):
+            _warn_unknown_keys(path, value, ann, prefix=f"{prefix}{key}.")
 
 
 def resolve_dataset(config: "Config") -> Tuple[str, Optional[date], str]:

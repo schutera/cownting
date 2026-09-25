@@ -340,8 +340,11 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                cfg.uncertain_below,
                cow_threshold, cfg.gate_band,
                list(cfg.seek_classes), hex_threshold(cfg.seek_share),
-               # queue_reason, in the order the CASE tests
+               # queue_reason, in the order the CASE tests: uniform, then the
+               # legibility gate the three selectors are all subject to, then
+               # the selectors themselves.
                hex_threshold(cfg.uniform_share),
+               abstain_px, hex_threshold(cfg.small_share),
                cow_threshold, cfg.gate_band,
                cfg.uncertain_below,
                list(cfg.seek_classes), hex_threshold(cfg.seek_share),
@@ -463,8 +466,25 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    --     rules it would have swallowed them (every unsure
                    --     `standing` would report `seek_class`) and the audit could
                    --     no longer tell balancing from teaching.
+                   --
+                   -- Every selector branch below ALSO carries the legibility
+                   -- gate, and that repetition is the point. Without it the CASE
+                   -- names a rule that `worth_asking` refused to act on: a 30 px
+                   -- crop sitting astride the gate threshold is not promoted (the
+                   -- floor rejected it) but was still stamped `gate_boundary` the
+                   -- moment anything served it — and at the shipped defaults that
+                   -- was 55% of all `gate_boundary` rows. `queue_reason` is the
+                   -- column the whole active-learning audit is computed over, so
+                   -- a reason that did not do the promoting poisons the one
+                   -- measurement that tells us whether any of this works.
+                   -- An illegible crop falls through to `confident`, which is
+                   -- accurate: nothing selected it, it was served off the tail.
                    CASE WHEN substr(md5('uni' || k.instance_key), 1, 4) < ? THEN 'uniform'
                         WHEN k.attr_model_rev IS NULL                       THEN 'unscored'
+                        WHEN NOT (greatest(k.bbox_x2 - k.bbox_x1,
+                                           k.bbox_y2 - k.bbox_y1) >= ?
+                                  OR substr(md5('sm' || k.instance_key), 1, 4) < ?)
+                                                                            THEN 'confident'
                         WHEN k.attr_cow_p IS NOT NULL
                              AND abs(k.attr_cow_p - ?) < ?                  THEN 'gate_boundary'
                         WHEN k.attr_behaviour IS NULL                       THEN 'abstained'

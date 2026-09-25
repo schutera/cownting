@@ -172,14 +172,26 @@ def test_the_spa_route_cannot_be_walked_out_of_its_root():
         from cownting import api as api_mod
         dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(api_mod.__file__))),
                             "frontend", "dist")
-        if not os.path.isdir(dist):
-            check("frontend/dist is not built — SPA traversal not exercised", True,
-                  "build the frontend to cover this")
-            return
+        # This used to return early with a GREEN check when `frontend/dist` was
+        # absent — and `.gitignore` ignores that directory while CI ran the Python
+        # suite BEFORE `npm ci`, so the traversal probes never executed on a
+        # single CI run in the gate's entire life. A guard that is skipped in the
+        # only place it is meant to guard is not a guard.
+        #
+        # So: build a minimal dist if there isn't one, and remove exactly what we
+        # created. The app resolves `dist` relative to its own module, so it
+        # cannot simply be pointed at a tmpdir.
+        made_dist = not os.path.isdir(dist)
+        if made_dist:
+            os.makedirs(dist, exist_ok=True)
+            with open(os.path.join(dist, "index.html"), "w") as f:
+                f.write("<!doctype html><title>test</title>")
         sentinel = os.path.join(os.path.dirname(dist), "test_sentinel_secret.txt")
         with open(sentinel, "w") as f:
             f.write("SENTINEL-DO-NOT-SERVE")
         try:
+            check("the traversal probes actually run (dist exists)",
+                  os.path.isdir(dist), dist)
             for path in ("/../test_sentinel_secret.txt",
                          "/..%2ftest_sentinel_secret.txt",
                          "/..%2f..%2f..%2fetc%2fpasswd",
@@ -190,6 +202,8 @@ def test_the_spa_route_cannot_be_walked_out_of_its_root():
                       f"{r.status_code} {r.text[:60]}")
         finally:
             os.unlink(sentinel)
+            if made_dist:
+                shutil.rmtree(dist, ignore_errors=True)
 
 
 def test_the_validators_enumerate_what_is_allowed():

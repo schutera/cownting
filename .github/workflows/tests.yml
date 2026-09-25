@@ -28,13 +28,18 @@ jobs:
           pip install -r requirements.txt
           pip install "httpx>=0.27"          # fastapi TestClient needs httpx (test_api/test_auth)
 
-      - name: Run tests
-        run: python -m tests
-
       # The frontend carries logic the Python suite cannot see: the outline
       # editor's geometry and the rule deciding which box is ringed. Both
       # regressed silently during development — nothing threw, the screen just
       # showed the wrong thing — so they are gated here too.
+      #
+      # BUILT BEFORE the Python suite runs, deliberately. `frontend/dist` is
+      # gitignored, and `test_path_safety`'s SPA traversal probes used to return
+      # a green "not exercised" when it was missing — so on every CI run in that
+      # gate's life, the traversal guard it exists to protect was never tested.
+      # (The test now builds a throwaway dist of its own if there is none, so it
+      # cannot silently skip again; this ordering means it runs against the real
+      # one.)
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -52,3 +57,13 @@ jobs:
       - name: Run frontend tests
         working-directory: frontend
         run: npm test
+
+      # `tsc --noEmit` and the bundler disagree: a path alias, an asset import or
+      # a dependency that only resolves at bundle time typechecks clean and then
+      # fails the Docker build, which nothing else here exercises.
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run tests
+        run: python -m tests

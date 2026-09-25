@@ -70,16 +70,18 @@ export interface DatasetRow {
 export interface UploadJob {
   job_id:string; dataset_id:string; label:string;
   status:"queued"|"running"|"done"|"failed";
-  stage:"queued"|"ingesting"|"segmenting"|"localizing"|"scoring"|"remasking"|"done";
+  stage:"queued"|"ingesting"|"segmenting"|"localizing"|"scoring"|"remasking"|"repainting"|"done";
   // What the job IS. 'upload' covers a whole day and an added camera alike —
   // they differ in scope, not in kind, and BOTH now include a 'scoring' stage
   // after localizing.
   //
-  // 'remask' and 'attrs_score' are BACKFILLS: passes over footage that predates
-  // a feature. They belong to no single day and must be kept out of the
-  // per-dataset job map (see BACKFILL_KINDS in lib/processing), or they would
-  // displace the upload job for whichever day they name.
-  kind?:"upload"|"remask"|"attrs_score";
+  // 'remask', 'attrs_score' and 'reoverlay' are BACKFILLS: passes over footage
+  // that predates a feature, or repaints after a new model. They belong to no
+  // single day and must be kept out of the per-dataset job map (see
+  // `ownsItsDataset` in lib/processing), or they displace the upload job for
+  // whichever day they name. That union is asked POSITIVELY there — "is it an
+  // upload" — precisely so this list falling behind the server cannot cause it.
+  kind?:"upload"|"remask"|"attrs_score"|"reoverlay";
   progress:number; message:string; error:string|null;
   frames:number; detections:number; created_at:number;
   // Advisory per-camera quality warnings, present on completed jobs (e.g.

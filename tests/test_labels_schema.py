@@ -865,6 +865,58 @@ def test_multiselect_dispatch():
         con.close()
 
 
+def test_a_submit_under_a_pre_reconciliation_key_lands_on_the_live_one():
+    """A client holding a stale item must not split the instance in two.
+
+    `reconcile_dataset` records `old -> new` in `instance_key_aliases` and moves
+    the existing rows onto the new `effective_key`. The WRITE path never
+    consulted that table, and a browser that was already showing the item when
+    the re-ingest happened still passes `verify_anchor` — the anchor genuinely
+    hashes to the old key. So the resubmit filed under the DEAD key, and the
+    supersede (which matches on `instance_key`) retired the annotator's own
+    reconciled row on the way past.
+
+    The instance then showed one annotator instead of two, fell back under
+    `targets_per_instance`, re-entered everyone's queue, and the newest answer
+    was invisible to `v_instance_coverage`, to the agreement queries and to the
+    training-set build until someone happened to re-run the reconciler."""
+    with tempfile.TemporaryDirectory() as d:
+        mcon, lcon, ds, cam, base, bbox, prov = _reingest_fixture(d)
+        old_key = labels_db.instance_key(ds, cam, base, bbox, 0)
+        for who in ("alice", "bob"):
+            labels_db.submit_annotation(lcon, instance_key=old_key, annotator=who,
+                                        outcome="labeled", choices=[_SHADED],
+                                        provenance=prov)
+        new_key = _shift_boxes(mcon)
+        labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+
+        def coverage():
+            return dict(lcon.execute(
+                "SELECT effective_key, count(DISTINCT annotator) "
+                "FROM v_current_answers GROUP BY 1").fetchall())
+
+        check("after reconciling, both answers sit on the new key",
+              coverage() == {new_key: 2}, str(coverage()))
+
+        # alice's tab was open across the re-ingest and resubmits the old item.
+        labels_db.submit_annotation(lcon, instance_key=old_key, annotator="alice",
+                                    outcome="labeled", choices=[_SHADED],
+                                    provenance=prov)
+        cov = coverage()
+        check("a stale resubmit does NOT resurrect the dead key",
+              old_key not in cov, str({k[:8]: v for k, v in cov.items()}))
+        check("...and the instance still has both annotators",
+              cov == {new_key: 2}, str({k[:8]: v for k, v in cov.items()}))
+
+        # The alias lookup is the mechanism; assert it directly too.
+        check("resolve_effective_key follows the alias",
+              labels_db.resolve_effective_key(lcon, old_key) == new_key)
+        check("...and is the identity for a key with no alias",
+              labels_db.resolve_effective_key(lcon, new_key) == new_key)
+        mcon.close()
+        lcon.close()
+
+
 def main():
     print("=== test_labels_schema ===")
     test_key_is_path_and_platform_stable()
@@ -886,6 +938,7 @@ def main():
     test_milestone_announces_each_level_once()
     test_undo_supersedes_and_keeps_history()
     test_multiselect_dispatch()
+    test_a_submit_under_a_pre_reconciliation_key_lands_on_the_live_one()
     print("==========================")
     if _FAILED:
         print(f"{_FAILED} check(s) FAILED")

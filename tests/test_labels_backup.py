@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import contextlib
 import os
 import sys
 import tempfile
@@ -490,6 +491,167 @@ def test_unset_webhook_is_a_clean_noop():
         os.environ.pop(labels_backup.WEBHOOK_ENV, None)
 
 
+def test_a_forced_run_does_not_consume_the_scheduled_slot():
+    """A --force run is an EXTRA copy, not a substitute.
+
+    `due()` counted any `status='done'` row inside the window, so an operator who
+    ran `labels backup --force` on Monday to check the pipeline silently spent
+    that week's slot: the scheduler then reported "already backed up within the
+    last 7 days" all week and the annotators' work waited until the following
+    Monday to leave the box. This actually happened, and looked from the outside
+    like a broken backup rather than a consumed one."""
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d)
+        os.environ[labels_backup.WEBHOOK_ENV] = _WEBHOOK
+        con, _ = _seed(config, labeled=2)
+        con.close()
+
+        res = labels_backup.run_backup(config, trigger="forced", force=True,
+                                       poster=_Recorder())
+        check("the forced run itself succeeds", res["status"] == "done", str(res))
+
+        # A week of annotator work follows — otherwise `due()` short-circuits on
+        # the watermark ("nothing new") and the weekly slot is never consulted,
+        # which would make this test pass for the wrong reason.
+        con, _ = _seed(config, labeled=3, annotator="bob")
+        con.close()
+
+        lcon = db.connect(config.paths.labels_db_path)
+        try:
+            ok, why = labels_backup.due(lcon, config.backup)
+            check("new work after a FORCED run is still due", ok, why)
+        finally:
+            lcon.close()
+
+        # ...whereas a genuinely SCHEDULED run does hold the slot, or the weekly
+        # gate would mean nothing at all.
+        labels_backup.run_backup(config, trigger="schedule", force=True,
+                                 poster=_Recorder())
+        con, _ = _seed(config, labeled=3, annotator="carol")
+        con.close()
+        lcon = db.connect(config.paths.labels_db_path)
+        try:
+            ok2, why2 = labels_backup.due(lcon, config.backup)
+            check("the same new work after a SCHEDULED run is not", not ok2, why2)
+            check("...and the reason given is the weekly slot",
+                  "already backed up" in why2, why2)
+        finally:
+            lcon.close()
+
+
+def test_a_store_that_has_never_succeeded_raises_the_alarm():
+    """The staleness alarm is documented as what closes the loop when the gate
+    itself is wedged. It read `max(finished_at) FROM backup_runs WHERE status =
+    'done'` and returned silently on NULL — so it was dead in exactly the case
+    where the backup had never once worked: every tick failing, no `done` row
+    ever written, and no alarm, forever. A deployment that has never produced a
+    backup is the most alarming state there is."""
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d, every_days=7)
+        con, _ = _seed(config, labeled=1)
+        # One failed attempt, 200 days ago, and nothing else.
+        labels_backup.ensure_backup_tables(con)
+        con.execute(
+            "INSERT INTO backup_runs (run_id, \"trigger\", status, started_at, finished_at, error) "
+            "VALUES (1, 'schedule', 'failed', now() - to_days(200), now() - to_days(200), 'disk full')")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            labels_backup._stale_alert(con, config.backup)
+        out = buf.getvalue()
+        con.close()
+        check("the alarm fires when no backup has ever succeeded",
+              "stale:" in out, repr(out))
+        check("...and says so, rather than naming a date that does not exist",
+              "NO backup has ever succeeded" in out, repr(out))
+        check("...and is a line alerts/watch.py forwards",
+              "[cownting.alert] LABEL-BACKUP" in out, repr(out))
+
+
+def test_a_rung_that_fails_to_build_falls_through_to_the_summary():
+    """Only a SIZE rejection used to drop a rung. But building the csv rung
+    writes a second zip, and a full disk raises OSError there — which aborted the
+    ladder before the summary rung, the one that carries no file and therefore
+    cannot be rejected at all. The operator was told nothing whatsoever, although
+    a complete full zip was sitting on the box."""
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d, max_upload_bytes=1)     # force past the 'full' rung
+        os.environ[labels_backup.WEBHOOK_ENV] = _WEBHOOK
+        con, _ = _seed(config, labeled=2)
+        con.close()
+
+        real_write = labels_backup._write_zip
+        calls = {"n": 0}
+
+        def _explode(path, members, *a, **kw):
+            # The first call builds the full zip; the second is the csv rung.
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError(28, "No space left on device")
+            return real_write(path, members, *a, **kw)
+
+        rec = _Recorder()
+        labels_backup._write_zip = _explode
+        try:
+            res = labels_backup.run_backup(config, trigger="cli", force=True, poster=rec)
+        finally:
+            labels_backup._write_zip = real_write
+
+        check("the run still completes", res["status"] == "done", str(res))
+        check("the summary rung was reached and delivered",
+              res["discord"] == "posted_summary", str(res["discord"]))
+        check("...carrying no attachment, which is why it cannot be rejected",
+              bool(rec.calls) and rec.calls[-1][2] is None, str(rec.calls[-1:]))
+        check("...and the full zip is still on the box",
+              len(_zips(config)) == 1, str(_zips(config)))
+
+
+def test_a_racing_ddl_is_contention_not_a_failure():
+    """`_open_store` classified only `db.connect`. The DDL replay sat OUTSIDE the
+    try — and `init_labels_db` ends in `CREATE OR REPLACE VIEW`, a catalog write
+    that `labeling.ensure_labels_db` wraps in a 50-attempt retry loop precisely
+    because it raced in production.
+
+    So a backup whose DDL collided with a Label-page request was recorded as a
+    genuine FAILURE: a spurious `[cownting.alert] LABEL-BACKUP failed` line, a
+    non-zero CLI exit, and a 6 h cooldown armed against a perfectly healthy
+    store. Contention must read as `skipped`; only a real error may fail."""
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d)
+        con, _ = _seed(config, labeled=1)
+        con.close()
+
+        real = labels_backup.labels_db.init_labels_db
+
+        def racing(c):
+            raise Exception('TransactionContext Error: Catalog write-write '
+                            'conflict on create with "v_current_answers"')
+
+        def disk_full(c):
+            raise Exception("IO Error: No space left on device")
+
+        labels_backup.labels_db.init_labels_db = racing
+        try:
+            res = labels_backup.run_backup(config, trigger="schedule", force=True,
+                                           poster=_Recorder())
+        finally:
+            labels_backup.labels_db.init_labels_db = real
+        check("a racing DDL is reported as contention, not failure",
+              res["status"] == "skipped", str(res))
+        check("...so no cooldown is armed and no false alarm is raised",
+              res.get("error") is None, str(res.get("error")))
+
+        labels_backup.labels_db.init_labels_db = disk_full
+        try:
+            res2 = labels_backup.run_backup(config, trigger="schedule", force=True,
+                                            poster=_Recorder())
+        finally:
+            labels_backup.labels_db.init_labels_db = real
+        check("a genuine DDL error still fails, loudly",
+              res2["status"] == "failed", str(res2))
+        check("...naming the real cause", "No space left" in str(res2.get("error")),
+              str(res2.get("error")))
+
+
 def main():
     print("=== test_labels_backup ===")
     test_gate_and_bundle()
@@ -503,6 +665,10 @@ def main():
     test_the_upload_budget_sits_below_discords_floor()
     test_contention_is_skipped_not_failed()
     test_unset_webhook_is_a_clean_noop()
+    test_a_forced_run_does_not_consume_the_scheduled_slot()
+    test_a_store_that_has_never_succeeded_raises_the_alarm()
+    test_a_rung_that_fails_to_build_falls_through_to_the_summary()
+    test_a_racing_ddl_is_contention_not_a_failure()
     print("==========================")
     if _FAILED:
         print(f"{_FAILED} check(s) FAILED")

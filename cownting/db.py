@@ -16,6 +16,14 @@ FRAME_COLS = [
     "dataset_id",
     "camera_id", "frame_idx", "ts", "time_bin", "frame_path", "overlay_path",
     "pose_overlay_path", "processed",
+    # Same append-at-the-tail rule as DET_COLS below, and here for the same
+    # reason: `clip_camera` -> `restore_clip` round-trips through
+    # `clipped_frames` on exactly this list, so a column left off it is a column
+    # silently NULLed by clipping a camera. `overlay_rev` was, which made every
+    # restored frame look like it had never been painted — harmless in direction
+    # (NULL means "repaint", so the pass redid work rather than skipping it) but
+    # an hour of CPU per restore, and the next such column may not be so lucky.
+    "overlay_rev",
 ]
 
 DET_COLS = [
@@ -29,13 +37,14 @@ DET_COLS = [
     "under_panel", "panel_id", "region_id",
     # --- the persisted instance outline (M4 phase 0) ---
     # APPEND-ONLY, AT THE TAIL, and the same at the tail of the CREATE TABLE body
-    # below. `archive_dataset` copies with `INSERT INTO archive.t SELECT * FROM t`,
-    # which is POSITIONAL: a fresh archive gets CREATE-TABLE order while a
-    # long-deployed live DB gets ALTER order (appended last), so the two only agree
-    # if new columns go last in both. Inserting them mid-list either raises a
-    # ConversionException or — when the shifted types happen to line up — writes
-    # every column one slot over into the archive, which is the only copy of a
-    # deleted day.
+    # below. `archive_dataset` used to copy with `INSERT INTO archive.t SELECT *`,
+    # which is POSITIONAL — a fresh archive has CREATE-TABLE order while a
+    # long-deployed live DB has ALTER order — and a mid-list column therefore
+    # wrote every value one slot over into the only copy of a deleted day. That
+    # copy now names its columns, so the archive no longer depends on this rule.
+    # The rule still stands for the `CREATE TABLE … AS SELECT *` staging tables,
+    # and because this list drives the named clip INSERTs: a column missing from
+    # it is a column clipping a camera silently discards.
     "mask_poly", "mask_parts",
     # --- M5 instance attributes (docs/roadmap/M5_instance_attrs.md) ---
     # Same append-at-the-tail rule as the outline above, for the same archive
@@ -263,30 +272,35 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("CREATE TABLE IF NOT EXISTS clipped_detections AS SELECT * FROM detections WHERE 1=0")
     # ...except that "created AFTER the ALTERs" is only true on a FIRST boot. On
     # every already-deployed DB the CTAS above is a no-op, so a column added to
-    # `detections` after the clip feature shipped never reaches this table — and
-    # mask_poly/mask_parts are the first columns in this repo's history to be added
-    # after it, so nothing has ever crossed that gap before.
+    # `frames`/`detections` after the clip feature shipped never reaches its
+    # staging table, and clip_camera's `INSERT INTO clipped_x (FRAME_COLS)` —
+    # which names its columns — raises a BinderException. That abort is
+    # non-destructive (it happens before the DELETEs), but the tempting
+    # workaround, dropping the new columns from the clip lists, silently NULLs a
+    # whole GPU pass of outlines on the first clip. Fixing the schema is the only
+    # safe direction.
     #
-    # Without these, clip_camera's `INSERT INTO clipped_detections (DET_COLS)`
-    # raises a BinderException. That abort is non-destructive (it happens before
-    # the DELETEs), but the tempting workaround — dropping the mask columns from
-    # the clip lists — silently NULLs a whole GPU pass of outlines on the first
-    # clip. Fixing the schema is the only safe direction.
+    # This used to be a hand-written list of ALTERs, which meant every future
+    # column had to be remembered here as well as in the CREATE TABLE and in
+    # DET_COLS — and whether it needed remembering depended on whether it
+    # predated the clip feature, a question nobody can answer from the code.
+    # Syncing the staging table to its source instead makes the rule
+    # unconditional: a staging table always has every column its live table has.
     #
-    # They must sit AFTER the CTAS: `ADD COLUMN IF NOT EXISTS` guards the COLUMN,
-    # not the TABLE, so running these against a fresh DB where clipped_detections
+    # It must sit AFTER the CTAS: `ADD COLUMN IF NOT EXISTS` guards the COLUMN,
+    # not the TABLE, so running it against a fresh DB where the staging table
     # does not exist yet raises a CatalogException — which would be every first
     # boot and every test.
-    con.execute("ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS mask_poly VARCHAR")
-    con.execute("ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS mask_parts INTEGER")
-    # ...and the same for the M5 attribute columns, for the identical reason:
-    # they are in DET_COLS, so clip_camera's named INSERT names them, and on an
-    # already-deployed DB the CTAS above added nothing.
-    for _col, _type in (("attr_is_cow", "BOOLEAN"), ("attr_cow_p", "DOUBLE"),
-                        ("attr_sun", "VARCHAR"), ("attr_sun_p", "DOUBLE"),
-                        ("attr_behaviour", "VARCHAR"), ("attr_behaviour_p", "DOUBLE"),
-                        ("attr_model_rev", "VARCHAR")):
-        con.execute(f"ALTER TABLE clipped_detections ADD COLUMN IF NOT EXISTS {_col} {_type}")
+    for _live, _stage in (("frames", "clipped_frames"),
+                          ("detections", "clipped_detections")):
+        _have = {r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            [_stage]).fetchall()}
+        for _col, _type in con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = ? ORDER BY ordinal_position", [_live]).fetchall():
+            if _col not in _have:
+                con.execute(f'ALTER TABLE {_stage} ADD COLUMN IF NOT EXISTS "{_col}" {_type}')
 
 
 # --------------------------------------------------------------------------- writes
@@ -436,8 +450,12 @@ def archive_dataset(con, dataset_id: str, archive_path: str) -> int:
     it survives in `archive_path` and could be restored by the reverse move.
 
     Copies the dimension row + both fact tables (datasets, frames, detections). The
-    archive is schema-initialised first, then ATTACHed to this connection so the
-    copy + delete run in one transaction. Re-archiving the same id is idempotent
+    archive is schema-initialised first, then ATTACHed to this connection. Each
+    statement autocommits — there is no enclosing transaction, so the ORDER is
+    what makes this safe: every copy happens before any delete, and a failure
+    part-way leaves a duplicate in the archive, never a hole. (Re-archiving
+    clears the stale copy first, so the duplicate is transient.) Do not reorder
+    the loops. Re-archiving the same id is idempotent
     (its stale archive rows are cleared before the fresh copy). Returns the number
     of detections moved."""
     # Ensure the archive file has the same schema before we ATTACH + copy into it.
@@ -451,16 +469,50 @@ def archive_dataset(con, dataset_id: str, archive_path: str) -> int:
     n = con.execute("SELECT count(*) FROM detections WHERE dataset_id = ?", [dataset_id]).fetchone()[0]
     con.execute(f"ATTACH '{safe}' AS archive")
     try:
-        # Clear any prior copy of this id so a re-archive replaces rather than dupes.
-        for t in ("detections", "frames", "datasets"):
+        # Each table's prior copy is cleared immediately before it is rewritten,
+        # inside the loop below, so a re-archive replaces rather than duplicates.
+        # Copy live -> archive BY NAME, never by position.
+        #
+        # `INSERT ... SELECT *` is positional, and the two sides are not built the
+        # same way: the archive is created fresh by `init_db` just above, so it has
+        # CREATE-TABLE order, while a long-deployed live DB has ALTER order —
+        # every forward-compat column appended at the tail in the order the
+        # ALTERs run, which is NOT where the CREATE TABLE body puts it. A DB
+        # predating `dataset_id` ends up with that column 22 slots late; the
+        # positional copy then writes camera_id into dataset_id, ts into
+        # camera_id, and so on down the row. Nothing raises, because DuckDB casts
+        # TIMESTAMP and DOUBLE to VARCHAR happily — and the archive is the ONLY
+        # remaining copy of a day this function then deletes.
+        #
+        # Naming the columns makes the order irrelevant on both sides. If the live
+        # DB is genuinely missing one, the binder raises before any DELETE runs,
+        # which is the loud failure this used to lack.
+        # Pinned by tests/test_schema_migration.py.
+        # The clip STAGING tables are part of the day too. `clip_camera` MOVES
+        # out-of-window rows there rather than deleting them, on the promise that
+        # a clip is undoable — so leaving them behind broke that promise in both
+        # directions: the archive held an incomplete copy of the day, and the
+        # live DB kept orphan rows whose `datasets` row no longer existed, with
+        # `clipped_counts` still advertising an Undo control for a deleted day.
+        tables = ("datasets", "frames", "detections",
+                  "clipped_frames", "clipped_detections")
+        for t in tables:
+            if not _table_exists(con, t):
+                continue
             con.execute(f"DELETE FROM archive.{t} WHERE dataset_id = ?", [dataset_id])
-        # Copy live -> archive (same DDL both sides, so SELECT * column order matches).
-        for t in ("datasets", "frames", "detections"):
-            con.execute(f"INSERT INTO archive.{t} SELECT * FROM {t} WHERE dataset_id = ?", [dataset_id])
-        # Drop from the live DB (detections first — keep the intent explicit).
-        con.execute("DELETE FROM detections WHERE dataset_id = ?", [dataset_id])
-        con.execute("DELETE FROM frames WHERE dataset_id = ?", [dataset_id])
-        con.execute("DELETE FROM datasets WHERE dataset_id = ?", [dataset_id])
+            cols = [r[0] for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_catalog = 'archive' AND table_name = ? "
+                "ORDER BY ordinal_position", [t]).fetchall()]
+            names = ", ".join(f'"{c}"' for c in cols)
+            con.execute(
+                f"INSERT INTO archive.{t} ({names}) "
+                f"SELECT {names} FROM {t} WHERE dataset_id = ?", [dataset_id])
+        # Drop from the live DB, every copy first (see the docstring: copies all
+        # precede deletes, so a failure part-way duplicates and never holes).
+        for t in reversed(tables):
+            if _table_exists(con, t):
+                con.execute(f"DELETE FROM {t} WHERE dataset_id = ?", [dataset_id])
     finally:
         con.execute("DETACH archive")
     return int(n or 0)
@@ -497,17 +549,23 @@ def datasets(con) -> pd.DataFrame:
         """
         SELECT s.dataset_id, s.day, s.label, s.status, s.created_at, s.ingested_at,
                (SELECT count(*) FROM frames f WHERE f.dataset_id = s.dataset_id)          AS n_frames,
-               (SELECT count(*) FROM detections d WHERE d.dataset_id = s.dataset_id)      AS n_detections,
+               (SELECT count(*) FROM detections d WHERE d.dataset_id = s.dataset_id
+                  AND {gate})                                                     AS n_detections,
                (SELECT count(DISTINCT camera_id) FROM frames f WHERE f.dataset_id = s.dataset_id) AS n_cameras,
                -- Cows this day found that fall inside NO count area. Reported per
                -- day because the answer is per day: areas are drawn per dataset
                -- (cameras move), so a day can be fully covered while the next one
                -- has no polygons at all and counts nothing into any area.
+               -- Gated like every other count, and like `detections_outside_areas`
+               -- which answers this same question for the map. Ungated, the day
+               -- picker advertised a total the KPI rail beside it contradicted,
+               -- and the "unassigned" gap the comment above promises to spare the
+               -- reader came out different on each surface.
                (SELECT count(*) FROM detections d WHERE d.dataset_id = s.dataset_id
-                  AND d.region_id IS NULL)                                        AS n_unassigned
+                  AND d.region_id IS NULL AND {gate})                             AS n_unassigned
         FROM datasets s
         ORDER BY s.day DESC NULLS LAST, s.dataset_id DESC
-        """
+        """.format(gate=gate_clause("d"))
     ).df()
 
 
@@ -1065,8 +1123,13 @@ def area_counts_over_time(con, camera: str | None = None, trunc: str = "hour", d
     sql = """
         SELECT date_trunc(?, ts) AS t, region_id, count(*) AS cows
         FROM detections
-        WHERE region_id IS NOT NULL
-    """
+        -- THE GATE. This was the one counting read that omitted it, so with
+        -- `gate_enabled` on the per-area time series counted model-rejected
+        -- false positives that `area_summary` and `crosstab("region")` — reading
+        -- the same rows, on the same screen — did not. No alias: this query has
+        -- no table alias.
+        WHERE region_id IS NOT NULL AND {gate}
+    """.format(gate=gate_clause())
     params = [trunc]
     if camera is not None:
         sql += " AND camera_id = ?"

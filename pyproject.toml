@@ -6,6 +6,13 @@ requires-python = ">=3.10"
 dynamic = ["dependencies"]
 
 [tool.setuptools]
+# EXHAUSTIVE: naming `packages` explicitly turns setuptools' auto-discovery
+# off, so a subpackage missing from this list is simply not installed. That is
+# invisible under the documented `pip install -e .` (an editable install
+# resolves the whole source tree through a path hook) and invisible in the
+# container (the Dockerfile COPYs the tree instead of installing it) — it
+# surfaces only as ModuleNotFoundError at boot on a real `pip install .`.
+# tests/test_packaging.py diffs this list against the directories on disk.
 packages = [
     "cownting",
     "cownting.detect",
@@ -13,6 +20,7 @@ packages = [
     "cownting.eval",
     "cownting.scene",
     "cownting.finetune",
+    "cownting.instance_attrs",
 ]
 
 [tool.setuptools.dynamic]

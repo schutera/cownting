@@ -131,6 +131,7 @@ def test_a_restart_tells_each_kind_of_job_the_right_thing():
             {"job_id": "u1", "dataset_id": "2025-07-03", "label": "t", "status": "running", "kind": "upload"},
             {"job_id": "r1", "dataset_id": "", "label": "t", "status": "queued", "kind": "remask"},
             {"job_id": "a1", "dataset_id": "", "label": "t", "status": "running", "kind": "attrs_score"},
+            {"job_id": "o1", "dataset_id": "", "label": "t", "status": "queued", "kind": "reoverlay"},
             {"job_id": "d1", "dataset_id": "2025-07-02", "label": "t", "status": "done", "kind": "upload",
              "message": "Upload complete."},
         ]
@@ -141,7 +142,7 @@ def test_a_restart_tells_each_kind_of_job_the_right_thing():
             uploads.recover_jobs(cfg)
             J = uploads._JOBS
             check("every active job is failed as interrupted",
-                  all(J[k].status == "failed" and J[k].error for k in ("u1", "r1", "a1")))
+                  all(J[k].status == "failed" and J[k].error for k in ("u1", "r1", "a1", "o1")))
             check("the finished one is untouched", J["d1"].status == "done" and J["d1"].message == "Upload complete.")
             check("an upload says re-upload", "re-upload" in J["u1"].message, J["u1"].message)
             check("a remask says start the outline pass again",
@@ -149,6 +150,16 @@ def test_a_restart_tells_each_kind_of_job_the_right_thing():
             check("a scoring pass says start scoring again and that it resumes",
                   "/api/attrs/score" in J["a1"].message and "resumes" in J["a1"].message
                   and "re-upload" not in J["a1"].message, J["a1"].message)
+            # reoverlay was the fourth kind and had no coverage here. The lookup
+            # used to fall back to the UPLOAD message for any unknown kind, which
+            # is the exact wrong-page bug the dict exists to prevent — and it
+            # would only ever appear after a restart, where nobody is looking.
+            check("a repaint says start the repaint again, not re-upload",
+                  "/api/reoverlay" in J["o1"].message
+                  and "re-upload" not in J["o1"].message, J["o1"].message)
+            check("...and every registered kind has its OWN message",
+                  len({J[k].message for k in ("u1", "r1", "a1", "o1")}) == 4,
+                  str({k: J[k].message[:40] for k in ("u1", "r1", "a1", "o1")}))
         finally:
             _restore(saved)
 

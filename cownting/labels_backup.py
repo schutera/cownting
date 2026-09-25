@@ -202,15 +202,30 @@ def _open_store(config: Config) -> duckdb.DuckDBPyConnection:
     must be one definition, or a platform that gets added to one list and not the
     other turns a routine contention skip into a spurious failure (and a failure
     arms a 6 h cooldown, so the divergence silently suppresses backups)."""
+    con = None
     try:
         con = db.connect(config.paths.labels_db_path)
+        # THE DDL IS INSIDE THE TRY, and that is the fix. `init_labels_db` ends in
+        # `CREATE OR REPLACE VIEW`, a catalog write — `labeling.ensure_labels_db`
+        # carries a 50-attempt retry loop around this exact DDL precisely BECAUSE
+        # it raced in production. Only `db.connect` used to be classified here, so
+        # a backup whose DDL replay collided with a Label-page request was
+        # reported as a genuine FAILURE: a spurious alert, a non-zero CLI exit,
+        # and a 6 h cooldown armed against a perfectly healthy store.
+        labels_db.init_labels_db(con)
+        ensure_backup_tables(con)
+        return con
     except Exception as e:  # noqa: BLE001 — classify, then re-raise
+        # Close before re-raising either way: the old code leaked an open
+        # read-write handle (and its file lock) on the DDL path.
+        if con is not None:
+            try:
+                con.close()
+            except Exception:  # noqa: BLE001
+                pass
         if db.is_transient_lock_error(e) or "lock" in str(e).lower():
             raise _StoreBusy(str(e)) from e
         raise
-    labels_db.init_labels_db(con)
-    ensure_backup_tables(con)
-    return con
 
 
 # ------------------------------------------------------------------- gate + claim
@@ -246,8 +261,14 @@ def due(con: duckdb.DuckDBPyConnection, backup: BackupCfg) -> tuple[bool, str]:
     ).fetchone()
     if row is not None and row[0] == "failed" and bool(row[1]):
         return False, f"cooling down: last run failed within {_COOLDOWN_HOURS}h"
+    # `trigger <> 'forced'` because a --force run is an EXTRA copy, not a
+    # substitute for the scheduled one. Without this, an operator who runs
+    # `labels backup --force` on Monday to check the pipeline silently consumes
+    # that week's slot: the annotators' whole week of work then waits until the
+    # following Monday to leave the box. (This has happened.)
     recent = con.execute(
         "SELECT count(*) FROM backup_runs WHERE status = 'done' "
+        "AND \"trigger\" IS DISTINCT FROM 'forced' "
         "AND finished_at > now() - to_days(CAST(? AS INTEGER))",
         [backup.every_days],
     ).fetchone()[0]
@@ -687,30 +708,54 @@ def _deliver(
         return csv_zip, _write_zip(csv_zip, list(csv_members))
 
     for rung in ("full", "csv", "summary"):
-        if rung == "full":
-            path, size, content = zip_path, zip_bytes, base
-        elif rung == "csv":
-            path, size = _csv_rung()
-            content = (base + f" Full zip is {zip_bytes / 1e6:.1f} MB — over the upload "
-                       f"cap, so the CSV bundle is attached; the full zip is retained "
-                       f"on the box at {zip_path}.")
-        else:
-            path, size = None, 0
-            content = (base + f" Bundle is {zip_bytes / 1e6:.1f} MB, over the upload cap "
-                       f"— retained on the box at {zip_path}.")
+        def _build(rung=rung):
+            if rung == "full":
+                return zip_path, zip_bytes, base
+            if rung == "csv":
+                p, n = _csv_rung()
+                return p, n, (base + f" Full zip is {zip_bytes / 1e6:.1f} MB — over the "
+                              f"upload cap, so the CSV bundle is attached; the full zip "
+                              f"is retained on the box at {zip_path}.")
+            return None, 0, (base + f" Bundle is {zip_bytes / 1e6:.1f} MB, over the upload "
+                             f"cap — retained on the box at {zip_path}.")
+        last = rung == "summary"
+        try:
+            path, size, content = _build()
+        except Exception as e:  # noqa: BLE001
+            # BUILDING a rung can fail too, not just posting it — `_csv_rung`
+            # writes a second zip, and a full disk raises OSError there. That is
+            # not a size rejection, so it used to propagate and abort the ladder
+            # BEFORE the summary rung, which carries no file and therefore cannot
+            # be rejected at all. The operator then heard nothing whatsoever,
+            # although a complete full zip was sitting on the box.
+            if last:
+                raise
+            print(f"{_ALERT} rung: could not build {rung} ({_redact(str(e))}) "
+                  f"— dropping a rung")
+            continue
         if path is not None and size > budget:
             print(f"{_ALERT} oversize: {rung} is {size} B (cap {budget} B) — dropping a rung")
             continue
         try:
             poster(webhook, content, path)
-        except Exception as e:  # noqa: BLE001 — only size is a rung failure
+        except Exception as e:  # noqa: BLE001
             if path is not None and _is_too_large(e):
                 print(f"{_ALERT} oversize: Discord rejected {size} B though our cap is "
                       f"{budget} B — dropping a rung")
                 continue
-            raise
+            if last:
+                raise
+            # Any other failure on a rung that still has a fallback below it:
+            # take the fallback. The summary rung re-raises, so a genuinely
+            # undeliverable backup is still reported as such.
+            print(f"{_ALERT} rung: {rung} could not be posted "
+                  f"({_redact(str(e))}) — dropping a rung")
+            continue
         return {"full": "posted", "csv": "posted_csv_only", "summary": "posted_summary"}[rung]
-    return "posted_summary"
+    # Unreachable: the summary rung either returns or raises. If the ladder is
+    # ever reordered so it is not last, falling off the bottom must not be
+    # reported as a successful delivery.
+    raise RuntimeError("delivery ladder exhausted without posting anything")
 
 
 # ------------------------------------------------------------------- the run
@@ -878,13 +923,31 @@ def _stale_alert(con: duckdb.DuckDBPyConnection, backup: BackupCfg) -> None:
     Printed on every scheduler tick while true, which `alerts/watch.py` already
     tails — this is what closes the loop when the gate itself is wedged (e.g. a
     persistent failure inside the cooldown window)."""
+    window = 2 * backup.every_days
     row = con.execute(
         "SELECT max(finished_at), max(finished_at) < now() - to_days(CAST(? AS INTEGER)) "
         "FROM backup_runs WHERE status = 'done'",
-        [2 * backup.every_days],
+        [window],
     ).fetchone()
-    if row is not None and row[0] is not None and bool(row[1]):
-        print(f"{_ALERT} stale: last successful backup {row[0]} — over {2 * backup.every_days} days ago")
+    if row is not None and row[0] is not None:
+        if bool(row[1]):
+            print(f"{_ALERT} stale: last successful backup {row[0]} — over {window} days ago")
+        return
+    # NO SUCCESSFUL RUN HAS EVER HAPPENED. The old code returned silently here,
+    # which made this alarm — the one mechanism documented as "what closes the
+    # loop when the gate itself is wedged" — dead in precisely the case where the
+    # backup never worked at all: `backup.enabled` switched on against a store
+    # that always fails, every tick recording `failed`, no `done` row ever
+    # written, and no alarm, forever. A deployment that has never produced a
+    # backup is the most alarming state there is, not the least.
+    first = con.execute(
+        "SELECT min(started_at), count(*) FROM backup_runs").fetchone()
+    if first and first[0] is not None:
+        age = con.execute(
+            "SELECT ? < now() - to_days(CAST(? AS INTEGER))", [first[0], window]).fetchone()
+        if age and bool(age[0]):
+            print(f"{_ALERT} stale: NO backup has ever succeeded; first attempt "
+                  f"{first[0]}, {first[1]} run(s) tried — over {window} days ago")
 
 
 # ------------------------------------------------------------------ milestones

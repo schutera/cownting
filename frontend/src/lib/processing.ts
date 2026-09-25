@@ -62,9 +62,21 @@ export function isJobActive(job: UploadJob | undefined | null): boolean {
 }
 
 const POLL_ACTIVE_MS = 2000;
-// Job kinds that are passes over EXISTING footage rather than the processing of
-// one newly-uploaded day. They name a dataset but do not own it.
-const BACKFILL_KINDS = new Set(["remask", "attrs_score"]);
+// Is this job the processing of one newly-uploaded day, or a pass over EXISTING
+// footage that merely names a day?
+//
+// A POSITIVE predicate — "it is an upload" — rather than a list of the backfill
+// kinds. The list was `new Set(["remask", "attrs_score"])` with a comment
+// underneath saying "the next one must not have to rediscover this rule by
+// shipping the bug", and then `reoverlay` shipped and was not added to it: a
+// repaint won its day's slot in the map and the dashboard showed "Repainting
+// overlays… 12/400" where that day's real upload progress, warnings and failure
+// text should have been. An open list cannot be kept in step with the server;
+// asking the opposite question cannot fall behind. This is the same shape the
+// backend's `_upload_waiting` was rewritten into, for the same reason.
+function ownsItsDataset(job: UploadJob): boolean {
+  return job.kind === undefined || job.kind === "upload";
+}
 
 const POLL_IDLE_MS = 20000;
 
@@ -104,11 +116,11 @@ export function useUploadJobs(): UploadJobs {
         // "tracing outlines" as if it were that day's upload — which is how the
         // day's real progress, and its warnings, would silently disappear.
         //
-        // A SET rather than a literal comparison: this was `kind === "remask"`
-        // until attribute scoring became the second backfill, and the next one
-        // must not have to rediscover this rule by shipping the bug.
+        // Asked as "does this job own its dataset", never as a list of the kinds
+        // that don't — see ownsItsDataset above for why that list could not be
+        // kept in step with the server.
         for (const j of jobs) {
-          if (j.kind !== undefined && BACKFILL_KINDS.has(j.kind)) continue;
+          if (!ownsItsDataset(j)) continue;
           if (!(j.dataset_id in map)) map[j.dataset_id] = j;
         }
         const active = jobs.filter(isJobActive);

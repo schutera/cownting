@@ -301,12 +301,32 @@ def test_split_is_deterministic_and_whole_blocks_only():
 
 
 def test_split_never_produces_an_empty_side():
-    """The trainer divides by len(val); a one-block corpus must not make that 0."""
-    one = ds.split_blocks({"only": 5}, val_fraction=0.2, seed=1)
-    check("a single block still yields a val split", set(one.values()) == {"val"})
+    """The trainer divides by len(val), so neither side may be empty.
+
+    This test used to assert that a single block yields `{"only": "val"}` — which
+    is an empty side, just the other one. `fit` then built an empty train
+    DataLoader, divided by `max(1, len(tl))` rather than erroring, ran its
+    epochs against nothing and SAVED A CHECKPOINT holding random head weights.
+    Scoring a corpus with it would have written 46,000 confident-looking verdicts
+    from an untrained model.
+
+    One block cannot be split at all: blocking exists because instances within a
+    block are near-duplicates, so any cut through one leaks. Refusing is the only
+    honest answer, and a raise is recoverable in a way a served random model is
+    not."""
+    try:
+        got = ds.split_blocks({"only": 5}, val_fraction=0.2, seed=1)
+        raised = ""
+    except ValueError as e:
+        got, raised = None, str(e)
+    check("a single block is refused rather than split", bool(raised), str(got))
+    check("...and the message says what to do about it",
+          "at least two" in raised, raised)
+
     two = ds.split_blocks({"a": 5, "b": 5}, val_fraction=1.0, seed=1)
     check("val_fraction=1.0 still leaves something to train on",
           "train" in set(two.values()), str(two))
+    check("...and something to validate on", "val" in set(two.values()), str(two))
 
 
 def test_samples_land_in_the_block_their_frame_belongs_to():

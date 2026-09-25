@@ -299,6 +299,7 @@ def test_the_bound_parameters_line_up_with_the_placeholders():
         0.55, cfg.gate_band,                                 #   selector 2: gate band
         ["behaviour.standing"], hx(cfg.seek_share),          #   selector 3: sought class, capped
         hx(cfg.uniform_share),                               # reason: uniform (tested first)
+        cfg.abstain_min_px, hx(cfg.small_share),             # reason: the same legibility gate
         0.55, cfg.gate_band,                                 # reason: gate_boundary
         cfg.uncertain_below,                                 # reason: low_confidence
         ["behaviour.standing"], hx(cfg.seek_share),          # reason: seek_class
@@ -535,6 +536,77 @@ def test_the_legibility_floor_guards_every_selector():
               set(head) == {(100, "gate_boundary")}, str(head))
 
 
+def test_a_reason_is_never_credited_to_a_rule_that_did_not_promote_the_row():
+    """`queue_reason` is the column the entire active-learning audit is computed
+    over — "abstained yields 3.7x more not_visible than uniform" is a claim ABOUT
+    THIS COLUMN. So a row must never be stamped with a selector that did not
+    actually select it.
+
+    `worth_asking` gates all three selectors behind a legibility floor; the
+    reason CASE did not. A 30 px crop above `min_instance_px` but below the
+    floor, sitting exactly astride the gate threshold, was `worth_asking = FALSE`
+    — refused — and still stamped `gate_boundary` the moment anything served it.
+    At the shipped defaults that was over half of every `gate_boundary` row.
+
+    The floor is set ABOVE `clear_instance_px` here, which is the documented use
+    of the knob and the configuration where those rows stop sorting last and land
+    in the front tier instead."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, abstain_min_px=90, clear_instance_px=60, small_share=0.0,
+                   uncertain_below=0.75, gate_band=0.15, seek_share=1.0,
+                   seek_classes=["behaviour.standing"])
+        _seed(cfg, [
+            # Illegible (70 px < the 90 px floor) but matching every selector.
+            {"side": 70.0, "cls": "behaviour.lying", "p": 0.10, "cow_p": 0.50, "rev": "r1"},
+            {"side": 70.0, "cls": "behaviour.standing", "p": 0.99, "cow_p": 0.99, "rev": "r1"},
+            {"side": 70.0, "cls": None, "p": 0.30, "cow_p": 0.99, "rev": "r1"},
+            # Legible, and genuinely selected.
+            {"side": 120.0, "cls": "behaviour.lying", "p": 0.10, "cow_p": 0.50, "rev": "r1"},
+            {"side": 120.0, "cls": None, "p": 0.30, "cow_p": 0.99, "rev": "r1"},
+        ])
+        items = _serve(cfg)
+        by_side = {}
+        for it in items:
+            side = round(it["bbox"][2] - it["bbox"][0])
+            by_side.setdefault(side, []).append(it.get("queue_reason"))
+
+        selectors = {"gate_boundary", "abstained", "low_confidence", "seek_class"}
+        illegible = set(by_side.get(70, []))
+        check("no illegible crop claims a selector as its reason",
+              not (illegible & selectors),
+              f"70px rows were stamped {sorted(illegible & selectors)}")
+        check("...they report `confident`, which is what actually served them",
+              illegible <= {"confident", "uniform"}, str(sorted(illegible)))
+        check("the legible ones DO carry their selector",
+              set(by_side.get(120, [])) & selectors,
+              str(sorted(set(by_side.get(120, [])))))
+
+
+def test_the_reason_and_the_rule_agree_across_a_realistic_corpus():
+    """The general invariant behind the test above, asserted over a mixed
+    population rather than a hand-picked one: any row carrying a selector reason
+    must be one the selector could actually have promoted."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, abstain_min_px=60, clear_instance_px=60, small_share=0.0,
+                   uncertain_below=0.75, gate_band=0.15, seek_share=1.0,
+                   seek_classes=["behaviour.standing"])
+        rows = []
+        for i in range(120):
+            side = (25.0, 40.0, 70.0, 150.0)[i % 4]
+            rows.append({"side": side, "rev": "r1",
+                         "cls": (None, "behaviour.standing", "behaviour.lying")[i % 3],
+                         "p": (0.2, 0.95, 0.5)[i % 3],
+                         "cow_p": (0.5, 0.99, 0.2)[i % 3]})
+        _seed(cfg, rows)
+        selectors = {"gate_boundary", "abstained", "low_confidence", "seek_class"}
+        bad = [(round(it["bbox"][2] - it["bbox"][0]), it.get("queue_reason"))
+               for it in _serve(cfg)
+               if it.get("queue_reason") in selectors
+               and round(it["bbox"][2] - it["bbox"][0]) < cfg.annotation.abstain_min_px]
+        check("every selector-stamped row clears the legibility floor",
+              not bad, f"{len(bad)} do not, e.g. {bad[:4]}")
+
+
 def main():
     print("=== test_queue_active_learning ===")
     test_an_unscored_corpus_behaves_exactly_as_before()
@@ -555,6 +627,8 @@ def main():
     test_the_sought_class_is_capped_to_a_share()
     test_an_unscored_corpus_is_untouched_by_the_legibility_floor()
     test_the_legibility_floor_guards_every_selector()
+    test_a_reason_is_never_credited_to_a_rule_that_did_not_promote_the_row()
+    test_the_reason_and_the_rule_agree_across_a_realistic_corpus()
     print("\n" + ("PASS" if not _FAILED else f"{_FAILED} FAILED"))
     sys.exit(1 if _FAILED else 0)
 
