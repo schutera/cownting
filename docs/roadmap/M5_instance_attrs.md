@@ -286,11 +286,23 @@ carry the rev that scored them.
 Each step is independently green and independently useful: step 2 produces an
 inspectable dataset whether or not step 3 ever trains well.
 
-**Where it stands (2026-09-17).** All seven shipped. Production runs rev
-`e27d6d4d6638` (ResNet18, `head_probing` merged away, §2.2) over the whole
-corpus; `score_on_ingest` is on, so a new day scores itself after segmentation;
-`gate_enabled` is still off — the dashboard shows what the model thinks, it does
-not yet drop what the model rejects (§10).
+**Where it stands (2026-09-25).** All seven shipped. Production runs rev
+`5a6dfd5ef295` (ResNet18, 2,973 labels) over the whole corpus;
+`score_on_ingest` is on, so a new day scores itself after segmentation; and
+overlays are repainted from the database whenever the verdicts change (§11), so
+a detection the model rejects is no longer drawn as a cow. `gate_enabled` is
+still off — the dashboard shows what the model thinks, it does not yet drop
+what the model rejects from the COUNTS (§10).
+
+| rev | labels | fixed-split mean macro-F1 | 5-fold CV pooled |
+|---|---|---|---|
+| `bd64f61f` | 477 | — | — |
+| `e27d6d4d6638` | 2,381 | 0.8224 | 0.8455 |
+| **`5a6dfd5ef295`** | **2,973** | **0.8465** | **0.8562** |
+
+More labels, same recipe, better on seven of nine classes — including the gate
+(`not_cow` 0.931 → 0.943) and the weakest class (`behaviour.not_visible`
+0.426 → 0.473).
 
 ## 9. The recipe, and how it was chosen (2026-09-16/17)
 
@@ -378,6 +390,50 @@ confidence alone was not measured, and is the one variant here that was not.
 The operating point is a config line (`instance_attrs.abstain_min_conf`); the
 number to watch is the `unsure` bucket in the behaviour pivot and the KPI rail.
 
+### 9.4 Dropping the decline class: measured, and rejected (2026-09-25)
+
+§2.3 argues from the taxonomy that the surviving decline option should be
+trained. With 2,973 labels it became worth settling with a number, because the
+opposite is also arguable: "Cannot tell" is an annotator's epistemic state, and
+training a classifier to predict a state of mind is a strange thing to ask.
+
+Two 5-fold runs on identical data and recipe. **A** keeps the four-class
+behaviour head. **B** removes `behaviour.not_visible` from the head entirely,
+leaving abstention to carry every "cannot tell" through the confidence
+threshold.
+
+B looks emphatically better:
+
+| behaviour | A | B |
+|---|---|---|
+| feeding | 0.827 | 0.896 |
+| lying | 0.967 | 0.976 |
+| standing | 0.735 | 0.793 |
+| macro over the three postures | 0.843 | **0.888** |
+
+**And that comparison is invalid.** Removing the class removes those instances
+from the EVALUATION set as well as from training, so B is being marked on an
+easier exam: 2,097 readable crops against A's 2,353 including the 256 a human
+could not read. The gain is the exam, not the model.
+
+Judged on the same population — every instance a human answered for behaviour,
+declines included — and at matched coverage, the ranking reverses:
+
+| at ~74% coverage | precision of shown postures | annotator-declines correctly abstained |
+|---|---|---|
+| **A** (conf < 0.6, the deployed rule) | **90.9%** | **75.8%** |
+| B (conf < 0.76, tuned to match) | 88.3% | 53.9% |
+
+A is better on both axes at once. The reason is visible in the confidences: on
+crops a human could not read, B's median confidence is 0.738 against 0.893 on
+readable ones — some separation, but nowhere near enough to act on, whereas A's
+trained decline class pulls probability mass away from the postures and makes
+the threshold mean something. **The class is what keeps the confidence honest.**
+
+So it stays, and the lesson generalises past this head: when a change alters
+which rows are SCORED, the headline metric is measuring a different question and
+the two numbers cannot be compared at all.
+
 ## 10. Known risks
 
 - **543 samples is small.** Transfer learning from ImageNet makes it viable, not
@@ -413,3 +469,42 @@ say that the CV could not:
   purpose, and a good first thing to look at (frames 169/175/179 of
   2025-07-04 · camera_04 show five or six of them struck through) before
   deciding on `gate_enabled`.
+
+## 11. The overlay is a cache of the model's opinion (2026-09-25)
+
+`segment` burns the instance masks into a JPEG. The crop model has not run yet
+at that point — it cannot have, the crops come from the very detections being
+written — so the picture is made before anything knows which blobs are cows.
+The verdict lands minutes later, and changes again at every retrain.
+
+That makes an overlay a cache with no invalidation, and for a while it had
+none: 4,435 detections the model called not-a-cow were still painted as cows on
+3,078 frames.
+
+`pipeline.reoverlay` rebuilds the image from `mask_poly` + `attr_is_cow` — no
+GPU, no segmenter, ~55 ms a frame, about seven minutes for the corpus against
+hours for a re-segmentation. `frames.overlay_rev` records the rev each image was
+painted for, and a frame is selected only when that differs from the rev its own
+detections now carry. That single column buys idempotence, resumability, and
+automatic invalidation: a re-score marks exactly the affected frames without any
+bookkeeping, and the pass is chained after both scoring paths.
+
+Two invariants have pixel-probing tests, because either would silently corrupt
+18 GB of images recoverable only by re-segmenting:
+
+- **NULL is not FALSE.** `attr_is_cow` is NULL for every never-scored row, which
+  is most of the corpus most of the time. `coalesce(attr_is_cow, TRUE)`
+  (`db.mask_drawn_clause`), never `NOT attr_is_cow` — NULL propagates through
+  NOT and would blank every unscored day.
+- **The palette is positional.** Colours come from the `enumerate` index, so a
+  hidden detection must still consume its index. Pre-filtering the list
+  recolours every animal after it, on every frame.
+
+Deliberately NOT tied to `gate_enabled`: that flag decides what COUNTS and moves
+every historical number, so it needs deliberate opt-in; this decides what is
+PAINTED, and nobody opts in to not having a fence post tinted as a cow.
+
+**Fidelity.** `mask_to_polygon` stores the largest external contour only, so a
+cow split by an occluding panel repaints as its bigger half; 4,135 of 46,486
+detections have `mask_parts > 1`. The extra contours were discarded at
+segmentation time and only `remask` can recover them.

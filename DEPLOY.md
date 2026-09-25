@@ -232,6 +232,22 @@ docker exec -u cownting cownting-cownting-1 sh -c 'echo "{}" > /app/data/attrs_s
 #   or, scoped:  echo '{"dataset": "2025-07-03", "rescore": true}' > data/attrs_score.request
 ```
 
+Overlays repaint themselves after any score, so nothing extra is needed for a
+new model: the masks of detections it rejects stop being drawn. To backfill
+footage whose overlays predate the model, or after an interrupted pass:
+
+```bash
+curl -X POST 'https://<host>/api/reoverlay'              # whole corpus, resumable
+curl -X POST 'https://<host>/api/reoverlay?force=true'   # even frames already current
+```
+
+It reads the stored outlines rather than re-running the segmenter — about seven
+minutes for the corpus, against hours for `remask` — and stamps each frame with
+the model rev it painted for, so re-running costs nothing. **It overwrites the
+overlay JPEGs in place**, and the originals come back only from a re-ingest or a
+re-segmentation; archive them first if the current look matters
+(`data/backups/overlays-pre-<rev>/`).
+
 Progress rides `GET /api/uploads` like every other job — there is no second
 status route. The pass yields to a waiting upload and re-queues itself, and
 scored rows carry the model's rev, so an interrupted pass resumes rather than
