@@ -62,6 +62,36 @@ annotation:
   skip_retire: 3                   # distinct annotators who may skip an instance
                                    # before it stops being served to anyone
   batch_size: 8                    # instances handed out per queue fetch
+
+  # --- Which crops get served first (all optional; these are the defaults) ---
+  # The queue spends a finite amount of annotator time, so it spends it where a
+  # label teaches the model something. Every served crop records WHY it was
+  # chosen (`queue_reason` on the annotation), which is what lets the next round
+  # be audited against the model it produced rather than guessed at.
+  min_instance_px: 25              # hard floor; never served below this
+  clear_instance_px: 60            # at/above -> served first
+  small_share: 0.15                # of sub-clear instances, promoted anyway
+  uncertain_below: 0.75            # ask when the posture confidence is under this
+  uniform_share: 0.25              # held OUT of every rule, as a marked random
+                                   # sample — prevalence and agreement statistics
+                                   # are only meaningful over this slice
+  gate_band: 0.15                  # ask when |attr_cow_p - cow_threshold| is under
+                                   # this; the only rule that can move the gate
+  seek_classes:                    # go looking for classes training is short of,
+                                   # by the model's own prediction ([] disables).
+                                   # behaviour.not_visible cannot appear here:
+                                   # the scorer never writes it (it writes NULL
+                                   # and abstains), so it would match nothing.
+    - behaviour.standing
+  seek_share: 0.25                 # of those, the share actually promoted —
+                                   # confident crops of a common posture are a
+                                   # huge pool and would crowd out the rules
+                                   # that carry real uncertainty
+  # abstain_min_px: 60             # abstention promotes a crop only if it is this
+                                   # legible (defaults to clear_instance_px). The
+                                   # model abstains both on genuinely ambiguous
+                                   # postures and on unreadable smudges; only size
+                                   # separates them before serving.
   max_batch_size: 50               # ceiling on a client-requested batch size
   # Context around the cow, as a fraction of the LONGER bbox side. Sun exposure and
   # lying/standing are read off the surroundings, not off the animal, so a tight

@@ -57,6 +57,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def _cfg(d: str, **over) -> Config:
     ann = {"min_instance_px": 25, "clear_instance_px": 60, "small_share": 0.0,
+           "seek_share": 1.0,
            "targets_per_instance": 2, "overlap_fraction": 0.0, "skip_retire": 3,
            "uncertain_below": 0.75, "uniform_share": 0.0,
            "batch_size": 500, "max_batch_size": 500}
@@ -67,11 +68,21 @@ def _cfg(d: str, **over) -> Config:
                                  artifacts_dir=os.path.join(d, "artifacts")))
 
 
+def _cfg_ann(**over) -> AnnotationCfg:
+    """Just the annotation config, for tests that call `_scan_sql` directly."""
+    base = {"min_instance_px": 25, "clear_instance_px": 60, "small_share": 0.15,
+            "targets_per_instance": 2, "overlap_fraction": 0.0, "skip_retire": 3,
+            "uncertain_below": 0.75, "uniform_share": 0.25}
+    base.update(over)
+    return AnnotationCfg(**base)
+
+
 def _seed(cfg: Config, rows_in: list[dict]) -> None:
     """One frame per instance so each gets ordinal 0 and a distinct key.
 
     Each entry: {"side": px, and optionally "p": attr_behaviour_p,
-    "cls": attr_behaviour, "rev": attr_model_rev}. Omit rev -> never scored.
+    "cls": attr_behaviour, "rev": attr_model_rev, "cow_p": attr_cow_p}.
+    Omit rev -> never scored.
     """
     rows = []
     for i, r in enumerate(rows_in):
@@ -82,7 +93,7 @@ def _seed(cfg: Config, rows_in: list[dict]) -> None:
             bbox_x1=0.0, bbox_y1=0.0, bbox_x2=side, bbox_y2=side,
             area_px=side * side, posture="standing",
             attr_behaviour=r.get("cls"), attr_behaviour_p=r.get("p"),
-            attr_model_rev=r.get("rev")))
+            attr_cow_p=r.get("cow_p"), attr_model_rev=r.get("rev")))
     con = db.connect(cfg.paths.db_path)
     db.init_db(con)
     db.insert_detections(con, pd.DataFrame(rows))
@@ -256,6 +267,274 @@ def test_progress_still_agrees_with_what_the_queue_will_serve():
               f'{len(_serve(cfg))} vs {p["remaining"]}')
 
 
+def test_the_bound_parameters_line_up_with_the_placeholders():
+    """THE SILENT-BIAS GUARD.
+
+    `_scan_sql` interpolates positional `?` and appends the matching values to a
+    list by hand, in two separate places. If the order ever drifts, the query
+    STILL RUNS AND STILL RETURNS ROWS — just the wrong ones, selected against the
+    wrong thresholds. Nothing raises, nothing looks broken, and the damage shows
+    up months later as a training set quietly skewed toward whatever the
+    mis-bound comparison happened to favour. A count check is the cheap half; the
+    type sequence below is what catches two same-typed values being swapped."""
+    # Every knob distinct, so a swap of any two is visible. Asserting TYPES
+    # would not do: `cow_threshold` and `gate_band` are adjacent floats, and
+    # exchanging them type-checks perfectly while silently selecting on a band
+    # of 0.5 around a threshold of 0.15 — i.e. almost every row, forever.
+    cfg = _cfg_ann(uncertain_below=0.75, uniform_share=0.25, gate_band=0.15,
+                   clear_instance_px=60, min_instance_px=25, small_share=0.10,
+                   overlap_fraction=0.30, seek_share=0.20, abstain_min_px=45,
+                   seek_classes=["behaviour.standing"], targets_per_instance=2,
+                   overlap_targets=3)
+    sql, params = labeling._scan_sql(cfg, "lbl", annotator="alice", dataset=None,
+                                     camera=None, day=None, cow_threshold=0.55)
+    check("every placeholder has exactly one bound value",
+          sql.count("?") == len(params), f"{sql.count('?')} ? vs {len(params)} params")
+    hx = labeling.hex_threshold
+    expected = [
+        cfg.clear_instance_px, hx(cfg.small_share),          # the `clear` tier
+        hx(cfg.uniform_share),                               # worth_asking: uniform passes free
+        cfg.abstain_min_px, hx(cfg.small_share),             # worth_asking: the legibility gate
+        cfg.uncertain_below,                                 #   selector 1: weak posture
+        0.55, cfg.gate_band,                                 #   selector 2: gate band
+        ["behaviour.standing"], hx(cfg.seek_share),          #   selector 3: sought class, capped
+        hx(cfg.uniform_share),                               # reason: uniform (tested first)
+        0.55, cfg.gate_band,                                 # reason: gate_boundary
+        cfg.uncertain_below,                                 # reason: low_confidence
+        ["behaviour.standing"], hx(cfg.seek_share),          # reason: seek_class
+        hx(cfg.overlap_fraction), hx(cfg.overlap_fraction),  # deep-overlap slice
+        cfg.overlap_targets, cfg.targets_per_instance,
+        "alice", "alice", cfg.min_instance_px,
+    ]
+    check("the bound values arrive in the documented order",
+          params == expected,
+          next((f"index {i}: {params[i]!r} != {expected[i]!r}"
+                for i in range(min(len(params), len(expected))) if params[i] != expected[i]),
+               f"lengths {len(params)} vs {len(expected)}"))
+    # And the scope filters must stay AHEAD of all of it.
+    _, scoped = labeling._scan_sql(cfg, "lbl", annotator="alice", dataset="d1",
+                                   camera="cam1", day=None, cow_threshold=0.5)
+    check("a scoped call binds its filters first and still balances",
+          scoped[:2] == ["d1", "cam1"] and len(scoped) == len(params) + 2, str(scoped[:3]))
+
+
+def test_a_crop_astride_the_gate_threshold_is_asked_about():
+    """The gate decides whether an animal is counted at all, and nothing used to
+    select on it: `attr_cow_p` was invisible to the queue, and the gate's recall
+    duly sat still across a whole round of labelling while 44 not-cows kept
+    passing as cows. A crop whose cow-probability straddles the threshold is the
+    one that would move it."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, gate_band=0.15, uncertain_below=0.0, seek_classes=[])
+        _seed(cfg,
+              # confidently a cow, confidently posture -> nothing to ask
+              [{"side": 100.0, "cls": "behaviour.lying", "p": 0.99,
+                "cow_p": 0.99, "rev": "r1"}] * 6 +
+              # astride the gate: same confident posture, but the gate is torn
+              [{"side": 100.0, "cls": "behaviour.lying", "p": 0.99,
+                "cow_p": 0.52, "rev": "r1"}] * 6)
+        head = _reasons(_serve(cfg))[:6]
+        check("the gate-boundary crops lead", set(head) == {"gate_boundary"}, str(head))
+
+        # The band is a real cut, on both sides of the threshold.
+        cfg2 = _cfg(d, gate_band=0.01, uncertain_below=0.0, seek_classes=[])
+        check("narrowing the band excludes them again",
+              "gate_boundary" not in set(_reasons(_serve(cfg2))),
+              str(set(_reasons(_serve(cfg2)))))
+
+
+def test_an_unscored_crop_is_not_mistaken_for_a_gate_boundary():
+    """`attr_cow_p` is NULL on everything the model has never seen, and NULL
+    comparisons yield NULL rather than FALSE. If that leaked into the CASE, an
+    entire unscored corpus would report `gate_boundary` and the audit trail would
+    be a lie."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, gate_band=0.15, seek_classes=[])
+        _seed(cfg, [{"side": 100.0}] * 8)          # no rev, no cow_p
+        reasons = set(_reasons(_serve(cfg)))
+        check("an unscored corpus still reads as unscored", reasons == {"unscored"},
+              str(reasons))
+
+
+def test_seeking_a_scarce_class_claims_only_the_confident_ones():
+    """`seek_class` and `low_confidence` answer different needs — one balances
+    the training set, the other teaches the model where it is unsure — and a
+    crop can satisfy both. The CASE tests uncertainty FIRST on purpose: a crop
+    the model is unsure of teaches more than one it is sure of, and if
+    `seek_class` came first it would swallow every unsure `standing` and the
+    audit could no longer tell balancing from teaching."""
+    with tempfile.TemporaryDirectory() as d:
+        # seek_share=1.0: this test is about the RULE, not the cap. The cap has
+        # its own test below.
+        cfg = _cfg(d, uncertain_below=0.75, gate_band=0.0, seek_share=1.0,
+                   seek_classes=["behaviour.standing"])
+        _seed(cfg,
+              # confidently standing: wanted purely because training is short of it
+              [{"side": 100.0, "cls": "behaviour.standing", "p": 0.95,
+                "cow_p": 0.99, "rev": "r1"}] * 4 +
+              # unsure standing: the same class, but uncertainty owns the label
+              [{"side": 100.0, "cls": "behaviour.standing", "p": 0.60,
+                "cow_p": 0.99, "rev": "r1"}] * 4 +
+              # confidently a class nobody is seeking
+              [{"side": 100.0, "cls": "behaviour.lying", "p": 0.95,
+                "cow_p": 0.99, "rev": "r1"}] * 4)
+        reasons = _reasons(_serve(cfg))
+        check("the unsure ones report low_confidence, not seek_class",
+              reasons.count("low_confidence") == 4, str(reasons[:12]))
+        check("the confident sought ones report seek_class",
+              reasons.count("seek_class") == 4, str(reasons[:12]))
+        check("an unsought confident class is not promoted",
+              reasons.count("confident") == 4, str(reasons[:12]))
+        head = set(reasons[:8])
+        check("both sought tiers lead the unsought one",
+              head == {"low_confidence", "seek_class"}, str(head))
+
+
+def test_an_empty_seek_list_disables_the_rule():
+    """The config documents `seek_classes: []` as off. An empty list bound to a
+    DuckDB VARCHAR[] must therefore match nothing — not everything, and not
+    raise."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, uncertain_below=0.0, gate_band=0.0, seek_share=1.0,
+                   seek_classes=[])
+        _seed(cfg, [{"side": 100.0, "cls": "behaviour.standing", "p": 0.95,
+                     "cow_p": 0.99, "rev": "r1"}] * 6)
+        reasons = set(_reasons(_serve(cfg)))
+        check("nothing is sought when the list is empty", reasons == {"confident"},
+              str(reasons))
+
+
+def test_abstention_only_promotes_a_crop_worth_answering():
+    """The model abstains for two unrelated reasons: the posture is genuinely
+    ambiguous (worth asking) and the crop is thirty pixels of brown (worth
+    nothing — the annotator skips it). Only size separates them before serving,
+    and in the first production round 28 of the abstained tier's 39 skips were
+    `low_resolution`. Legibility is now a condition of promotion, not just of
+    the tier above."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, abstain_min_px=60, small_share=0.0, uncertain_below=0.75,
+                   gate_band=0.0, seek_classes=[])
+        _seed(cfg,
+              # big and abstained: exactly what the rule is for
+              [{"side": 100.0, "cls": None, "p": 0.30, "cow_p": 0.99, "rev": "r1"}] * 4 +
+              # big and confident: nothing to ask
+              [{"side": 100.0, "cls": "behaviour.lying", "p": 0.99,
+                "cow_p": 0.99, "rev": "r1"}] * 4)
+        head = _reasons(_serve(cfg))[:4]
+        check("a legible abstention leads", set(head) == {"abstained"}, str(head))
+
+        # The floor is real: the same abstention on a small crop is not promoted
+        # ahead of a large confident one.
+        with tempfile.TemporaryDirectory() as d2:
+            cfg2 = _cfg(d2, abstain_min_px=60, small_share=0.0, uncertain_below=0.75,
+                        gate_band=0.0, seek_classes=[])
+            _seed(cfg2,
+                  [{"side": 30.0, "cls": None, "p": 0.30, "cow_p": 0.99, "rev": "r1"}] * 4 +
+                  [{"side": 100.0, "cls": "behaviour.lying", "p": 0.99,
+                    "cow_p": 0.99, "rev": "r1"}] * 4)
+            items = _serve(cfg2)
+            sides = [round(i["bbox"][2] - i["bbox"][0]) for i in items[:4]]
+            check("the legible confident crops still come first",
+                  set(sides) == {100}, str(sides))
+
+
+def test_every_reason_the_queue_emits_is_in_the_vocabulary():
+    """`api.py` stores `queue_reason` only if it is in `QUEUE_REASONS`, else
+    NULL. So a CASE branch added without updating that tuple does not fail — it
+    silently throws away the audit trail that tells us which selector paid for
+    which label, which is the only way the next round can be evaluated."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, uniform_share=0.5, uncertain_below=0.75, gate_band=0.15,
+                   seek_share=1.0, seek_classes=["behaviour.standing"])
+        _seed(cfg,
+              [{"side": 100.0, "cls": "behaviour.standing", "p": 0.95, "cow_p": 0.99, "rev": "r1"}] * 3 +
+              [{"side": 100.0, "cls": "behaviour.lying", "p": 0.60, "cow_p": 0.99, "rev": "r1"}] * 3 +
+              [{"side": 100.0, "cls": None, "p": 0.30, "cow_p": 0.99, "rev": "r1"}] * 3 +
+              [{"side": 100.0, "cls": "behaviour.lying", "p": 0.99, "cow_p": 0.52, "rev": "r1"}] * 3 +
+              [{"side": 100.0}] * 3)
+        seen = {r for r in _reasons(_serve(cfg)) if r is not None}
+        check("every emitted reason is one the store will keep",
+              seen <= set(labeling.QUEUE_REASONS), str(seen - set(labeling.QUEUE_REASONS)))
+        check("...and the new ones are genuinely reachable",
+              {"gate_boundary", "seek_class"} & seen, str(sorted(seen)))
+
+
+def test_the_sought_class_is_capped_to_a_share():
+    """Confidently-predicted crops of a common posture are an enormous pool --
+    far larger than the abstentions or the gate-boundary cases. Uncapped, they
+    crowd the front tier with the one signal carrying no uncertainty at all."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, uncertain_below=0.0, gate_band=0.0, seek_share=0.25,
+                   seek_classes=["behaviour.standing"])
+        _seed(cfg, [{"side": 100.0, "cls": "behaviour.standing", "p": 0.95,
+                     "cow_p": 0.99, "rev": "r1"}] * 120)
+        reasons = _reasons(_serve(cfg))
+        sought = reasons.count("seek_class")
+        check("only a share of the sought crops is promoted",
+              0 < sought < len(reasons), f"{sought} of {len(reasons)}")
+        check("...and it is near the configured share",
+              0.10 < sought / len(reasons) < 0.45, f"{sought / len(reasons):.2f}")
+        # Membership is a pure function of the key, so it survives a re-score.
+        again = _reasons(_serve(cfg))
+        check("the slice is stable across serves", again.count("seek_class") == sought)
+
+
+def test_an_unscored_corpus_is_untouched_by_the_legibility_floor():
+    """THE INVARIANT AN EARLIER DRAFT BROKE, and the reason this test exists.
+
+    The floor was first ANDed onto the weak-posture term -- which is also the
+    term that carries unscored rows through `coalesce(attr_behaviour_p, 0)`. So
+    on any day the model had not scored, every sub-floor crop silently dropped
+    out of `worth_asking`, including the `small_share` slice that exists to stop
+    exactly that. Measured at ~4x fewer small crops served. Nothing raised; the
+    queue looked healthy; the bias would have surfaced months later as a model
+    that fails on distant animals.
+
+    The floor now applies only to rows the model has actually scored, so an
+    unscored corpus must serve in byte-identical order however the floor is set."""
+    with tempfile.TemporaryDirectory() as d:
+        mixed = [{"side": 30.0}] * 60 + [{"side": 100.0}] * 60   # never scored
+        cfg_a = _cfg(d, abstain_min_px=60, small_share=0.15)
+        _seed(cfg_a, mixed)
+        order_a = [i["instance_key"] for i in _serve(cfg_a)]
+        small_a = sum(1 for i in _serve(cfg_a)[:40]
+                      if round(i["bbox"][2] - i["bbox"][0]) == 30)
+
+        # Same store, floor effectively disabled: must be indistinguishable.
+        cfg_b = _cfg(d, abstain_min_px=1, small_share=0.15)
+        order_b = [i["instance_key"] for i in _serve(cfg_b)]
+        check("an unscored corpus serves identically whatever the floor is set to",
+              order_a == order_b, f"first divergence at "
+              f"{next((i for i in range(len(order_a)) if order_a[i] != order_b[i]), None)}")
+        check("...and the small_share slice still reaches the front",
+              small_a > 0, f"{small_a} small crops in the first 40")
+
+
+def test_the_legibility_floor_guards_every_selector():
+    """The floor is not a property of abstention -- it is a property of acting on
+    the model's opinion at all. `gate_boundary` and `seek_class` fire on 30 px of
+    brown just as readily, so one floor guards all three rather than one being
+    bolted onto the first."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, abstain_min_px=60, small_share=0.0, uncertain_below=0.0,
+                   gate_band=0.15, seek_share=1.0, seek_classes=["behaviour.standing"])
+        _seed(cfg,
+              # tiny, and astride the gate: the model is torn, the human cannot help
+              [{"side": 30.0, "cls": "behaviour.lying", "p": 0.99,
+                "cow_p": 0.52, "rev": "r1"}] * 6 +
+              # tiny, and a sought class
+              [{"side": 30.0, "cls": "behaviour.standing", "p": 0.99,
+                "cow_p": 0.99, "rev": "r1"}] * 6 +
+              # legible and astride the gate: this is the one worth serving
+              [{"side": 100.0, "cls": "behaviour.lying", "p": 0.99,
+                "cow_p": 0.52, "rev": "r1"}] * 6)
+        items = _serve(cfg)
+        head = [(round(i["bbox"][2] - i["bbox"][0]), i.get("queue_reason"))
+                for i in items[:6]]
+        check("only the legible gate-boundary crops lead",
+              set(head) == {(100, "gate_boundary")}, str(head))
+
+
 def main():
     print("=== test_queue_active_learning ===")
     test_an_unscored_corpus_behaves_exactly_as_before()
@@ -266,6 +545,16 @@ def main():
     test_uniform_wins_the_label_when_a_row_is_both()
     test_two_annotators_still_meet_in_the_middle()
     test_progress_still_agrees_with_what_the_queue_will_serve()
+    test_the_bound_parameters_line_up_with_the_placeholders()
+    test_a_crop_astride_the_gate_threshold_is_asked_about()
+    test_an_unscored_crop_is_not_mistaken_for_a_gate_boundary()
+    test_seeking_a_scarce_class_claims_only_the_confident_ones()
+    test_an_empty_seek_list_disables_the_rule()
+    test_abstention_only_promotes_a_crop_worth_answering()
+    test_every_reason_the_queue_emits_is_in_the_vocabulary()
+    test_the_sought_class_is_capped_to_a_share()
+    test_an_unscored_corpus_is_untouched_by_the_legibility_floor()
+    test_the_legibility_floor_guards_every_selector()
     print("\n" + ("PASS" if not _FAILED else f"{_FAILED} FAILED"))
     sys.exit(1 if _FAILED else 0)
 

@@ -189,6 +189,59 @@ class AnnotationCfg(BaseModel):
     uncertain_below: float = 0.75   # ask when the model's posture confidence is under this
     uniform_share: float = 0.25     # held out of the rule, as a marked random sample
 
+    # --- What the first round of active learning actually bought (2026-09-25) ---
+    # `queue_reason` is recorded on every annotation, so the selector could be
+    # audited against the model it fed. 497 labels in, judged against the 5-fold
+    # CV of the model trained on them:
+    #
+    #   abstained      yields 22% not_visible vs uniform's 6% -- 3.7x, and
+    #                  not_visible is the ONLY class that clearly improved
+    #                  (+0.047, 3.6x the fold spread). The rule works.
+    #   BUT it spends 53% of its budget on `feeding`, already the most abundant
+    #                  class, and finds no more `standing` than random sampling
+    #                  does (20% vs 20%) -- and `standing` did not improve at all
+    #                  (-0.001). 28 of its 39 skips are `low_resolution`.
+    #
+    # The cause is that `uncertain_below` reads MAX PROBABILITY, which cannot
+    # tell "torn between standing and feeding" (informative -- it is the dominant
+    # confusion, 177 of the behaviour errors) from "flat over four classes on an
+    # unreadable smudge" (a skip). The three knobs below add the signals the max
+    # cannot express.
+
+    # A crop whose cow/not-cow probability sits near the gate's own threshold is
+    # the one that would move the gate. Nothing looked at `attr_cow_p` before, and
+    # the gate's recall duly sat still (0.885 -> 0.895) while 44 not-cows kept
+    # passing as cows. Half-width of the band around `instance_attrs.cow_threshold`.
+    gate_band: float = 0.15
+
+    # Classes the queue should go looking for, by the model's OWN prediction.
+    # Not "rare in the corpus" -- rare in the TRAINING SET and weak in validation:
+    # standing (n=535, F1 0.735) against feeding's n=969. Empty disables the rule.
+    #
+    # `behaviour.not_visible` is deliberately NOT here, though it is the weakest
+    # class of all (F1 0.473, n=256). It cannot be: `infer.score_detections`
+    # picks the written class with `max(subst_i, ...)` over the SUBSTANTIVE
+    # classes only, and writes NULL when it would have chosen not_visible -- so
+    # `attr_behaviour` is never that value (production: 0 rows of 46,486) and
+    # listing it here would match nothing. Those crops are precisely the
+    # abstentions, which the weak-posture selector already catches.
+    seek_classes: list[str] = ["behaviour.standing"]
+
+    # Of the crops matching `seek_classes`, the share actually promoted.
+    # Confidently-predicted crops of a common posture are an enormous pool --
+    # far larger than the abstentions or the gate-boundary cases -- so an
+    # uncapped rule would crowd the front tier with the one signal that carries
+    # no uncertainty at all. Membership is a hash of the instance key, like
+    # every other share here, so it is stable and needs no table.
+    seek_share: float = 0.25
+
+    # Abstention promotes a crop only if it is at least this legible. The model
+    # abstains for two different reasons -- "this posture is genuinely ambiguous"
+    # (worth asking) and "this is 30 pixels of brown" (worth nothing, and the
+    # annotator skips it). Only the crop size separates them before serving.
+    # Defaults to clear_instance_px when None.
+    abstain_min_px: int | None = None
+
 
 class BackupCfg(BaseModel):
     """Weekly zip of the label store, posted to a Discord webhook.

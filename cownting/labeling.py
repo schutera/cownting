@@ -250,8 +250,10 @@ def verify_anchor(instance_key: str, anchor: AnchorLike) -> bool:
 QUEUE_REASONS: tuple[str, ...] = (
     "uniform",         # held out of the uncertainty rule, as a marked random sample
     "unscored",        # the model has no opinion on this crop yet
+    "gate_boundary",   # its cow/not-cow probability sits astride the gate threshold
     "abstained",       # it looked and declined to name a posture (M5 §9.3)
     "low_confidence",  # it named one, with support under annotation.uncertain_below
+    "seek_class",      # CONFIDENTLY predicted as a class training is short of
     "confident",       # it is sure; served only once the others are exhausted
 )
 
@@ -278,7 +280,8 @@ def hex_threshold(fraction: float) -> str:
 
 # --------------------------------------------------------------------------- the queue
 def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
-              dataset: str | None, camera: str | None, day: str | None) -> tuple[str, list]:
+              dataset: str | None, camera: str | None, day: str | None,
+              cow_threshold: float = 0.5) -> tuple[str, list]:
     """The CTE chain every queue/progress read starts from, plus its parameters.
 
     Ends at a relation named `scoped` carrying one row per live detection with its
@@ -327,9 +330,21 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
     # Positional and order-sensitive: clear-tier (2), ask-tier (2), overlap (1),
     # target CASE (3), mine (1), mymask (1), then the hard floor (1) — matching
     # the order the placeholders appear in the SQL below.
+    abstain_px = cfg.abstain_min_px if cfg.abstain_min_px is not None else cfg.clear_instance_px
     params += [cfg.clear_instance_px, hex_threshold(cfg.small_share),
-               cfg.uncertain_below, hex_threshold(cfg.uniform_share),
-               hex_threshold(cfg.uniform_share), cfg.uncertain_below,
+               # worth_asking, in the order the SQL reads: uniform slice, then
+               # the legibility gate (px OR the small-share escape), then the
+               # three selectors it guards.
+               hex_threshold(cfg.uniform_share),
+               abstain_px, hex_threshold(cfg.small_share),
+               cfg.uncertain_below,
+               cow_threshold, cfg.gate_band,
+               list(cfg.seek_classes), hex_threshold(cfg.seek_share),
+               # queue_reason, in the order the CASE tests
+               hex_threshold(cfg.uniform_share),
+               cow_threshold, cfg.gate_band,
+               cfg.uncertain_below,
+               list(cfg.seek_classes), hex_threshold(cfg.seek_share),
                threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance,
                annotator, annotator, cfg.min_instance_px]
 
@@ -384,16 +399,79 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    -- order falls through to the permutation below unchanged.
                    -- An abstained row keeps `attr_behaviour_p` (M5 §9.3) and so
                    -- lands here on its merits rather than through the coalesce.
-                   (coalesce(k.attr_behaviour_p, 0) < ?
-                    OR substr(md5('uni' || k.instance_key), 1, 4) < ?) AS worth_asking,
+                   -- WHAT WOULD TEACH THE MODEL SOMETHING.
+                   --
+                   -- Three groups, and the grouping is the correctness argument,
+                   -- not tidiness:
+                   --
+                   --  1. UNSCORED rows pass free. The model has no opinion, so no
+                   --     opinion-based rule can apply, and the partition is
+                   --     uniformly true exactly as it was before any of this
+                   --     existed. A first draft ANDed the legibility floor onto
+                   --     the weak-posture term -- which is ALSO the term that
+                   --     carries unscored rows through `coalesce(p, 0)` -- and so
+                   --     silently throttled small crops on every unscored day by
+                   --     ~4x, breaking the invariant two lines of comment below
+                   --     claim. Measured, not theorised.
+                   --  2. The UNIFORM slice passes free too. It is the unbiased
+                   --     sample; gating it on anything is what would bias it.
+                   --  3. Everything else is a SELECTOR -- a rule that acts on the
+                   --     model's opinion -- and every selector is gated on
+                   --     legibility, because the model is least sure on exactly
+                   --     the crops a human cannot read either. That is one floor
+                   --     for all three rather than one bolted onto the first:
+                   --     `gate_boundary` and `seek_class` are no less prone to
+                   --     firing on 30 px of brown than abstention was. The
+                   --     `small_share` escape is the same one the `clear` tier
+                   --     uses, so a crop deliberately promoted for being small
+                   --     is not simultaneously demoted for it.
+                   --
+                   -- The selectors themselves: the posture call is weak (or
+                   -- absent, which is abstention); the cow/not-cow probability
+                   -- straddles the gate threshold, the only rule that can move
+                   -- the gate; or the predicted class is one training is short of
+                   -- -- capped to a share, because confidently-predicted crops of
+                   -- a common posture are a huge pool and would otherwise crowd
+                   -- out the two rules that carry real uncertainty.
+                   (k.attr_model_rev IS NULL
+                    OR substr(md5('uni' || k.instance_key), 1, 4) < ?
+                    OR ((greatest(k.bbox_x2 - k.bbox_x1, k.bbox_y2 - k.bbox_y1) >= ?
+                         OR substr(md5('sm' || k.instance_key), 1, 4) < ?)
+                        AND (coalesce(k.attr_behaviour_p, 0) < ?
+                             OR (k.attr_cow_p IS NOT NULL AND abs(k.attr_cow_p - ?) < ?)
+                             OR (k.attr_behaviour IS NOT NULL
+                                 AND list_contains(?::VARCHAR[], k.attr_behaviour)
+                                 AND substr(md5('seek' || k.instance_key), 1, 4) < ?)))
+                   ) AS worth_asking,
                    -- Why it was served, recorded on the annotation so a later
                    -- analysis can separate the uniform sample from the actively
                    -- selected one. `uniform` is checked FIRST: a row can satisfy
                    -- both, and the unbiased slice is the claim that must survive.
+                   -- The ORDER is the claim, because a row can satisfy several
+                   -- rules and only one reason is recorded — the audit next round
+                   -- depends on which gets the credit.
+                   --   `uniform` first: the unbiased slice is the claim that must
+                   --     survive, whatever else a row also happens to be.
+                   --   `gate_boundary` next: it is a different axis from posture
+                   --     uncertainty, and the gate is what decides whether an
+                   --     animal is counted at all.
+                   --   then the two UNCERTAINTY rules, because a crop the model is
+                   --     unsure of teaches more than one it is sure of;
+                   --   and `seek_class` LAST of the selectors, so it means what it
+                   --     says: confidently predicted, and wanted only because
+                   --     training is short of that class. Ahead of the uncertainty
+                   --     rules it would have swallowed them (every unsure
+                   --     `standing` would report `seek_class`) and the audit could
+                   --     no longer tell balancing from teaching.
                    CASE WHEN substr(md5('uni' || k.instance_key), 1, 4) < ? THEN 'uniform'
                         WHEN k.attr_model_rev IS NULL                       THEN 'unscored'
+                        WHEN k.attr_cow_p IS NOT NULL
+                             AND abs(k.attr_cow_p - ?) < ?                  THEN 'gate_boundary'
                         WHEN k.attr_behaviour IS NULL                       THEN 'abstained'
                         WHEN k.attr_behaviour_p < ?                         THEN 'low_confidence'
+                        WHEN k.attr_behaviour IS NOT NULL
+                             AND list_contains(?::VARCHAR[], k.attr_behaviour)
+                             AND substr(md5('seek' || k.instance_key), 1, 4) < ? THEN 'seek_class'
                         ELSE 'confident' END AS queue_reason,
                    -- The MODEL's outline. `ranked` is SELECT d.* so it arrives
                    -- here for free, but this projection is explicit, so without
@@ -507,7 +585,8 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
 
     with attached_labels(con, config) as alias:
         cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
-                                camera=camera, day=day)
+                                camera=camera, day=day,
+                                cow_threshold=config.instance_attrs.cow_threshold)
         # `NOT s.false_positive` is unconditional — it is not a preference like
         # `mine`, and no filter combination may bring back an instance somebody
         # has judged not to be an animal.
@@ -600,7 +679,8 @@ def progress(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str =
     cfg = config.annotation
     with attached_labels(con, config) as alias:
         cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
-                                camera=camera, day=None)
+                                camera=camera, day=None,
+                                cow_threshold=config.instance_attrs.cow_threshold)
         params += [cfg.skip_retire, cfg.skip_retire, cfg.skip_retire]
         rows = _rows(con, f"""{cte}
             SELECT count(*)                                              AS pool_total,
