@@ -15,20 +15,34 @@ Present numbers, then ask. Never start either on your own initiative.
 
 ## The drill
 
-**0 · Back up the labels first.** Annotator hours are the only state a re-ingest
-cannot rebuild. `POST /api/labels/backup/run` (or `cownting labels backup
---force`). Note that a `--force` run is an extra copy, not a substitute for the
-weekly one. Never print the webhook URL — pipe through
-`sed -E "s#https://[^ ]*#<redacted>#gi"`.
+Both scripts below are read-only and run inside the container:
 
-**1 · Measure what actually landed.** `GET /api/label/progress` for counts, and
-`queue_reason` on the new annotations for *which selector paid for them* (see
-step 9). Say how many new labels there are before claiming anything about them.
+```bash
+S=.claude/skills/new-labels/scripts/label-delta.py      # or verify-rescore.py
+B=$(basename $S) && scp $S <box>:/tmp/ && ssh <box> \
+  "docker cp /tmp/$B cownting-cownting-1:/tmp/ &&
+   docker exec -u cownting cownting-cownting-1 python /tmp/$B"
+```
 
-**2 · Build the crop dataset — with the container stopped.**
-`attrs build-dataset` takes a DuckDB write handle, and DuckDB allows one
-read-write process per file: run it against a live server and the site goes
-down, it does not merely slow.
+**0 · Is there enough new work? Gate on this before touching anything.** Run
+[scripts/label-delta.py](scripts/label-delta.py). It compares the live store against the **deployed model's own dataset manifest**
+and exits non-zero when a retrain would chase noise. It counts `annotations`
+UNION `mask_edits`, which is the training population — counting answers alone
+understates it by hundreds of instances (VALIDATION.md trap 2b).
+
+NOT ENOUGH means **stop here**: report the numbers, say why you are not
+retraining, and do not back up, stop the container or build anything. "41 new
+instances, +1.4%, inside the fold spread" is a complete answer.
+
+**1 · Back up the labels.** Only now, because the next step stops the container.
+Annotator hours are the only state a re-ingest cannot rebuild.
+`POST /api/labels/backup/run` (or `cownting labels backup --force` — an extra
+copy, no longer a substitute for the weekly one). Never print the webhook URL:
+pipe through `sed -E "s#https://[^ ]*#<redacted>#gi"`.
+
+**2 · Build the crop dataset — with the container stopped.** `build-dataset`
+takes a DuckDB write handle and DuckDB allows one read-write process per file, so
+against a live server the site goes down, not merely slow.
 
 ```bash
 docker compose stop cownting
@@ -45,39 +59,43 @@ Copy the dataset off the box (a few MB) and work locally from here.
 py -3.11 -m cownting.cli attrs cv -c config/cownting.yaml --out cv_new.json
 ```
 
-Run it for the **current recipe on the new label set** and, if you are changing
-anything about the recipe, for each variant. Read `VALIDATION.md` before you
-compare anything — the two ways this goes wrong have both already happened here,
-and both produced a confident recommendation that was wrong.
+Run it for the current recipe on the new label set, and for each variant if you
+are changing the recipe. **Read [VALIDATION.md](VALIDATION.md) before comparing
+anything** — four ways this goes wrong, every one of them already made here.
 
-**4 · Decide, and show your work.** Report pooled mean macro-F1, the fold
-spread, and per-class deltas — with the spread stated next to them so a delta
-inside it is visibly noise. If it is not better, say so and stop; a null result
-is a result.
+**4 · Decide, and show your work.** Pooled mean macro-F1, the fold spread, and
+per-class deltas with the spread beside them so noise is visibly noise. Not
+better? Say so and stop; a null result is a result.
 
 **5 · Train the checkpoint you intend to ship.** `attrs train` writes
-`data/models/instance_attrs.pt` and, beside it, `instance_attrs.metrics.json`
-(`<weights-stem>.metrics.json`). That report is the held-out 20% of one split and
-is **optimistic** — quote CV for decisions and this only as "what the shipped
-checkpoint scored on its own split".
+`data/models/instance_attrs.pt` and `instance_attrs.metrics.json` beside it. That
+report is one split's held-out 20% and is **optimistic** — quote CV for
+decisions, this only as "what the shipped checkpoint scored on its own split".
 
 **6 · Ship it.** See `SHIP.md` — the deploy has a hook-blocked push and a
 permanently-dirty prod config, so `git pull` on the box does not work.
 
-**7 · Rescore, once the user has said yes.** Through the API or the request
-file, never the CLI — it must run in-process on the upload queue. Overlays
-repaint themselves afterwards. `SHIP.md` has the commands and the
-overlay-archiving caveat.
+**7 · Rescore, once the user has said yes.** Via the API or the request file,
+never the CLI — it must run in-process. A **new** rev makes the plain call cover
+the whole corpus; `rescore=true` is for re-running the *same* rev and makes the
+pass non-resumable. Overlays repaint themselves. See `SHIP.md`.
 
-**8 · Verify on the box, not from memory.** `GET /api/attrs/status`: `scored`
-should equal `detections` and `revs` should be `1`. If `revs` is 2 the corpus is
-half-scored by two models and every count is a blend.
+**8 · Verify on the box, not from memory.** Run
+[scripts/verify-rescore.py](scripts/verify-rescore.py).
 
-**9 · Audit what the queue bought.** The point of `queue_reason` is that the
-selector can be judged against the model it fed. For each reason bucket, compare
-the class mix it produced against `uniform` (the unbiased slice), and check which
-classes actually moved in CV. Feed that back into `annotation.seek_classes` /
-`gate_band` / `abstain_min_px` — that is how the next round gets cheaper.
+`scored == detections` is **not** a sufficient check and can be impossible to
+satisfy — a crop the timestamp-banner mask refuses is skipped without a rev and
+pins its frame pending forever. And `revs == 1` cannot see unscored rows at all,
+because `count(DISTINCT ...)` ignores NULL. The script knows this, checks the
+overlays too, and names the data no rescore reaches. See `SHIP.md`.
+
+**9 · Audit what the queue bought.** `queue_reason` exists so the selector can be
+judged against the model it fed. Per bucket, compare the class mix against
+`uniform` (the unbiased control) and check which classes actually moved in CV,
+then feed that into `annotation.seek_classes` / `gate_band` / `abstain_min_px`.
+`uniform` **can be empty** — membership is a hash of the key, so a small batch
+may contain none, and then there is no control and no audit. Say that rather than
+comparing selectors against each other.
 
 **10 · Report.** Distinguish the three estimators explicitly; they answer
 different questions and are not comparable. `VALIDATION.md` §Reporting has the
@@ -85,5 +103,7 @@ shape.
 
 ## Files
 
+- [scripts/label-delta.py](scripts/label-delta.py) — step 0's gate; run it first, every time
+- [scripts/verify-rescore.py](scripts/verify-rescore.py) — step 8; the naive checks do not work
 - [VALIDATION.md](VALIDATION.md) — how to compare two models without fooling yourself
 - [SHIP.md](SHIP.md) — deploy, rescore, verify, and how to back out

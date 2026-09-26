@@ -78,6 +78,14 @@ curl -X POST 'https://<host>/api/attrs/score'                 # whole corpus, re
 curl -X POST 'https://<host>/api/attrs/score?dataset=<day>'   # one day first, to look
 ```
 
+**Do NOT pass `rescore=true` for a new model.** `pending_frames` selects on
+`attr_model_rev IS NULL OR attr_model_rev <> <the new rev>`, so a new checkpoint
+already matches every row in the corpus — the plain call rescores all of it.
+`rescore=true` exists only to re-run the **same** rev, and it is the flag that
+makes a pass non-resumable: with it, an interruption restarts from zero instead
+of continuing. The `rescore=true` in the back-out section below is for putting
+the PREVIOUS checkpoint back, where the rev is one the rows already carry.
+
 Without a browser session, from a shell on the box:
 
 ```bash
@@ -104,21 +112,66 @@ A repaint that yielded to an upload part-way re-queues itself and says so in the
 job message. To force one by hand: `POST /api/reoverlay` (or `?force=true` to
 repaint frames already stamped current).
 
+## What a rescore does NOT reach
+
+"Whole corpus" means `FROM detections` in the live DB. Three pockets sit outside
+it, in every mode — including `rescore=true` and an explicit `?dataset=`:
+
+- **`clipped_detections` / `clipped_frames`.** A camera clip MOVES rows here.
+  `restore_clip` puts them back carrying whatever rev they left with, or none.
+  **Re-score after any restore** — nothing does it for you and nothing warns.
+  (On this box today: 23 rows for `2025-10-15 / camera_03`, all unscored. They
+  would be counted as cows on restore, because the gate reads
+  `coalesce(attr_is_cow, TRUE)`.)
+- **The archive DB.** Archived days are never scored, and there is no implemented
+  restore — `archive_dataset`'s "could be restored by the reverse move" is not
+  code. An archive written before M5 has no `attr_*` columns at all.
+- **Rows whose crop cannot be rendered.** Not a disk fault: `render_crop`
+  deterministically refuses a crop the timestamp banner would cover more than
+  `max_banner_fraction` of, and these cameras look down with the herd crossing
+  the bottom of frame. Such a row is skipped WITHOUT a rev, and because a frame
+  is pending if any of its detections lacks the rev, that frame stays pending
+  forever. If it had been scored before, it keeps its OLD rev — which is the real
+  way a corpus ends up holding two models at once.
+
 ## Verify — on the box, not from memory
 
-`GET /api/attrs/status`:
+Run [scripts/verify-rescore.py](scripts/verify-rescore.py). It exists because the
+two obvious checks are both wrong:
 
-- `scored == detections` — the pass finished.
-- `revs == 1` — **the one that matters.** `revs == 2` means the corpus is
-  half-scored by two models and every count is a blend of them.
-- `not_cow` — what the gate would remove. Compare against what you expected from
-  CV's `not_cow` recall before assuming a scoring bug.
-- `unsure` — abstentions. Expect roughly the CV coverage figure.
+- `scored == detections` may be **unsatisfiable** (see the unrenderable case
+  above). The honest check is `scored + unscorable == detections`, with the
+  shortfall recorded once as a baseline. The pass reports its own `unreadable`
+  count in the job message on `GET /api/uploads` — read it and reconcile.
+- `revs == 1` **cannot see unscored rows**: `count(DISTINCT attr_model_rev)`
+  ignores NULL. It catches a stale-rev mix, which is the case that matters, but
+  not an incomplete pass.
 
-Then pull the live class distribution and the confidence separation: the lowest
-confidence ever *shown* and the highest ever *withheld* should both sit at
-`abstain_min_conf`. If they do not, the deployed checkpoint is not the one you
-validated.
+Two more things it checks that nothing else does: that the single rev present is
+actually the deployed one, and that no frame carries two revs at once — the
+repaint resolves a frame's rev with `max(attr_model_rev)`, a **lexicographic** max
+over sha256 prefixes rather than a version, so a mixed frame can be stamped with
+the OLDER rev and then read as clean forever.
+
+Then check `GET /api/attrs/status` for `not_cow` (what the gate removes — compare
+against CV's `not_cow` recall before assuming a bug) and `unsure` (abstentions,
+expect roughly the CV coverage figure), and confirm the confidence separation:
+the lowest confidence ever *shown* and the highest ever *withheld* should both
+sit at `abstain_min_conf`. If they do not, the deployed checkpoint is not the one
+you validated.
+
+## If you changed a THRESHOLD instead of the weights
+
+`cow_threshold`, `abstain_min_conf` and `abstain_nv_p` change the verdicts without
+changing the checkpoint, so the rev does not move. Consequences:
+
+- The score pass needs `rescore=true`, because the default skips rows already
+  carrying that rev.
+- **The chained repaint will not fire.** `_run_attrs_score` calls
+  `pipeline.reoverlay` with `force` at its default False, and the staleness
+  predicate compares `overlay_rev` against the detections' rev — unchanged, so
+  every frame reads as clean while its mask decisions have actually changed. Run
+  `POST /api/reoverlay?force=true` by hand.
 
 ## Backing out
 

@@ -39,6 +39,37 @@ better and was worse.
 exist, re-score the baseline on the variant's population too, and report both
 numbers on both populations. If you cannot do that, you cannot compare them.
 
+## Trap 2b — the training population is `annotations` UNION `mask_edits`
+
+This one caught me while running this drill for real, and it is the easiest of
+the lot to fall into because the wrong query looks so obviously right.
+
+`v_current_answers` is **annotations only**. The `cow` head does not come from
+there — it comes from `mask_edits`, where a `false_positive` verdict means
+`not_cow` and `ok`/`polygon` mean `cow` (instance_attrs/dataset.py). So:
+
+- counting `SELECT count(DISTINCT effective_key) FROM v_current_answers` gave
+  2,567 against a deployed manifest of 2,973, and
+- the difference looked like **444 training instances had vanished from the
+  store** — a data-loss emergency.
+
+Nothing had vanished. Those 444 were cow-gate-only instances: 413 `not_cow` and
+31 `cow`, every one of them with `sun_exposure` and `behaviour` NULL, because a
+geometry verdict answers neither question. Counting the union gave 3,014
+instances, of which 2,973 were exactly the deployed set and 41 were genuinely
+new.
+
+`scripts/label-delta.py` does this correctly. Use it rather than writing the
+query again.
+
+Two related details worth not re-deriving:
+
+- Compare against the **deployed model's `manifest.json` keys**, not a remembered
+  training count. The manifest is the only authority on what the model saw.
+- `manifest.json`'s `instance_key` field holds the store's `effective_key` at
+  build time, so join on `effective_key`. Joining on `annotations.instance_key`
+  will diverge for anything a re-ingest re-keyed.
+
 ## Trap 3 — per-class deltas inside the fold spread mean nothing
 
 The CV output carries `spread.mean_macro_f1` — read the std from there, never
