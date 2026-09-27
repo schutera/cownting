@@ -63,9 +63,19 @@ ssh <box> 'cd /opt/cownting && docker compose up -d --build'
 ssh <box> 'cd /opt/cownting && docker compose ps'    # wait for (healthy)
 ```
 
-Caddy now waits on the app's healthcheck (`condition: service_healthy`), and the
-Dockerfile allows a 45 s start period, so the first ~45 s of a deploy is expected
-to look idle. That is not a hang.
+**Read `docker-compose.override.yml` on the box before reasoning about the
+topology.** It is gitignored and server-local, so it is invisible from here, and
+on this deployment it changes three things that matter: it publishes the app to
+`127.0.0.1:8090` (NOT 8000 — a stale docker-proxy still holds that port and
+answers 404, which looks exactly like a broken deploy), it caps the container at
+6 GB / 3.5 CPU, and it **disables the compose Caddy service entirely**
+(`profiles: ["disabled"]`). Caddy runs on the HOST instead, fronting several
+unrelated stacks.
+
+So the `condition: service_healthy` that `docker-compose.yml` now puts on the
+compose Caddy is inert here — host Caddy does NOT wait for the app's 45 s start
+period, and will serve 502s across a restart. Curl the app on 8090 from the box,
+or inside the container on 8000; curling host :8000 tells you nothing.
 
 ## Rescore — only after the user has said yes
 
