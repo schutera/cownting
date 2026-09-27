@@ -248,6 +248,7 @@ def verify_anchor(instance_key: str, anchor: AnchorLike) -> bool:
 # The vocabulary `_scan_sql`'s queue_reason CASE can emit, and therefore the
 # only values the submit route will store. Ordered as the CASE tests them.
 QUEUE_REASONS: tuple[str, ...] = (
+    "under_panel",     # standing in a solar panel's shade — the distinctive subset
     "uniform",         # held out of the uncertainty rule, as a marked random sample
     "unscored",        # the model has no opinion on this crop yet
     "gate_boundary",   # its cow/not-cow probability sits astride the gate threshold
@@ -340,10 +341,17 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                cfg.uncertain_below,
                cow_threshold, cfg.gate_band,
                list(cfg.seek_classes), hex_threshold(cfg.seek_share),
-               # queue_reason, in the order the CASE tests: uniform, then the
-               # legibility gate the three selectors are all subject to, then
-               # the selectors themselves.
+               bool(cfg.under_panel_first),
+               # under_panel_now: the same flag, then the same legibility gate
+               # again, because this column is evaluated independently of
+               # worth_asking above.
+               bool(cfg.under_panel_first), abstain_px, hex_threshold(cfg.small_share),
+               # queue_reason, in the order the CASE tests: uniform, under_panel
+               # (with its own copy of the flag and the floor), then the
+               # legibility gate the three remaining selectors share, then those
+               # selectors.
                hex_threshold(cfg.uniform_share),
+               bool(cfg.under_panel_first), abstain_px, hex_threshold(cfg.small_share),
                abstain_px, hex_threshold(cfg.small_share),
                cow_threshold, cfg.gate_band,
                cfg.uncertain_below,
@@ -444,8 +452,20 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                              OR (k.attr_cow_p IS NOT NULL AND abs(k.attr_cow_p - ?) < ?)
                              OR (k.attr_behaviour IS NOT NULL
                                  AND list_contains(?::VARCHAR[], k.attr_behaviour)
-                                 AND substr(md5('seek' || k.instance_key), 1, 4) < ?)))
+                                 AND substr(md5('seek' || k.instance_key), 1, 4) < ?)
+                             -- Under a panel: the subset the whole deployment
+                             -- exists to measure. Gated on legibility like every
+                             -- other selector, because shade makes these crops
+                             -- HARDER to read, not easier.
+                             OR (? AND k.under_panel)))
                    ) AS worth_asking,
+                   -- A separate column from the reason, because it is also a SORT
+                   -- key: `worth_asking` only decides membership of a tier, and
+                   -- "next" means ahead of the rest of that tier.
+                   (? AND coalesce(k.under_panel, FALSE)
+                        AND (greatest(k.bbox_x2 - k.bbox_x1,
+                                      k.bbox_y2 - k.bbox_y1) >= ?
+                             OR substr(md5('sm' || k.instance_key), 1, 4) < ?)) AS under_panel_now,
                    -- Why it was served, recorded on the annotation so a later
                    -- analysis can separate the uniform sample from the actively
                    -- selected one. `uniform` is checked FIRST: a row can satisfy
@@ -480,6 +500,14 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    -- An illegible crop falls through to `confident`, which is
                    -- accurate: nothing selected it, it was served off the tail.
                    CASE WHEN substr(md5('uni' || k.instance_key), 1, 4) < ? THEN 'uniform'
+                        -- Ahead of `unscored` and the rest: for a row under a
+                        -- panel that IS why it was served, and the audit needs to
+                        -- be able to count exactly that.
+                        WHEN ? AND k.under_panel
+                             AND (greatest(k.bbox_x2 - k.bbox_x1,
+                                           k.bbox_y2 - k.bbox_y1) >= ?
+                                  OR substr(md5('sm' || k.instance_key), 1, 4) < ?)
+                                                                            THEN 'under_panel'
                         WHEN k.attr_model_rev IS NULL                       THEN 'unscored'
                         WHEN NOT (greatest(k.bbox_x2 - k.bbox_x1,
                                            k.bbox_y2 - k.bbox_y1) >= ?
@@ -647,7 +675,8 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             SELECT s.*, count(*) OVER () AS matching
             FROM scoped s
             WHERE {' AND '.join(where)}
-            ORDER BY {day_term}(NOT s.clear), (NOT s.worth_asking), md5(? || s.instance_key)
+            ORDER BY {day_term}(NOT s.clear), (NOT s.under_panel_now),
+                     (NOT s.worth_asking), md5(? || s.instance_key)
             LIMIT ?
             """, params)
 

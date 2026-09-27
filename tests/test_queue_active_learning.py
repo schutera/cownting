@@ -93,7 +93,8 @@ def _seed(cfg: Config, rows_in: list[dict]) -> None:
             bbox_x1=0.0, bbox_y1=0.0, bbox_x2=side, bbox_y2=side,
             area_px=side * side, posture="standing",
             attr_behaviour=r.get("cls"), attr_behaviour_p=r.get("p"),
-            attr_cow_p=r.get("cow_p"), attr_model_rev=r.get("rev")))
+            attr_cow_p=r.get("cow_p"), attr_model_rev=r.get("rev"),
+            under_panel=r.get("under_panel")))
     con = db.connect(cfg.paths.db_path)
     db.init_db(con)
     db.insert_detections(con, pd.DataFrame(rows))
@@ -298,8 +299,13 @@ def test_the_bound_parameters_line_up_with_the_placeholders():
         cfg.uncertain_below,                                 #   selector 1: weak posture
         0.55, cfg.gate_band,                                 #   selector 2: gate band
         ["behaviour.standing"], hx(cfg.seek_share),          #   selector 3: sought class, capped
+        cfg.under_panel_first,                               #   selector 4: under a panel
+        cfg.under_panel_first,                               # under_panel_now: flag...
+        cfg.abstain_min_px, hx(cfg.small_share),             #   ...and its own legibility gate
         hx(cfg.uniform_share),                               # reason: uniform (tested first)
-        cfg.abstain_min_px, hx(cfg.small_share),             # reason: the same legibility gate
+        cfg.under_panel_first,                               # reason: under_panel flag...
+        cfg.abstain_min_px, hx(cfg.small_share),             #   ...and its floor again
+        cfg.abstain_min_px, hx(cfg.small_share),             # reason: the shared legibility gate
         0.55, cfg.gate_band,                                 # reason: gate_boundary
         cfg.uncertain_below,                                 # reason: low_confidence
         ["behaviour.standing"], hx(cfg.seek_share),          # reason: seek_class
@@ -607,6 +613,69 @@ def test_the_reason_and_the_rule_agree_across_a_realistic_corpus():
               not bad, f"{len(bad)} do not, e.g. {bad[:4]}")
 
 
+def test_a_cow_under_a_panel_is_served_next():
+    """Agrivoltaic shade use is the one question this deployment can answer that
+    a barn dataset cannot, and `under_panel` is TRUE on a few hundred of ~46k
+    detections — so those crops are worth spending annotator time on ahead of an
+    equally legible cow standing in the open.
+
+    Ahead of `worth_asking`, behind `clear`: shade makes a crop HARDER to read,
+    so the legibility floor applies here exactly as it does to the other
+    selectors."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d, uncertain_below=0.0, gate_band=0.0, seek_classes=[],
+                   abstain_min_px=60, small_share=0.0, under_panel_first=True)
+        _seed(cfg, [
+            # confident, legible, in the open — the model wants nothing from these
+            {"side": 100.0, "cls": "behaviour.lying", "p": 0.99, "cow_p": 0.99,
+             "rev": "r1"} for _ in range(20)
+        ] + [
+            # same in every way EXCEPT that it stands under a panel
+            {"side": 100.0, "cls": "behaviour.lying", "p": 0.99, "cow_p": 0.99,
+             "rev": "r1", "under_panel": True} for _ in range(4)
+        ] + [
+            # under a panel but far too small to answer — must NOT be promoted
+            {"side": 30.0, "cls": "behaviour.lying", "p": 0.99, "cow_p": 0.99,
+             "rev": "r1", "under_panel": True} for _ in range(4)
+        ])
+        items = _serve(cfg)
+        head = items[:4]
+        check("the first four served are all under a panel",
+              all(i.get("queue_reason") == "under_panel" for i in head),
+              str(_reasons(items)[:8]))
+        check("...and all of them are legible",
+              all(round(i["bbox"][2] - i["bbox"][0]) == 100 for i in head),
+              str([round(i["bbox"][2] - i["bbox"][0]) for i in head]))
+        n_up = sum(1 for r in _reasons(items) if r == "under_panel")
+        check("exactly the four legible panel crops carry the reason",
+              n_up == 4, f"{n_up}")
+        check("the illegible panel crops are not promoted",
+              all(r != "under_panel" for i, r in zip(items, _reasons(items))
+                  if round(i["bbox"][2] - i["bbox"][0]) == 30), str(_reasons(items)))
+
+
+def test_the_under_panel_rule_can_be_turned_off():
+    """It is a config flag, and a flag nobody can turn off is not a flag. With it
+    off the queue must behave exactly as it did before the rule existed."""
+    with tempfile.TemporaryDirectory() as d:
+        rows = [{"side": 100.0, "cls": "behaviour.lying", "p": 0.99, "cow_p": 0.99,
+                 "rev": "r1", "under_panel": i % 5 == 0} for i in range(30)]
+        a = _cfg(d, uncertain_below=0.0, gate_band=0.0, seek_classes=[],
+                 under_panel_first=False)
+        _seed(a, rows)
+        off = [i["instance_key"] for i in _serve(a)]
+        check("with the rule off, no row claims the reason",
+              "under_panel" not in _reasons(_serve(a)), str(set(_reasons(_serve(a)))))
+
+        b = _cfg(d, uncertain_below=0.0, gate_band=0.0, seek_classes=[],
+                 under_panel_first=True)
+        on = [i["instance_key"] for i in _serve(b)]
+        check("with it on, the order actually changes", off != on,
+              "the rule had no effect at all — it is not wired in")
+        check("...and the same rows are still all served, just re-ordered",
+              sorted(off) == sorted(on), "the rule DROPPED rows, which it must never do")
+
+
 def main():
     print("=== test_queue_active_learning ===")
     test_an_unscored_corpus_behaves_exactly_as_before()
@@ -629,6 +698,8 @@ def main():
     test_the_legibility_floor_guards_every_selector()
     test_a_reason_is_never_credited_to_a_rule_that_did_not_promote_the_row()
     test_the_reason_and_the_rule_agree_across_a_realistic_corpus()
+    test_a_cow_under_a_panel_is_served_next()
+    test_the_under_panel_rule_can_be_turned_off()
     print("\n" + ("PASS" if not _FAILED else f"{_FAILED} FAILED"))
     sys.exit(1 if _FAILED else 0)
 

@@ -227,6 +227,20 @@ class AnnotationCfg(BaseModel):
     # abstentions, which the weak-posture selector already catches.
     seek_classes: list[str] = ["behaviour.standing"]
 
+    # Serve cows standing under a solar panel before anything else of equal
+    # legibility. This is the scientifically distinctive subset of the corpus --
+    # agrivoltaic shade use is the one question this deployment can answer that a
+    # barn dataset cannot -- and it is tiny: `under_panel` is TRUE on a few
+    # hundred of ~46k detections, because panel polygons have been drawn for one
+    # day and three cameras. Promoting them costs the rest of the queue almost
+    # nothing and makes every panel polygon that lands afterwards immediately
+    # productive.
+    #
+    # It rides ABOVE `worth_asking` in the sort but BELOW `clear`: an illegible
+    # crop under a panel is still illegible, and the legibility floor applies to
+    # this selector exactly as it does to the other three.
+    under_panel_first: bool = True
+
     # Of the crops matching `seek_classes`, the share actually promoted.
     # Confidently-predicted crops of a common posture are an enormous pool --
     # far larger than the abstentions or the gate-boundary cases -- so an
