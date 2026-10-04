@@ -52,6 +52,8 @@ _UNSEEN = {"class_key": "sun_exposure.not_visible", "group_key": "sun_exposure",
            "class_name": "Not visible"}
 _ESCAPE = {"class_key": "sun_exposure.cannot_tell", "group_key": "sun_exposure",
            "class_name": "Cannot tell"}
+_HALF = {"class_key": "sun_exposure.half_shade", "group_key": "sun_exposure",
+         "class_name": "Half shade"}
 
 
 def _store(d: str):
@@ -127,6 +129,61 @@ def test_multi_select_group_is_refused_not_guessed():
         check("a multi-select group becomes no head at all",
               "behaviour" not in vocab, str(sorted(vocab)))
         check("...and the single-select group is unaffected", "sun_exposure" in vocab)
+        con.close()
+
+
+def test_an_excluded_class_is_offered_but_not_trained():
+    """`exclude_classes` removes the OUTPUT, not the disagreement.
+
+    `sun_exposure.half_shade` (2026-10-04) ships active in the taxonomy and out
+    of the head: annotators answer it from the day it lands while the deployed
+    three-class sun model stays exactly as it is, because the class starts at
+    zero examples and a fourth class on a handful of them is a measured failure
+    (M5 §2.2). Two halves to that, and the second one costs something:
+
+      - an instance whose only sun answer is the excluded class trains the other
+        heads and contributes nothing to sun, the same as an archived class;
+      - an instance one rater called Shaded and another Half shade is CONTESTED
+        in SQL, and the unanimity test runs BEFORE the vocabulary filter — so
+        the sun label is dropped rather than resolving to the one answer the
+        head still has an output for. Adding an option beside an existing one
+        therefore takes away some signal that was unanimous before it existed.
+        That is the price of the new tile, pinned here so it is a known cost
+        rather than a mystery in the next CV run's class counts.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        offered = con.execute(
+            "SELECT active, is_escape FROM label_classes "
+            "WHERE class_key = 'sun_exposure.half_shade'").fetchone()
+        check("the taxonomy offers Half shade as a normal, active class",
+              offered == (True, False), str(offered))
+        vocab = ds.head_vocabulary(con, exclude=["sun_exposure.half_shade"])
+        check("...and the head has no output for it",
+              "sun_exposure.half_shade" not in vocab["sun_exposure"],
+              str(vocab["sun_exposure"]))
+        check("the three classes the deployed checkpoint knows are untouched",
+              vocab["sun_exposure"] == ("sun_exposure.shaded", "sun_exposure.direct_sun",
+                                        "sun_exposure.not_visible"),
+              str(vocab["sun_exposure"]))
+
+        _answer(con, "00000001.jpg", [_HALF])
+        _verdict(con, "00000001.jpg", "ok")
+        _answer(con, "00000002.jpg", [_SHADED], annotator="alice")
+        _answer(con, "00000002.jpg", [_HALF], annotator="bob")
+        samples = {s.instance_key: s for s in
+                   ds.collect_samples(con, block_frames=30, vocab=vocab)}
+        only_half = samples.get(_key("00000001.jpg"))
+        check("an excluded-class answer is not a sun label",
+              only_half is not None and "sun_exposure" not in only_half.labels,
+              str(only_half))
+        check("...but the instance still trains the gate",
+              only_half is not None and only_half.labels.get(ds.COW_HEAD) == "cow",
+              str(only_half))
+        contested = samples.get(_key("00000002.jpg"))
+        check("Shaded vs Half shade is contested, not resolved to Shaded",
+              contested is None or "sun_exposure" not in contested.labels,
+              str(contested))
         con.close()
 
 
@@ -346,6 +403,7 @@ def main():
     print("=== test_instance_attrs_dataset ===")
     test_vocabulary_drops_escape_and_keeps_not_visible()
     test_multi_select_group_is_refused_not_guessed()
+    test_an_excluded_class_is_offered_but_not_trained()
     test_an_escape_only_instance_is_a_label_once_merged()
     test_escape_answers_are_missing_data_not_disagreement()
     test_a_contested_instance_trains_nothing_on_that_head()

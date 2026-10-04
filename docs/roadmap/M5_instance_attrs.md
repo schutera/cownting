@@ -164,7 +164,111 @@ change — but the measured answer is no.
 future answers to it re-enter the class this experiment just showed to be
 mixed. The clean end state is probably to drop the trained catch-all on the sun
 head as well and let confidence carry it, exactly as behaviour does (§9.3) —
-`exclude_classes` exists for that experiment and it has not been run.
+`exclude_classes` exists for that experiment and it has not been run. §2.4
+narrows what that catch-all has to carry: the half-shaded body has left it.
+
+### 2.4 `half_shade`: a third step on the light scale, offered but not trained (2026-10-04)
+
+A cow standing at the edge of a panel's shadow, half of its body dark, was being
+recorded as **Cannot tell** — in the same bucket as an overcast sky and a crop
+too small to judge. That was not annotator drift; it was the written rule. M3
+§3.4 says plainly: *"at a near 50/50 split choose Cannot tell instead of
+guessing, because those are exactly the frames where annotators disagree and we
+would rather measure that honestly."* With two substantive options that was the
+right call — the alternative was a coin flip recorded as data. With a third it
+is the wrong one, because **a cow the shadow edge crosses is using the shade**,
+and whether the panels get used is the question this study exists to answer.
+
+**The thirds rule.** The three substantive options now read as one scale and
+their definitions are written as one, so the boundary is arithmetic rather than
+taste:
+
+| shadow over the visible body | answer |
+|---|---|
+| two thirds or more | `shaded` |
+| between roughly a third and two thirds | `half_shade` |
+| a third or less | `direct_sun` |
+| nothing in the scene casts a shadow at all | `not_visible` ("Cannot tell") |
+
+`half_shade` sorts at 15, BETWEEN its neighbours, because options are offered and
+the digits bound in `sort_order, class_key` — a new class takes the end of the
+row by default (`_next_sort`), which would put the middle of a scale after its
+extremes and next to the decline option, which is where these answers were
+already going wrong.
+
+**It ships OUT of the model head**, via `instance_attrs.exclude_classes`. The
+head's vocabulary is derived from the live taxonomy, so without that line the
+next `attrs build` makes the sun head four-way — and the class starts at **zero
+examples**, with none recoverable: the crops it describes were answered "Cannot
+tell" under the old definition, and the store records the answer, not the reason.
+`relabels` cannot rescue them the way it rescued `head_probing`'s 56, because
+there is no checkpoint whose softmax knows this class. The precedent is
+unambiguous (§2.2): a fourth class at n=12–56 scored F1 ≤ 0.12 in all eleven CV
+configurations and cost the headline ~0.02 for nothing. So annotators answer it
+from day one and the deployed three-class checkpoint is untouched.
+
+**What the new tile costs even while excluded.** Exclusion removes the OUTPUT,
+not the disagreement. `_SQL_ANSWERS` tests unanimity in SQL, before the
+vocabulary filter, so an instance one rater calls Shaded and another Half shade
+is contested and loses its sun label — signal that was unanimous before the
+option existed. At `targets_per_instance: 2` that is the price of a sharper
+question, and it is pinned by
+`test_an_excluded_class_is_offered_but_not_trained` so it shows up as a known
+cost rather than as a mystery in the next run's class counts.
+
+**The gate for entering the head.** Not a date — a count and a measurement:
+
+1. ~200 unanimous `half_shade` instances in the store (`cownting labels status`).
+2. Drop the `exclude_classes` line, `cownting attrs cv` 5-fold.
+3. Judge it on the identical instances at matched coverage, never headline
+   against headline: adding a class changes which rows are SCORED, and §9.4 is
+   the worked example of that comparison being invalid. The questions are
+   whether `shaded` F1 holds (E12 says this boundary bleeds: 0.787 → 0.710 when
+   a neighbouring class went mixed) and whether shade-versus-sun reads better
+   over the whole labelled population including the declines.
+4. **The dashboard SQL must land in the same deploy.** `db.py`'s KPI block and
+   `AREA_ATTR_COLS`, `areaAttrs.lightTintFor` and `AttrBadges`' glyph map each
+   count exactly three `attr_sun` keys by name. A fourth class scored into
+   `attr_sun` is invisible to all of them — the shares silently stop summing
+   rather than showing a wrong number, which is worse. `features.py` derives its
+   value from the string and needs nothing.
+5. Then the usual: train, deploy, rescore the corpus, `reoverlay` (§11).
+   `attr_model_rev` is what tells a three-class row from a four-class one, so a
+   day-over-day comparison that straddles the retrain is comparing vocabularies
+   until the rescore finishes.
+
+**Still one bucket, not two.** §10's other finding stands and is NOT addressed
+here: on 07-04, 08-30, 09-01 and 09-02, 91–98% of detections come back
+`not_visible` because the sky was overcast and neither "shaded" nor "direct sun"
+is true of anything. That is a different population from the half-shaded body —
+one is about the sky, the other about where the animal stands — and it is the
+larger one. A `diffuse` class remains the fix; it was deliberately deferred
+rather than bundled, so one taxonomy revision changes one thing.
+
+**Open: the model sees less of the scene than the annotator did.** Sun exposure
+is read off the surroundings, and crop geometry comes from `annotation`
+(`crop_pad: 0.35`) precisely so training crops are the pixels the annotator
+judged. But the annotator has two ways out of that square that the model does not
+have: hold-to-peek renders the WHOLE frame (`labeling.render_frame`), and the
+outline editor's zoom ladder reaches `pad: 2.5` (`labeling.ZOOM_PADS`). So a
+label may have been decided on context the model is never shown — which is a
+plausible part of why `shaded` tops out around 0.79 and why "is there sun in this
+scene at all" is answered so badly. It is an experiment, not a conclusion, and
+the knob is not free: the square is `(1 + 2·pad)` times the animal's longer side, so
+at a fixed `img_size: 224` going from `pad` 0.35 to 1.0 takes the body from 1/1.7
+of the frame's width to 1/3 of it — about **1.8x fewer pixels across the animal**
+— on a corpus where small crops are already the dominant cause of declines. Worth running as three 5-fold arms on one dataset build —
+0.35 (control) / 0.6 / 1.0, re-rendered with `attrs build --force` — judged per
+head and per crop-size band (§9.1), because the trade is expected to go opposite
+ways for the sun head and the behaviour head. Two riders if it is run:
+
+- raising `crop_pad` changes what ANNOTATORS see too, which is the invariant
+  that keeps the two honest; the existing 2,973 labels were given at 0.35;
+- a wider square holds more cows and nothing in the crop says which one is the
+  subject — the annotator has the ring drawn over the tile, the model has only
+  centring. Past ~0.6 the subject cue probably has to be given to the model
+  explicitly (the mask as a fourth channel, or the ring burned in) rather than
+  inferred from position, and that is a bigger change than a config line.
 
 ## 3. The banner mask is a methodological requirement
 

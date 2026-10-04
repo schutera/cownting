@@ -168,6 +168,7 @@ export interface CameraCoverage {
 // rather than have the type lie about what arrived.
 export type LabelIconName =
   | "shade"
+  | "half-shade"
   | "sun"
   | "eye-off"
   | "question"

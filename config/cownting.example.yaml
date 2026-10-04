@@ -198,6 +198,25 @@ instance_attrs:
   # between two of them in opposite proportions (45% vs 18%).
   merge_classes: {}
   relabels: config/instance_attrs_relabels.csv
+  # Classes the annotators are offered but the MODEL is not given an output for.
+  # The head's vocabulary is derived from the LIVE taxonomy
+  # (instance_attrs.dataset.head_vocabulary), so a class added in the taxonomy
+  # editor joins the softmax at the next `attrs build` whether or not it has
+  # examples yet — and a fourth class on a handful of them is a measured
+  # failure here, not a hypothetical: `behaviour.head_probing` scored F1 <= 0.12
+  # in all eleven CV configurations at n=12-56 and cost the headline ~0.02 for
+  # nothing (M5 §2.2). `sun_exposure.half_shade` was added 2026-10-04 and starts
+  # at ZERO examples — nothing in the store can be recovered into it, because the
+  # crops it describes were answered "Cannot tell" by the definition then in
+  # force and the store records the answer, not the reason.
+  #
+  # So it collects answers while the deployed three-class sun head stays exactly
+  # as it is. Remove the line when the class has support (~200 unanimous
+  # instances), then decide with `cownting attrs cv`, judged on identical
+  # instances at matched coverage — a class change moves which rows are SCORED,
+  # so headline-against-headline is measuring a different question (M5 §9.4).
+  exclude_classes:
+    - sun_exposure.half_shade
   device: auto                     # cuda > mps > cpu; train on a GPU box, serve on CPU
   # Split. The unit is a contiguous run of frames from ONE camera on ONE day —
   # at ingest.frame_interval_seconds = 60 these are minutes, so 30 is a

@@ -660,7 +660,7 @@ def test_schema_is_idempotent_and_seeded():
         n_groups = con.execute("SELECT count(*) FROM label_groups").fetchone()[0]
         n_classes = con.execute("SELECT count(*) FROM label_classes").fetchone()[0]
         check("three boots do not duplicate the seed (2 groups)", n_groups == 2, str(n_groups))
-        check("three boots do not duplicate the seed (10 classes)", n_classes == 10, str(n_classes))
+        check("three boots do not duplicate the seed (11 classes)", n_classes == 11, str(n_classes))
         rev = labels_db.taxonomy_revision(con)
         check("re-boots do not bump the revision (only the first seed did)",
               rev == 1, str(rev))
@@ -695,6 +695,46 @@ def test_schema_is_idempotent_and_seeded():
               row is not None and not row[0] and row[1] is not None, str(row))
         check("the reboot did not bump the revision either",
               labels_db.taxonomy_revision(con) == rev_after_archive)
+        con.close()
+
+
+def test_the_sun_question_is_a_scale_plus_one_decline():
+    """Sun exposure reads as a light SCALE, and the tiles have to show it.
+
+    Options are offered — and the digits bound — in `sort_order, class_key`, so
+    the order is the question's semantics and not presentation: fully shaded,
+    the shadow edge across the body, open sun, then the one decline. Half shade
+    landing at the END of that row (the `_next_sort` default for a class added
+    through the editor) would put the middle of a scale after its extremes and
+    beside "Cannot tell", which is where this class's answers were going wrong
+    in the first place.
+
+    The icon check is the other half of the same requirement (M3 UX §4): the
+    options separate pre-attentively on shape, so two classes in ONE question
+    sharing a glyph makes the pair a serial read. `question` is shared ACROSS
+    questions on purpose and that stays allowed.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        sun = con.execute(
+            "SELECT class_key, icon, is_escape FROM label_classes "
+            "WHERE group_key = 'sun_exposure' AND active ORDER BY sort_order, class_key"
+        ).fetchall()
+        check("the scale runs shaded -> half -> sun, then the decline",
+              [r[0] for r in sun] == ["sun_exposure.shaded", "sun_exposure.half_shade",
+                                      "sun_exposure.direct_sun",
+                                      "sun_exposure.not_visible"],
+              str([r[0] for r in sun]))
+        check("exactly one of the four is a no-answer option",
+              sum(1 for r in sun if r[0].endswith((".not_visible", ".cannot_tell"))) == 1,
+              str(sun))
+        check("no active sun class is an is_escape row",
+              not any(r[2] for r in sun), str(sun))
+        icons = [r[1] for r in sun]
+        check("every option carries an icon, all four different",
+              all(icons) and len(set(icons)) == len(icons), str(icons))
+        check("...and each is a name the renderer can draw",
+              all(i in labels_db.CLASS_ICONS for i in icons), str(icons))
         con.close()
 
 
@@ -1054,6 +1094,7 @@ def main():
     test_mask_survives_clip_restore_on_a_deployed_shape_db()
     test_mask_columns_are_last_so_the_archive_stays_aligned()
     test_schema_is_idempotent_and_seeded()
+    test_the_sun_question_is_a_scale_plus_one_decline()
     test_relabel_appends_and_double_submit_is_refused()
     test_archived_class_still_resolves()
     test_skip_does_not_count_as_coverage()

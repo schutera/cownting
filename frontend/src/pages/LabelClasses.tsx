@@ -79,6 +79,7 @@ const GROUP_KEY_RE = /^[a-z][a-z0-9_]*$/;
    runtime must not be able to hand us markup. */
 const ICON_CHOICES: readonly LabelIconName[] = [
   "shade",
+  "half-shade",
   "sun",
   "eye-off",
   "question",

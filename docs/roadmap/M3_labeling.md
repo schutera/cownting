@@ -541,6 +541,14 @@ a forced guess is noise that looks like disagreement.
 > the crop are context. This is the question the whole agrivoltaics study turns on:
 > do the panels actually get used as shade?
 
+> **The sun options below are the ORIGINAL (2026-09-09) definitions and two of
+> them have since been superseded.** `cannot_tell` was archived and merged into a
+> single decline option on 2026-09-18 (M5 §2.3), and the near-50/50 body — sent
+> to the decline option here — became its own class, `sun_exposure.half_shade`,
+> on 2026-10-04 (M5 §2.4). The live text is always `labels_db.SEED_GROUPS` plus
+> whatever a poweruser has since sharpened in the taxonomy editor; this section
+> is the design record, kept as written.
+
 - `sun_exposure.shaded` — **Shaded** — Roughly two thirds or more of the visible
   body sits inside a shadow — a panel row, a building, a tree, or the herd itself.
   A cow standing in panel shade with only its head out in the sun is still Shaded:

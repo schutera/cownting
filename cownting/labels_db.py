@@ -241,8 +241,8 @@ SKIP_REASONS: tuple[str, ...] = ("bad_crop", "no_cow", "multiple_cows", "occlude
 # the frontend also falls back to it for NULL and for any name it does not know, so
 # a value this list once contained can never break the renderer.
 CLASS_ICONS: tuple[str, ...] = (
-    "shade", "sun", "eye-off", "cloud", "question", "grass", "lying", "standing", "probe",
-    "pixels", "dot",
+    "shade", "half-shade", "sun", "eye-off", "cloud", "question", "grass", "lying",
+    "standing", "probe", "pixels", "dot",
 )
 
 EVENT_KINDS: tuple[str, ...] = (
@@ -776,13 +776,39 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
             "shade?"
         ),
         "classes": (
+            # THE THIRDS RULE (2026-10-04). These three read as one scale and their
+            # definitions are written as one: shadow over two thirds of the body or
+            # more is Shaded, under a third is Direct sun, and the middle third is
+            # Half shade. Before Half shade existed the middle was explicitly sent
+            # to the decline option ("at a near 50/50 split choose Cannot tell
+            # instead of guessing" — M3 §3.4), which was the right call with only
+            # two substantive options and the wrong one now: a cow the shadow edge
+            # crosses IS using the shade, and the study's question is whether the
+            # panels get used. It was being recorded as "no reading", in the same
+            # bucket as an overcast sky and a crop too small to judge.
             {
                 "class_key": "sun_exposure.shaded",
                 "name": "Shaded",
                 "icon": "shade",
                 "sort_order": 10,
                 "is_escape": False,
-                "description": "Most of the body sits in panel shade, not just overcast dullness.",
+                "description": ("Two thirds or more of the body sits in shadow — a panel row, "
+                                "a building, a tree, or the herd itself — not just overcast "
+                                "dullness. Head or legs out in the sun do not change it; the "
+                                "body decides."),
+            },
+            {
+                "class_key": "sun_exposure.half_shade",
+                "name": "Half shade",
+                "icon": "half-shade",
+                "sort_order": 15,
+                "is_escape": False,
+                "description": ("The shadow edge crosses the animal: between roughly a third "
+                                "and two thirds of the body is in shadow, and neither share "
+                                "is clearly the larger one. A cow at the edge of a panel's "
+                                "shadow, half in and half out, is this. Only when something "
+                                "in the scene casts a shadow at all — if nothing does, that "
+                                "is Cannot tell, not this."),
             },
             {
                 "class_key": "sun_exposure.direct_sun",
@@ -790,7 +816,10 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "sun",
                 "sort_order": 20,
                 "is_escape": False,
-                "description": "Most of the body is in open sun, casting its own sharp shadow.",
+                "description": ("A third of the body or less is in shadow: the ground around "
+                                "it is bright and the animal casts its own sharp shadow. Thin "
+                                "dappled light through a gap between panels is still this if "
+                                "its own shadow is sharp."),
             },
             # ONE no-answer option. Until 2026-09-18 there were two — Not visible
             # ("too little of the body") and an escape, Cannot tell ("visible, but
@@ -805,10 +834,11 @@ SEED_GROUPS: tuple[dict[str, Any], ...] = (
                 "icon": "question",
                 "sort_order": 30,
                 "is_escape": False,
-                "description": ("Neither shade nor direct sun can be read from this crop: "
-                                "overcast sky with no shadows anywhere, too little of the "
-                                "body visible, cut off, blocked, or blown out. The one answer "
-                                "for every such case."),
+                "description": ("No light reading can be taken from this crop at all: "
+                                "overcast sky with nothing casting a shadow anywhere, too "
+                                "little of the body visible, cut off, blocked, or blown out. "
+                                "The one answer for every such case. A body the shadow edge "
+                                "crosses is NOT this — that is Half shade."),
             },
             # Folded into the option above; ships archived so a fresh install
             # offers one escape. An existing store keeps whatever the operator
