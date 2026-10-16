@@ -311,7 +311,8 @@ def test_the_bound_parameters_line_up_with_the_placeholders():
         ["behaviour.standing"], hx(cfg.seek_share),          # reason: seek_class
         hx(cfg.overlap_fraction), hx(cfg.overlap_fraction),  # deep-overlap slice
         cfg.overlap_targets, cfg.targets_per_instance,
-        "alice", "alice", cfg.min_instance_px,
+        "alice", "alice", "alice",                           # mine, mymask, mypts
+        cfg.min_instance_px,
     ]
     check("the bound values arrive in the documented order",
           params == expected,

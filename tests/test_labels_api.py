@@ -75,6 +75,8 @@ _ITEM_FIELDS = (
     # hold-Space peek needs to place full-frame coordinates on a DOWNSCALED image.
     "mask", "mask_frame", "mask_seed", "frame_w", "frame_h", "geom_done",
     "crop_levels", "crop_level",
+    # M6: this annotator's body points and whether the step is passed.
+    "points", "points_done",
 )
 
 
@@ -908,6 +910,133 @@ def test_mask_fix_roundtrip_and_validation():
                         polygon=tri).status_code == 400)
 
 
+def _points_for(item: dict) -> list:
+    """Five body points a labeler could click on this item: four inside its box
+    in full-frame px, the hind hoof marked "can't see"."""
+    x1, y1, x2, y2 = item["bbox"]
+    w, h = x2 - x1, y2 - y1
+    return [[x1 + 0.9 * w, y1 + 0.4 * h], [x1 + 0.6 * w, y1 + 0.1 * h],
+            [x1 + 0.1 * w, y1 + 0.2 * h], [x1 + 0.7 * w, y1 + 0.95 * h], None]
+
+
+def _post_points(client: TestClient, item: dict, **extra) -> "object":
+    body = {"instance_key": item["instance_key"], "anchor": _anchor(item),
+            "kind": "points", **extra}
+    return client.post("/api/label/points", json=body)
+
+
+def test_points_roundtrip_and_validation():
+    """M6 §5: the body-points write, what it gives back on the queue item, and
+    every shape the route refuses."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        tax = client.get("/api/label/taxonomy").json()
+        check("the taxonomy serves the point vocabulary in storage order",
+              tax.get("points") == list(labels_db.POINT_NAMES), str(tax.get("points")))
+
+        before = client.get("/api/label/queue?mine=all&limit=200").json()["items"]
+        item = before[0]
+        check("a fresh item has no points and the step is not passed",
+              item["points"] is None and item["points_done"] is False,
+              f"{item['points']} / {item['points_done']}")
+        remaining = int(client.get("/api/label/progress").json()["remaining"])
+
+        pts = _points_for(item)
+        r = _post_points(client, item, points=pts)
+        check("POST /api/label/points -> 200", r.status_code == 200,
+              f"{r.status_code} {r.text[:160]}")
+        body = r.json() if r.status_code == 200 else {}
+        check("...version 1, echoing the stored points",
+              body.get("version") == 1 and body.get("points") == pts, str(body))
+
+        again = {i["instance_key"]: i for i in
+                 client.get("/api/label/queue?mine=all&limit=200").json()["items"]}
+        got = again.get(item["instance_key"], {})
+        check("the item now carries my points, verbatim, and the step is passed",
+              got.get("points") == pts and got.get("points_done") is True,
+              f"{got.get('points')} / {got.get('points_done')}")
+
+        # A point row is NOT an answer: the cow still needs its questions, so it
+        # stays in my todo queue, the pool does not move, and nothing reorders.
+        todo = {i["instance_key"] for i in
+                client.get("/api/label/queue?limit=200").json()["items"]}
+        check("the cow is still in my todo queue", item["instance_key"] in todo)
+        check("remaining is unchanged",
+              int(client.get("/api/label/progress").json()["remaining"]) == remaining)
+        check("the queue order is unchanged by a point row",
+              [i["instance_key"] for i in before] == list(again.keys()),
+              "order moved")
+
+        # Another annotator sees nothing of mine — independence, like mymask.
+        mc = db.connect(config.paths.db_path)
+        try:
+            bob = {i["instance_key"]: i for i in labeling.queue(
+                mc, config, annotator="bob", limit=50, mine="all")["items"]}
+        finally:
+            mc.close()
+        other = bob.get(item["instance_key"], {})
+        check("another annotator is served no points and an open step",
+              other.get("points") is None and other.get("points_done") is False,
+              f"{other.get('points')} / {other.get('points_done')}")
+
+        # Too small: a full verdict that supersedes, carries no points, and
+        # still passes the step.
+        r2 = _post_points(client, item, kind="too_small")
+        check("too_small -> 200, version 2, no points",
+              r2.status_code == 200 and r2.json().get("version") == 2
+              and r2.json().get("points") is None, r2.text[:160])
+        got2 = [i for i in client.get("/api/label/queue?mine=all&limit=200").json()["items"]
+                if i["instance_key"] == item["instance_key"]][0]
+        check("...and the item carries no points but a passed step",
+              got2["points"] is None and got2["points_done"] is True, str(got2["points"]))
+
+        # Validation. Each would otherwise store something no consumer can index.
+        check("a forged anchor is a 400",
+              _post_points(client, {**item, "bbox": [1.0, 2.0, 3.0, 4.0]},
+                           points=pts).status_code == 400)
+        check("an unknown kind is a 400",
+              _post_points(client, item, kind="nonsense", points=pts).status_code == 400)
+        check("four entries are a 400",
+              _post_points(client, item, points=pts[:4]).status_code == 400)
+        check("six entries are a 400",
+              _post_points(client, item, points=pts + [pts[0]]).status_code == 400)
+        check("kind points with no points is a 400",
+              _post_points(client, item).status_code == 400)
+        check("five nulls are a 400 — that is too_small",
+              _post_points(client, item, points=[None] * 5).status_code == 400)
+        check("a one-number point is a 400",
+              _post_points(client, item, points=[[pts[0][0]], *pts[1:]]).status_code == 400)
+        check("too_small carrying points is a 400",
+              _post_points(client, item, kind="too_small", points=pts).status_code == 400)
+        sx0, sy0, sx1, sy1 = labeling.widest_crop_box(item["bbox"], config.annotation)
+        far = [[sx1 + 50.0, sy1 + 50.0], *pts[1:]]
+        check("a point beyond the widest crop is a 400",
+              _post_points(client, item, points=far).status_code == 400)
+        edge = [[sx1 + 0.5, sy0 - 0.5], *pts[1:]]
+        check("a point on the widest crop's edge is accepted",
+              _post_points(client, item, points=edge).status_code == 200)
+        raw = json.dumps({"instance_key": item["instance_key"], "anchor": _anchor(item),
+                          "kind": "points", "points": [[1.0, 2.0], *pts[1:]]})
+        raw = raw.replace("[1.0, 2.0]", "[1e999, 2.0]", 1)
+        r_inf = client.post("/api/label/points", content=raw,
+                            headers={"Content-Type": "application/json"})
+        check("a non-finite point is rejected", r_inf.status_code in (400, 422),
+              f"{r_inf.status_code} {r_inf.text[:120]}")
+
+        # The lost race is a 409 the client retries, not a 400 it must not.
+        real = labels_db.submit_point_edit
+
+        def _lose(*_a, **_k):
+            raise labels_db.VersionRace("a concurrent submit won the race")
+
+        labels_db.submit_point_edit = _lose
+        try:
+            r409 = _post_points(client, item, points=pts)
+        finally:
+            labels_db.submit_point_edit = real
+        check("a lost race -> 409", r409.status_code == 409, str(r409.status_code))
+
+
 def test_false_positive_retires_the_instance_for_everyone():
     """M4a §4.2: 'not a cow' is not a skip. It leaves the pool for every
     annotator, because there are no questions to ask about a shadow — and the
@@ -1360,6 +1489,7 @@ def main():
     test_decision_event_detail_is_stored()
     test_undo_is_scoped_to_me()
     test_mask_fix_roundtrip_and_validation()
+    test_points_roundtrip_and_validation()
     test_false_positive_retires_the_instance_for_everyone()
     test_spread_draws_from_every_day_and_camera()
     test_zoom_ladder_and_frame_space_submit()

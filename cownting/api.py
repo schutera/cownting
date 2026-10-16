@@ -147,6 +147,22 @@ class LabelMaskFixReq(BaseModel):
     client_elapsed_ms: int | None = None
 
 
+class LabelPointsReq(BaseModel):
+    # The BODY POINTS body (docs/roadmap/M6_body_points.md §5.1). `kind`
+    # discriminates: 'points' carries exactly five entries in
+    # labels_db.POINT_NAMES order, each [x, y] in FULL-FRAME px or null for
+    # "can't see"; 'too_small' carries none. Full-frame only — the editor works
+    # in that space like the outline editor, so nothing converts and nothing
+    # can shear.
+    instance_key: str
+    anchor: InstanceAnchor
+    kind: str = "points"
+    points: list[list[float] | None] | None = None
+    serve_event_id: int | None = None
+    session_id: str | None = None
+    client_elapsed_ms: int | None = None
+
+
 class LabelUndoReq(BaseModel):
     instance_key: str
 
@@ -2237,9 +2253,7 @@ def create_app(config: Config) -> FastAPI:
                 # annotator can only have drawn inside a crop we served, and that
                 # is the largest one — rather than by the frame, which would
                 # accept an outline nobody could have seen.
-                widest = max(labeling.ZOOM_PADS + (cfg.crop_pad,))
-                sx0, sy0, sx1, sy1 = labeling.crop_geometry(
-                    a.bbox, widest, cfg.crop_max_width)[0]
+                sx0, sy0, sx1, sy1 = labeling.widest_crop_box(a.bbox, cfg)
                 if any(not (sx0 - 1 <= float(p[0]) <= sx1 + 1
                             and sy0 - 1 <= float(p[1]) <= sy1 + 1) for p in pts):
                     raise HTTPException(
@@ -2345,6 +2359,69 @@ def create_app(config: Config) -> FastAPI:
         return {"ok": True, "annotation_id": int(edit_id),
                 "version": int(row[0]) if row else 1,
                 "mask": mask_crop, "mask_frame": polygon, **recentred}
+
+    @app.post("/api/label/points", dependencies=[Depends(require_labeler)])
+    def label_points(body: LabelPointsReq, request: Request):
+        """Record the body points the labeler placed on one cow, or the verdict
+        that the cow is too small for any (M6 §5.1).
+
+        Same anchor discipline as the other three writes: the client echoes
+        what the queue served, `verify_anchor` re-hashes it, a mismatch is a
+        400, and the route never opens the main DB. Every placed point must lie
+        inside the widest crop the editor can show — the annotator cannot have
+        clicked anywhere else. The store validates the shape again; this layer
+        only turns its ValueErrors into 400s and the lost race into a 409."""
+        a = body.anchor
+        _valid_anchor(a)
+        if not labeling.verify_anchor(body.instance_key, a):
+            raise HTTPException(400, "anchor does not hash to instance_key")
+        if body.kind not in labels_db.POINT_EDIT_KINDS:
+            raise HTTPException(
+                400, f"kind must be one of {list(labels_db.POINT_EDIT_KINDS)}")
+        cfg = config.annotation
+        if body.kind == "points" and body.points is not None:
+            sx0, sy0, sx1, sy1 = labeling.widest_crop_box(a.bbox, cfg)
+            for name, p in zip(labels_db.POINT_NAMES, body.points):
+                if p is None or len(p) != 2:
+                    continue  # the store names the shape error
+                x, y = float(p[0]), float(p[1])
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    raise HTTPException(400, f"point {name!r} must be finite")
+                if not (sx0 - 1 <= x <= sx1 + 1 and sy0 - 1 <= y <= sy1 + 1):
+                    raise HTTPException(
+                        400, f"point {name!r} must lie inside the widest crop of this animal")
+        ts = _anchor_ts(a)
+        user = current_user(request)
+        lc = _labels_con()
+        try:
+            try:
+                edit_id = labels_db.submit_point_edit(
+                    lc,
+                    instance_key=body.instance_key,
+                    annotator=user["username"] or "local",
+                    kind=body.kind,
+                    points=body.points,
+                    provenance=_anchor_provenance(a, ts),
+                    telemetry=_label_telemetry(
+                        request, user, revision=labels_db.taxonomy_revision(lc),
+                        session_id=body.session_id,
+                        serve_event_id=body.serve_event_id,
+                        client_elapsed_ms=body.client_elapsed_ms),
+                )
+            except labels_db.VersionRace as e:
+                raise HTTPException(409, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            row = lc.execute(
+                "SELECT version, points FROM point_edits WHERE edit_id = ?", [edit_id]
+            ).fetchone()
+        finally:
+            lc.close()
+        # Echo what was STORED, so the client patches the item it holds without
+        # a second queue fetch — the same contract as mask-fix.
+        return {"ok": True, "edit_id": int(edit_id),
+                "version": int(row[0]) if row else 1,
+                "points": labeling._points_of(row[1]) if row else None}
 
     @app.post("/api/label/undo", dependencies=[Depends(require_labeler)])
     def label_undo(body: LabelUndoReq, request: Request):

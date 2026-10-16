@@ -1017,7 +1017,11 @@ def taxonomy(con: duckdb.DuckDBPyConnection, *, include_archived: bool = False) 
         by_group.setdefault(str(c["group_key"]), []).append(c)
     for g in groups:
         g["classes"] = by_group.get(str(g["group_key"]), [])
-    return {"revision": taxonomy_revision(con), "groups": groups}
+    # The body-points vocabulary rides along so the client can check its own copy
+    # (which carries the labeler-facing wording) against the server's order. Not a
+    # group: it is frozen in code, has no classes and no revision.
+    return {"revision": taxonomy_revision(con), "groups": groups,
+            "points": list(POINT_NAMES)}
 
 
 def known_classes(con: duckdb.DuckDBPyConnection) -> dict[str, dict[str, Any]]:

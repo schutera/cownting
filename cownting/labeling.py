@@ -329,8 +329,8 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
     # for `mymask`. Order matters: these are positional and must match the order
     # the joins appear in the CTE below.
     # Positional and order-sensitive: clear-tier (2), ask-tier (2), overlap (1),
-    # target CASE (3), mine (1), mymask (1), then the hard floor (1) — matching
-    # the order the placeholders appear in the SQL below.
+    # target CASE (3), mine (1), mymask (1), mypts (1), then the hard floor (1)
+    # — matching the order the placeholders appear in the SQL below.
     abstain_px = cfg.abstain_min_px if cfg.abstain_min_px is not None else cfg.clear_instance_px
     params += [cfg.clear_instance_px, hex_threshold(cfg.small_share),
                # worth_asking, in the order the SQL reads: uniform slice, then
@@ -357,7 +357,7 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                cfg.uncertain_below,
                list(cfg.seek_classes), hex_threshold(cfg.seek_share),
                threshold, threshold, cfg.overlap_targets, cfg.targets_per_instance,
-               annotator, annotator, cfg.min_instance_px]
+               annotator, annotator, annotator, cfg.min_instance_px]
 
     return (
         f"""
@@ -533,7 +533,12 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    (mine.effective_key IS NOT NULL) AS mine_done,
                    (fp.effective_key IS NOT NULL) AS false_positive,
                    mymask.polygon AS my_mask_poly,
-                   coalesce(mymask.n_verdicts, 0) > 0 AS geom_done
+                   coalesce(mymask.n_verdicts, 0) > 0 AS geom_done,
+                   -- MY OWN body points, and whether I have said anything about
+                   -- them (M6 §5.2). Same role as geom_done: a step the server
+                   -- remembers is a step a reload cannot re-ask.
+                   mypts.points AS my_points,
+                   (mypts.effective_key IS NOT NULL) AS points_done
             FROM keyed k
             LEFT JOIN datasets ds ON ds.dataset_id = k.dataset_id
             -- Every join is on effective_key, never instance_key (§2.4): after a
@@ -573,6 +578,16 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                        FROM {alias}.v_current_mask_edits
                        WHERE annotator = ? GROUP BY effective_key)
                       mymask ON mymask.effective_key = k.instance_key
+            -- Scoped to this annotator for the same reason mymask is: another
+            -- annotator's dots would anchor this one's clicks. One row per
+            -- effective_key, the newest, so the join can never multiply the
+            -- pool; a 'too_small' row has NULL points and still counts as done.
+            LEFT JOIN (SELECT effective_key, points
+                       FROM {alias}.v_current_point_edits
+                       WHERE annotator = ?
+                       QUALIFY row_number() OVER (PARTITION BY effective_key
+                                                  ORDER BY edit_id DESC) = 1)
+                      mypts ON mypts.effective_key = k.instance_key
             -- THE HARD FLOOR, and it must live at THIS level rather than in
             -- `ranked` above. `ranked` may only be filtered on partition columns
             -- of the ordinal window; `bbox_*` are not, so filtering there would
@@ -907,6 +922,12 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         # already corrected — and pressing Enter on that second asking is what
         # used to destroy the correction (labels_db.submit_mask_edit).
         "geom_done": bool(row.get("geom_done")),
+        # THIS annotator's body points (M6 §5.2), full-frame px, five entries
+        # with null for "can't see" — or null when they have none yet or said
+        # 'too_small'. `points_done` is served for the same reason `geom_done`
+        # is: the step's memory must not live only in React state.
+        "points": _points_of(row.get("my_points")),
+        "points_done": bool(row.get("points_done")),
         # The zoom ladder for the outline editor, with the level it opens on.
         # Sent per item because every level's geometry is a function of THIS
         # animal's box, and computing it here is what keeps crop_geometry out of
@@ -921,6 +942,44 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         "overlap": bool(row["overlap"]),
         "serve_event_id": serve_event_id,
     }
+
+
+def _points_of(raw) -> list[list[float] | None] | None:
+    """The stored body-points JSON as the item carries it, or None.
+
+    Tolerant on the way OUT, strict on the way in (`labels_db._validate_points`):
+    a row this process cannot parse must not 500 the whole queue, so anything
+    that is not a list of the right length is served as "no points"."""
+    if not raw:
+        return None
+    try:
+        pts = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(pts, list) or len(pts) != len(labels_db.POINT_NAMES):
+        return None
+    out: list[list[float] | None] = []
+    for p in pts:
+        if p is None:
+            out.append(None)
+        elif isinstance(p, list) and len(p) == 2:
+            out.append([float(p[0]), float(p[1])])
+        else:
+            return None
+    return out
+
+
+def widest_crop_box(bbox: Sequence[float], cfg: AnnotationCfg
+                    ) -> tuple[int, int, int, int]:
+    """The source square of the WIDEST crop the editors can show for `bbox`.
+
+    The bound for every full-frame coordinate a client submits — an outline node
+    or a body point. The annotator can only have clicked inside a crop we served,
+    and this is the largest one; bounding by the frame instead would accept a
+    point nobody could have seen. One function, so the two write routes cannot
+    disagree about what "inside" means."""
+    widest = max(ZOOM_PADS + (cfg.crop_pad,))
+    return crop_geometry(bbox, widest, cfg.crop_max_width)[0]
 
 
 # --------------------------------------------------------------------------- the crop
