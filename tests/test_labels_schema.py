@@ -357,7 +357,8 @@ def test_an_outline_correction_follows_its_instance():
         new_key = _shift_boxes(mcon)
         rep = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
         check("both tables were rewritten, not just the answers",
-              rep["rekeyed"] == {"annotations": 1, "mask_edits": 1}, str(rep["rekeyed"]))
+              rep["rekeyed"] == {"annotations": 1, "mask_edits": 1, "point_edits": 0},
+              str(rep["rekeyed"]))
         eff = lcon.execute("SELECT effective_key FROM v_current_mask_edits "
                            "WHERE instance_key = ?", [old_key]).fetchone()
         check("the correction points at the live detection", eff == (new_key,), str(eff))
@@ -428,8 +429,124 @@ def test_rekey_collides_with_nothing_when_one_annotator_has_rows_in_both_tables(
               == {old_key, new_key})
         again = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
         check("re-running moves nothing and does not re-report the same move",
-              again["rekeyed"] == {"annotations": 0, "mask_edits": 0},
+              again["rekeyed"] == {"annotations": 0, "mask_edits": 0, "point_edits": 0},
               str(again["rekeyed"]))
+        mcon.close(); lcon.close()
+
+
+# A full body-points answer for the fixture cow: five entries in POINT_NAMES
+# order, full-frame px inside the 100x200 box, hind hoof not visible.
+_POINTS = [[100.0, 60.0], [60.0, 30.0], [15.0, 40.0], [70.0, 215.0], None]
+
+
+def test_point_edits_store_and_validate():
+    """M6 §4: the body-points table takes the same shape and the same rules as
+    mask_edits — append-only, versioned per annotator, one current row — and
+    refuses every shape no consumer could index by POINT_NAMES."""
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        check("the point vocabulary has five entries, head to tail then legs",
+              labels_db.POINT_NAMES == ("nose", "shoulders", "tail_base",
+                                        "front_hoof", "hind_hoof"))
+        k = labels_db.instance_key("2026-07-03", "camera_01", "00000001.jpg", _BBOX, 0)
+        eid = labels_db.submit_point_edit(con, instance_key=k, annotator="alice",
+                                          kind="points", points=_POINTS)
+        row = con.execute(
+            "SELECT kind, points, n_placed, version FROM v_current_point_edits "
+            "WHERE edit_id = ?", [eid]).fetchone()
+        check("a points row is stored current, version 1",
+              row is not None and row[0] == "points" and row[3] == 1, str(row))
+        stored = __import__("json").loads(row[1]) if row else None
+        check("the JSON keeps five entries in order, null for 'can't see'",
+              stored == _POINTS, str(stored))
+        check("n_placed counts the non-null entries", row is not None and row[2] == 4)
+        ev = con.execute("SELECT detail FROM label_events WHERE kind = 'submitted' "
+                         "AND instance_key = ?", [k]).fetchone()
+        check("the submitted event names the step", ev == ("points_points",), str(ev))
+
+        # Second pass: supersede, never overwrite.
+        labels_db.submit_point_edit(con, instance_key=k, annotator="alice",
+                                    kind="too_small")
+        rows = con.execute(
+            "SELECT version, kind, superseded_at IS NULL, points, n_placed FROM point_edits "
+            "WHERE instance_key = ? AND annotator = 'alice' ORDER BY version", [k]
+        ).fetchall()
+        check("v2 appends and supersedes v1",
+              [(int(r[0]), r[1], bool(r[2])) for r in rows]
+              == [(1, "points", False), (2, "too_small", True)], str(rows))
+        check("a too_small row carries no points and no count",
+              rows[1][3] is None and rows[1][4] is None, str(rows[1]))
+
+        # Another annotator is independent.
+        labels_db.submit_point_edit(con, instance_key=k, annotator="bob", points=_POINTS)
+        n_cur = con.execute("SELECT count(*) FROM v_current_point_edits WHERE effective_key = ?",
+                            [k]).fetchone()[0]
+        check("two annotators each hold one current row", n_cur == 2, str(n_cur))
+
+        # Validation: every rejected shape, each a distinct ValueError.
+        def refused(label: str, **kw) -> None:
+            try:
+                labels_db.submit_point_edit(con, instance_key=k, annotator="carol", **kw)
+                check(f"refused: {label}", False, "accepted")
+            except labels_db.VersionRace:
+                check(f"refused: {label}", False, "raised VersionRace for bad input")
+            except ValueError:
+                check(f"refused: {label}", True)
+
+        refused("an unknown kind", kind="nonsense", points=_POINTS)
+        refused("four entries", points=_POINTS[:4])
+        refused("six entries", points=_POINTS + [[1.0, 1.0]])
+        refused("no points at all for kind points", points=None)
+        refused("five nulls", points=[None] * 5)
+        refused("a one-number point", points=[[1.0], *_POINTS[1:]])
+        refused("a non-finite point", points=[[float("nan"), 1.0], *_POINTS[1:]])
+        refused("too_small carrying points", kind="too_small", points=_POINTS)
+        n_carol = con.execute("SELECT count(*) FROM point_edits WHERE annotator = 'carol'"
+                              ).fetchone()[0]
+        check("nothing of carol's reached the table", n_carol == 0, str(n_carol))
+
+        # The UNIQUE (instance_key, annotator, version) is what turns a racing
+        # double submit into an error instead of a silent duplicate; the writer
+        # maps that error to VersionRace and the route to 409.
+        try:
+            con.execute(
+                "INSERT INTO point_edits (instance_key, effective_key, annotator, version) "
+                "VALUES (?, ?, 'bob', 1)", [k, k])
+            check("UNIQUE blocks a silent double submit", False, "duplicate row accepted")
+        except duckdb.ConstraintException:
+            check("UNIQUE blocks a silent double submit", True)
+        con.close()
+
+
+def test_point_edits_follow_their_instance_and_a_stale_key():
+    """A points row is human work on the cow like the outline is: the reconciler
+    moves it after a re-ingest, and a submit under the pre-re-ingest key files
+    under the live one instead of leaving two current rows."""
+    with tempfile.TemporaryDirectory() as d:
+        mcon, lcon, ds, cam, base, bbox, prov = _reingest_fixture(d)
+        old_key = labels_db.instance_key(ds, cam, base, bbox, 0)
+        labels_db.submit_point_edit(lcon, instance_key=old_key, annotator="alice",
+                                    points=_POINTS, provenance=prov)
+        check("...and it is the ONLY human work on this instance",
+              lcon.execute("SELECT count(*) FROM annotations").fetchone()[0] == 0
+              and lcon.execute("SELECT count(*) FROM mask_edits").fetchone()[0] == 0)
+        new_key = _shift_boxes(mcon)
+        rep = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+        check("the reconciler sees a points-only instance",
+              rep["instances"] == 1 and rep["point_edits"] == 1, str(rep))
+        check("...and moves its row", rep["rekeyed"]["point_edits"] == 1, str(rep["rekeyed"]))
+        eff = lcon.execute("SELECT effective_key FROM v_current_point_edits "
+                           "WHERE instance_key = ?", [old_key]).fetchone()
+        check("the points point at the live detection", eff == (new_key,), str(eff))
+
+        # alice's tab was open across the re-ingest and resubmits the old item.
+        labels_db.submit_point_edit(lcon, instance_key=old_key, annotator="alice",
+                                    kind="too_small", provenance=prov)
+        cur = lcon.execute(
+            "SELECT effective_key, kind FROM v_current_point_edits WHERE annotator = 'alice'"
+        ).fetchall()
+        check("one current row, on the live key, carrying the newest verdict",
+              cur == [(new_key, "too_small")], str(cur))
         mcon.close(); lcon.close()
 
 
@@ -927,6 +1044,8 @@ def main():
     test_a_false_positive_stays_removed_across_a_rekey()
     test_an_outline_correction_follows_its_instance()
     test_rekey_collides_with_nothing_when_one_annotator_has_rows_in_both_tables()
+    test_point_edits_store_and_validate()
+    test_point_edits_follow_their_instance_and_a_stale_key()
     test_mask_survives_clip_restore_on_a_deployed_shape_db()
     test_mask_columns_are_last_so_the_archive_stays_aligned()
     test_schema_is_idempotent_and_seeded()

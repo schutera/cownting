@@ -317,7 +317,7 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
     `db.connect`'s retry substrings, so a `read_only` open surfaces as an un-retried
     500."""
     for seq in ("seq_annotation", "seq_label_event", "seq_taxonomy_audit", "seq_backup_run",
-                "seq_mask_edit"):
+                "seq_mask_edit", "seq_point_edit"):
         con.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq} START 1;")
 
     # A GROUP is a question ("Sun exposure"). Poweruser-editable at runtime and
@@ -498,6 +498,50 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
         );
         """
     )
+    # One row per (instance, annotator, submission) of the BODY POINTS step
+    # (docs/roadmap/M6_body_points.md §4). The labeler places five named points
+    # by hand; there is no model seed. Same append-only discipline as the two
+    # tables above, and a separate table for the same reason `mask_edits` is one:
+    # a point row is not an answer and must not count towards coverage.
+    #
+    # `kind` discriminates: 'points' carries the five entries, 'too_small' carries
+    # none and says the cow is too small to place any. `points` is JSON with
+    # exactly five entries in POINT_NAMES order, each `[x, y]` in FULL-FRAME px or
+    # `null` for "can't see". `n_placed` is the count of non-null entries.
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS point_edits (
+            edit_id        BIGINT PRIMARY KEY DEFAULT nextval('seq_point_edit'),
+            instance_key   VARCHAR NOT NULL,
+            effective_key  VARCHAR NOT NULL,
+            key_version    VARCHAR NOT NULL DEFAULT 'v1',
+            annotator      VARCHAR NOT NULL,
+            version        INTEGER NOT NULL DEFAULT 1,
+            superseded_at  TIMESTAMP,
+            kind           VARCHAR NOT NULL DEFAULT 'points',
+            points         VARCHAR,
+            n_placed       INTEGER,
+            dataset_id     VARCHAR,
+            camera_id      VARCHAR,
+            frame_path     VARCHAR,
+            frame_basename VARCHAR,
+            frame_sig      VARCHAR,
+            bbox_x1 DOUBLE, bbox_y1 DOUBLE, bbox_x2 DOUBLE, bbox_y2 DOUBLE,
+            ordinal        INTEGER NOT NULL DEFAULT 0,
+            session_id     VARCHAR,
+            serve_event_id BIGINT,
+            submitted_at   TIMESTAMP DEFAULT now(),
+            client_elapsed_ms BIGINT,
+            annotator_role      VARCHAR,
+            annotator_real_role VARCHAR,
+            acting_preview BOOLEAN DEFAULT FALSE,
+            auth_disabled  BOOLEAN DEFAULT FALSE,
+            app_version    VARCHAR,
+            client_info    VARCHAR,
+            UNIQUE (instance_key, annotator, version)
+        );
+        """
+    )
     # Append-only effort telemetry. 'served' is the non-forgeable time-on-task clock:
     # it is written server-side by the queue, so a client cannot claim a shorter
     # elapsed time than it actually took.
@@ -600,6 +644,8 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
         # The queue's false-positive anti-join runs on every batch, so it gets an
         # index for the same reason idx_ann_effective has one.
         ("idx_mask_effective", "mask_edits", "effective_key"),
+        # The queue joins this annotator's current point row on every batch.
+        ("idx_point_effective", "point_edits", "effective_key"),
     ):
         con.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})")
 
@@ -642,6 +688,12 @@ def init_labels_db(con: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE OR REPLACE VIEW v_current_mask_edits AS
         SELECT * FROM mask_edits WHERE superseded_at IS NULL;
+        """
+    )
+    con.execute(
+        """
+        CREATE OR REPLACE VIEW v_current_point_edits AS
+        SELECT * FROM point_edits WHERE superseded_at IS NULL;
         """
     )
     # The instances at least one annotator has declared not-an-animal. This is what
@@ -1719,6 +1771,153 @@ def submit_mask_edit(
     return int(edit_id)
 
 
+# --------------------------------------------------------------------- body points
+# The five points a labeler places on each cow (docs/roadmap/M6_body_points.md
+# §2). Index order is click order AND storage order: `point_edits.points[i]` is
+# the point named here at i. Frozen in code like MASK_EDIT_KINDS, not
+# poweruser-editable — every consumer indexes the JSON by position, so a
+# runtime-added point would shift every stored row's meaning. The frontend
+# carries the same list with the labeler-facing copy; the taxonomy route serves
+# this one so the two can be compared.
+POINT_NAMES: tuple[str, ...] = ("nose", "shoulders", "tail_base", "front_hoof", "hind_hoof")
+# 'points' carries the five entries; 'too_small' carries none and says the whole
+# cow is too small for any of them. There is no per-point escape kind — a point
+# the labeler cannot see is a `null` entry inside 'points'.
+POINT_EDIT_KINDS: tuple[str, ...] = ("points", "too_small")
+
+
+def _validate_points(points: Sequence[Sequence[float] | None] | None
+                     ) -> tuple[list[list[float] | None], int]:
+    """The stored shape of `points`, or ValueError.
+
+    Exactly `len(POINT_NAMES)` entries, each `[x, y]` finite or None. At least one
+    entry must be placed: five nulls is not a body-points answer, it is the
+    'too_small' verdict wearing the wrong kind, and storing it as 'points' would
+    count it as a posed cow in every later tally."""
+    if points is None or len(points) != len(POINT_NAMES):
+        raise ValueError(f"points needs exactly {len(POINT_NAMES)} entries, one per "
+                         f"{POINT_NAMES}, got {None if points is None else len(points)}")
+    out: list[list[float] | None] = []
+    n_placed = 0
+    for name, p in zip(POINT_NAMES, points):
+        if p is None:
+            out.append(None)
+            continue
+        if len(p) != 2:
+            raise ValueError(f"point {name!r} must be [x, y] or null")
+        x, y = float(p[0]), float(p[1])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError(f"point {name!r} must be finite")
+        out.append([x, y])
+        n_placed += 1
+    if n_placed == 0:
+        raise ValueError("every point is null — use kind 'too_small' for a cow with "
+                         "no visible points")
+    return out, n_placed
+
+
+def submit_point_edit(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    instance_key: str,
+    effective_key: str | None = None,
+    annotator: str,
+    kind: str = "points",
+    points: Sequence[Sequence[float] | None] | None = None,
+    provenance: Mapping[str, Any] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
+) -> int:
+    """Append one body-points submission and supersede this annotator's previous one.
+
+    Mirrors `submit_mask_edit` on purpose — append-only, `VersionRace` on the lost
+    UNIQUE race, explicit transaction, `effective_key`-supersedes /
+    `instance_key`-versions, alias resolution on the default `effective_key` —
+    because it is the same kind of object written by the same people at the same
+    moment, and a second discipline here would be a second set of bugs.
+
+    Unlike `submit_mask_edit` there is no weakest verdict to protect: both kinds
+    are a full statement about the cow, so the latest one wins.
+
+    `points` is full-frame px and is stored as JSON (see `_validate_points`).
+    Returns the new `edit_id`."""
+    if kind not in POINT_EDIT_KINDS:
+        raise ValueError(f"kind must be one of {POINT_EDIT_KINDS}, got {kind!r}")
+    if not annotator:
+        raise ValueError("a point edit needs an annotator")
+
+    points_json: str | None = None
+    n_placed: int | None = None
+    if kind == "points":
+        pts, n_placed = _validate_points(points)
+        points_json = json.dumps(pts, separators=(",", ":"))
+    elif points is not None:
+        # A 'too_small' with coordinates would export as both a posed and an
+        # unposed cow; refuse rather than pick one.
+        raise ValueError("a 'too_small' verdict carries no points")
+
+    prov = _picked(provenance, PROVENANCE_COLS, "provenance")
+    tel = _picked(telemetry, TELEMETRY_COLS, "telemetry")
+    effective_key = effective_key or resolve_effective_key(con, instance_key)
+
+    cols = ["edit_id", "instance_key", "effective_key", "key_version", "annotator",
+            "version", "kind", "points", "n_placed",
+            "dataset_id", "camera_id", "frame_path", "frame_basename", "frame_sig",
+            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "ordinal",
+            "session_id", "serve_event_id", "client_elapsed_ms",
+            "annotator_role", "annotator_real_role", "acting_preview", "auth_disabled",
+            "app_version", "client_info"]
+
+    edit_id = con.execute("SELECT nextval('seq_point_edit')").fetchone()[0]
+    version = 0
+    con.execute("BEGIN TRANSACTION")
+    try:
+        prev = con.execute(
+            "SELECT max(version) FROM point_edits WHERE instance_key = ? AND annotator = ?",
+            [instance_key, annotator],
+        ).fetchone()[0]
+        version = int(prev or 0) + 1
+        con.execute(
+            "UPDATE point_edits SET superseded_at = now() WHERE annotator = ? "
+            "AND superseded_at IS NULL AND (effective_key = ? OR instance_key = ?)",
+            [annotator, effective_key, instance_key],
+        )
+        values: list[Any] = [
+            edit_id, instance_key, effective_key, KEY_VERSION, annotator,
+            version, kind, points_json, n_placed,
+            prov.get("dataset_id"), prov.get("camera_id"), prov.get("frame_path"),
+            prov.get("frame_basename"), prov.get("frame_sig"),
+            prov.get("bbox_x1"), prov.get("bbox_y1"), prov.get("bbox_x2"), prov.get("bbox_y2"),
+            int(prov.get("ordinal") or 0),
+            tel.get("session_id"), tel.get("serve_event_id"), tel.get("client_elapsed_ms"),
+            tel.get("annotator_role"), tel.get("annotator_real_role"),
+            bool(tel.get("acting_preview")), bool(tel.get("auth_disabled")),
+            tel.get("app_version"), tel.get("client_info"),
+        ]
+        con.execute(
+            f"INSERT INTO point_edits ({', '.join(cols)}) "
+            f"VALUES ({', '.join(['?'] * len(cols))})",
+            values,
+        )
+        _insert_event(
+            con, kind="submitted", session_id=tel.get("session_id"), annotator=annotator,
+            instance_key=instance_key, class_key=None,
+            # Same convention as the outline: EVENT_KINDS is frozen, so the
+            # discriminator rides in `detail`.
+            detail=f"points_{kind}",
+        )
+        con.execute("COMMIT")
+    except _RACE_ERRORS as e:
+        _rollback(con)
+        raise VersionRace(
+            f"{annotator!r} already has version {version} of the body points for "
+            f"{instance_key!r} — a concurrent submit won the race; re-fetch and resubmit"
+        ) from e
+    except Exception:
+        _rollback(con)
+        raise
+    return int(edit_id)
+
+
 def undo_last(
     con: duckdb.DuckDBPyConnection,
     annotator: str,
@@ -1811,6 +2010,7 @@ def _insert_event(
 KEYED_TABLES: tuple[tuple[str, str], ...] = (
     ("annotations", "annotation_id"),
     ("mask_edits", "edit_id"),
+    ("point_edits", "edit_id"),
 )
 
 
@@ -1936,6 +2136,7 @@ def reconcile_dataset(
         "instances": len(labels),
         "annotations": sum(int(r["n_annotations"]) for r in labels),
         "mask_edits": sum(int(r["n_mask_edits"]) for r in labels),
+        "point_edits": sum(int(r["n_point_edits"]) for r in labels),
         # The population an annotations-only reconciler was structurally blind
         # to: an instance whose ONLY human work is a corrected outline or a 'not
         # a cow' verdict. On the first run after this fix a non-zero value here
