@@ -865,6 +865,11 @@ def test_milestone_announces_each_level_once():
     minutes forever — so the watermark advance is what this pins, including
     across the multi-level jump an import produces.
     """
+    # The last check below is about an UNSET webhook, so unset it here rather
+    # than inherit one: test_labels_backup sets it, never clears it, and runs
+    # before this file in pytest's default order — which made this test fail in
+    # a full-suite run and pass alone. Every test that wants a webhook sets its own.
+    os.environ.pop(labels_backup.WEBHOOK_ENV, None)
     with tempfile.TemporaryDirectory() as d:
         # Built before the store is opened: a Config that fails validation while a
         # connection is live leaves the handle open, and on Windows that surfaces
