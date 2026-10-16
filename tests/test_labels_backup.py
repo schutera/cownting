@@ -60,8 +60,8 @@ _TOKEN = "SuperSecretToken1234567890"
 # an instance can carry a geometry verdict and NO answer (a "not a cow" removal
 # retires it before any question is asked), so a join would drop exactly the
 # rows that have no other readable copy.
-_MEMBERS = {"labels.duckdb", "annotations.csv", "mask_edits.csv", "taxonomy.json",
-            "MANIFEST.json", "README.md"}
+_MEMBERS = {"labels.duckdb", "annotations.csv", "mask_edits.csv", "point_edits.csv",
+            "taxonomy.json", "MANIFEST.json", "README.md"}
 
 _SHADED = {"class_key": "sun_exposure.shaded", "group_key": "sun_exposure",
            "class_name": "Shaded"}
@@ -214,6 +214,56 @@ def test_csv_contains_the_answers():
         check("...carrying its skip_reason",
               all(r["skip_reason"] == "occluded" for r in skip_rows),
               str([r["skip_reason"] for r in skip_rows]))
+
+
+def test_a_day_of_only_point_work_is_backed_up():
+    """M6 §4.4. The body-points step writes to `point_edits` before any question
+    is answered, so a labeler who only placed points has written nothing to
+    `annotations` or `mask_edits`. The gate must still see that work, and the
+    bundle must carry it in a readable CSV."""
+    with tempfile.TemporaryDirectory() as d:
+        config = _config(d)
+        con = db.connect(config.paths.labels_db_path)
+        labels_db.init_labels_db(con)
+        key = labels_db.instance_key("2026-07-03", "camera_01", "00000001.jpg",
+                                     [10, 20, 110, 220], 0)
+        pts = [[100.0, 60.0], [60.0, 30.0], [15.0, 40.0], [70.0, 215.0], None]
+        labels_db.submit_point_edit(
+            con, instance_key=key, annotator="alice", points=pts,
+            provenance={"dataset_id": "2026-07-03", "camera_id": "camera_01",
+                        "frame_basename": "00000001.jpg", "bbox_x1": 10.0,
+                        "bbox_y1": 20.0, "bbox_x2": 110.0, "bbox_y2": 220.0})
+        labels_db.submit_point_edit(con, instance_key=key, annotator="bob",
+                                    kind="too_small")
+        is_due, reason = labels_backup.due(con, config.backup)
+        check("a store holding only point work is due", is_due, reason)
+
+        out = os.path.join(d, "point_edits.csv")
+        n = labels_backup.export_point_csv(con, out)
+        con.close()
+        with open(out, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        check("export_point_csv reports the rows it wrote", n == len(rows) == 2,
+              f"reported {n}, file has {len(rows)}")
+        by = {r["annotator"]: r for r in rows}
+        check("the points survive as the stored JSON",
+              json.loads(by["alice"]["points"]) == pts, by["alice"]["points"])
+        check("...with their count and the day they belong to",
+              by["alice"]["n_placed"] == "4" and by["alice"]["dataset_id"] == "2026-07-03",
+              str(by["alice"]))
+        check("the too_small verdict is a row with no points",
+              by["bob"]["kind"] == "too_small" and by["bob"]["points"] == "",
+              str(by["bob"]))
+
+        rec = _Recorder()
+        r = labels_backup.run_backup(config, trigger="cli", poster=rec)
+        check("the run fires on point work alone", r["status"] == "done", str(r))
+        with zipfile.ZipFile(r["zip_path"]) as z:
+            names = set(z.namelist())
+            readme = z.read("README.md").decode("utf-8")
+        check("point_edits.csv is in the bundle", "point_edits.csv" in names,
+              str(sorted(names)))
+        check("...and the README names it", "point_edits.csv" in readme)
 
 
 def test_snapshot_is_a_real_db():
@@ -656,6 +706,7 @@ def main():
     print("=== test_labels_backup ===")
     test_gate_and_bundle()
     test_csv_contains_the_answers()
+    test_a_day_of_only_point_work_is_backed_up()
     test_snapshot_is_a_real_db()
     test_oversize_ladder_and_retention()
     test_a_failed_delivery_still_completes_the_backup()
