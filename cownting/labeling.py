@@ -928,6 +928,12 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         # is: the step's memory must not live only in React state.
         "points": _points_of(row.get("my_points")),
         "points_done": bool(row.get("points_done")),
+        # Where POST /api/label/points accepts a point, full-frame px — the same
+        # widest_crop_box the route checks, around the ANCHOR box. Served so the
+        # client can refuse a click the route would 400: the zoom ladder is cut
+        # around the display box, which after an outline correction is not the
+        # anchor box, and a write the server rejects is retried forever.
+        "point_bounds": [float(v) for v in widest_crop_box(bbox, cfg)],
         # The zoom ladder for the outline editor, with the level it opens on.
         # Sent per item because every level's geometry is a function of THIS
         # animal's box, and computing it here is what keeps crop_geometry out of

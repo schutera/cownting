@@ -75,8 +75,9 @@ _ITEM_FIELDS = (
     # hold-Space peek needs to place full-frame coordinates on a DOWNSCALED image.
     "mask", "mask_frame", "mask_seed", "frame_w", "frame_h", "geom_done",
     "crop_levels", "crop_level",
-    # M6: this annotator's body points and whether the step is passed.
-    "points", "points_done",
+    # M6: this annotator's body points, whether the step is passed, and where
+    # the points route accepts a point.
+    "points", "points_done", "point_bounds",
 )
 
 
@@ -1009,6 +1010,9 @@ def test_points_roundtrip_and_validation():
         check("too_small carrying points is a 400",
               _post_points(client, item, kind="too_small", points=pts).status_code == 400)
         sx0, sy0, sx1, sy1 = labeling.widest_crop_box(item["bbox"], config.annotation)
+        check("the item serves the route's own bound as point_bounds",
+              item["point_bounds"] == [float(sx0), float(sy0), float(sx1), float(sy1)],
+              f"{item['point_bounds']} vs {(sx0, sy0, sx1, sy1)}")
         far = [[sx1 + 50.0, sy1 + 50.0], *pts[1:]]
         check("a point beyond the widest crop is a 400",
               _post_points(client, item, points=far).status_code == 400)
