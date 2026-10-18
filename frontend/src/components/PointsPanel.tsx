@@ -1,5 +1,12 @@
 import type { ReactNode } from "react";
-import { POINT_COUNT, POINT_STEPS, canHide, nextIndex, type PointDraft } from "../lib/pointSteps";
+import {
+  POINT_COUNT,
+  POINT_STEPS,
+  canHide,
+  isComplete,
+  nextIndex,
+  type PointDraft,
+} from "../lib/pointSteps";
 import { PANEL_H } from "./QuestionPanel";
 import { StickCow } from "./StickCow";
 
@@ -35,6 +42,9 @@ export interface PointsPanelProps {
   onHide: () => void;
   onUndo: () => void;
   onTooSmall: () => void;
+  /** Enter: accept all five and go on. The fifth point never does this by
+      itself — the labeler sees the whole set first. */
+  onAccept: () => void;
 }
 
 export function PointsPanel({
@@ -45,6 +55,7 @@ export function PointsPanel({
   onHide,
   onUndo,
   onTooSmall,
+  onAccept,
 }: PointsPanelProps) {
   const next = nextIndex(draft);
   const step = next === null ? null : POINT_STEPS[next];
@@ -56,7 +67,12 @@ export function PointsPanel({
     body = "→ keeps it. Click the photo to place points instead.";
   } else if (step === null) {
     title = "All five points are given";
-    body = "→ goes on to the questions. Backspace takes back the last point.";
+    body = (
+      <>
+        <span style={{ color: INK }}>Enter saves them</span> and goes on to the questions.
+        Backspace takes back the last point.
+      </>
+    );
   } else {
     title = (
       <>
@@ -113,6 +129,11 @@ export function PointsPanel({
             <KeyButton keyLabel="S" onClick={onTooSmall}>
               Too small
             </KeyButton>
+            {/* Last and amber, like the outline step's Enter: it is the one
+                action that saves the set, and it waits for all five. */}
+            <KeyButton keyLabel="Enter" onClick={onAccept} disabled={!isComplete(draft)} primary>
+              Save points
+            </KeyButton>
           </div>
         </div>
       </div>
@@ -125,11 +146,13 @@ function KeyButton({
   children,
   onClick,
   disabled,
+  primary,
 }: {
   keyLabel: string;
   children: ReactNode;
   onClick: () => void;
   disabled?: boolean;
+  primary?: boolean;
 }) {
   return (
     <button
@@ -139,11 +162,21 @@ function KeyButton({
       className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg border box-border text-[12px] cursor-pointer
                  transition-opacity duration-150 hover:opacity-80 disabled:opacity-40 disabled:cursor-default
                  focus-visible:outline focus-visible:outline-2"
-      style={{ background: CARD, borderColor: HAIRLINE, color: INK, outlineColor: INK }}
+      style={{
+        background: CARD,
+        borderColor: primary ? ACCENT : HAIRLINE,
+        color: INK,
+        outlineColor: INK,
+      }}
     >
       <span
         className="grid place-items-center rounded px-1 font-mono text-[11px] font-bold leading-none"
-        style={{ minWidth: 18, height: 18, background: HAIRLINE }}
+        style={{
+          minWidth: 18,
+          height: 18,
+          background: primary ? ACCENT : HAIRLINE,
+          color: primary ? "#14161A" : undefined,
+        }}
       >
         {keyLabel}
       </span>

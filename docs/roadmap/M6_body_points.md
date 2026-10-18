@@ -13,7 +13,7 @@ These were made with the owner on 2026-10-15. They are not open.
 | 1 | **No model seed.** The labeler places every point. There is no prediction pass, no new job, no new dependency in the image. |
 | 2 | **Five points:** nose, top of the shoulders, tail base, one front hoof, one hind hoof. |
 | 3 | **Every cow gets the step.** There is no size floor for the step. The labeler can answer **Too small** for the whole cow. |
-| 4 | **Guided order.** The panel names the next point. One click places it. One key marks it *can't see*. The step completes after the fifth point. |
+| 4 | **Guided order.** The panel names the next point. One click places it. One key marks it *can't see*. After the fifth point the step shows all five and **Enter saves them** — the fifth point does not save by itself (owner's review, 2026-10-18). |
 | 5 | **Per-point escape.** Each point can be *can't see*. A hidden point is stored as `null`, not dropped. |
 | 6 | The step is **step 2 of 4**: outline, body points, sun exposure, behaviour. |
 | 7 | Points are stored in **full-frame pixels**, in `labels.duckdb`, append-only, like `mask_edits`. |
@@ -52,7 +52,7 @@ does not ask the labeler to decide which leg is which.
 
 ```
 [1/4] Is there a cow in the box?    Enter yes · E fix · X no cow
-[2/4] Body points                   click · X can't see · Backspace undo · S too small
+[2/4] Body points                   click · X can't see · Backspace undo · S too small · Enter save
 [3/4] Sun exposure                  Y X C
 [4/4] Behaviour                     Y X C V B
 ```
@@ -104,8 +104,11 @@ queue retries a refused write forever.
 | `F` | Flag the cow, as today. Leaves the step. |
 | `Space`, `H` | Holds, as today. |
 
-`Enter` does nothing in this step. The step completes by itself after the fifth
-point, or on `S`. There is no save button.
+`Enter` (or the amber **Save points** button) saves the five and goes on. It
+waits until all five are given; before that it shakes and says so. The fifth
+point never saves by itself: the labeler sees the whole set first and can still
+take a point back. `S` saves at once, because that one key press is the whole
+verdict. `→` never saves — the outline step's rule, looking is not judging.
 
 `X` and `S` are safe to use: the answer letters are inert during this step,
 exactly as they are during the outline step.
@@ -113,9 +116,41 @@ exactly as they are during the outline step.
 ### 3.5 Revisiting
 
 `←` from Sun exposure returns to the body points step. The placed points are
-shown. `Backspace` removes the last one and the prompt reopens. `→` leaves again
-only when all five are placed or hidden. A revisit that changes nothing writes
-nothing.
+shown. `Backspace` removes the last one and the prompt reopens. `→` leaves only
+while the draft is exactly what is stored (`pointSteps.leavable`); after any
+change, `Enter` saves again. A revisit that changes nothing writes nothing.
+
+### 3.7 Points-only mode
+
+The ordinary queue never serves a cow back to the labeler who answered it, and a
+cow leaves the queue at its answer target. So the cows that already have
+answers — the ones where points are worth most, because they pair with the
+behaviour answers — would almost never get points. On production on 2026-10-18
+that was 3,248 cows.
+
+`/label?mode=points` (the "Points only" link in the page header) serves them:
+
+- **Who is served:** every cow with at least one current answer from anyone, no
+  current `point_edits` row from anyone, and no false-positive verdict. One
+  labeler's points (or *too small*) take it out — one set per cow is enough
+  (owner's decision, 2026-10-18). It is not annotator-scoped.
+- **Steps:** the outline (only if this labeler has not judged it) and the points.
+  No questions. `Enter` on the points saves them and the next cow comes.
+- **Order:** day term, legible first, under a panel first, then the per-labeler
+  md5 permutation. No `worth_asking`: that is about the attribute model's
+  uncertainty on a question, and no question is asked.
+- **No flags.** A flag is stored as an `annotations` row with outcome
+  `skipped`, and it supersedes the labeler's own current answer on the cow. In a
+  pass over cows they already answered, one `F` would destroy their answer. The
+  ways out are `X` on the outline (no cow), `S` (too small), and `→` for a crop
+  that cannot be shown (nothing is written; the cow stays in the backlog).
+- **Telemetry:** its `served` events carry `detail = 'points'`, and
+  `SQL_ABANDONED` leaves them out — a points-only serve never gets an answer.
+- **Progress:** `/api/label/progress` returns `points_backlog`, by the same rule
+  the queue serves, and the side panel shows "N cows still need body points" in
+  this mode.
+- The mode is a URL parameter, not a stored preference, and switching it
+  remounts the page, so no tape or draft crosses from one mode to the other.
 
 ### 3.6 Copy
 

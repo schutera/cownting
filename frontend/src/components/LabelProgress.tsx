@@ -89,6 +89,9 @@ export interface LabelStream {
       that predates the step — the line is then left out, not printed as 0. */
   bodyPoints?: number;
   tooSmall?: number;
+  /** Points-only mode: cows that have answers and no body points from anyone.
+      Undefined outside that mode, where the line is left out. */
+  pointsBacklog?: number;
 }
 
 export interface LabelProgressProps {
@@ -448,6 +451,12 @@ export function LabelProgress({
             {stream.bodyPoints.toLocaleString()} {stream.bodyPoints === 1 ? "cow" : "cows"} with
             body points
             {stream.tooSmall ? ` · ${stream.tooSmall.toLocaleString()} too small` : ""}
+          </p>
+        ) : null}
+        {stream.pointsBacklog !== undefined ? (
+          <p className="text-[11.5px] leading-snug mt-0.5" style={{ color: INK }}>
+            {stream.pointsBacklog.toLocaleString()}{" "}
+            {stream.pointsBacklog === 1 ? "cow still needs" : "cows still need"} body points
           </p>
         ) : null}
       </Block>

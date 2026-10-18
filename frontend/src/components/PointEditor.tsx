@@ -66,8 +66,13 @@ export interface PointEditorProps {
   onPlace: (xy: [number, number]) => void;
   /** Hold-H: hide every mark, and take no clicks, so the bare pixels can be judged. */
   hidden?: boolean;
-  /** The crop could not be loaded; carries the key like InstanceCrop's does. */
+  /** The item's OWN crop could not be loaded; carries the key like
+      InstanceCrop's does. Reported only for the default zoom level — see
+      onLevelFailed. */
   onError?: (instanceKey: string) => void;
+  /** Another zoom level could not be loaded. The editor has already gone back
+      to the default level; the page only has to say so. */
+  onLevelFailed?: () => void;
   className?: string;
 }
 
@@ -80,6 +85,7 @@ export function PointEditor({
   onPlace,
   hidden = false,
   onError,
+  onLevelFailed,
   className,
 }: PointEditorProps) {
   const level = levels[clamp(levelIndex, 0, Math.max(0, levels.length - 1))];
@@ -157,7 +163,20 @@ export function PointEditor({
         className="absolute inset-0 w-full h-full"
         decoding="async"
         draggable={false}
-        onError={() => onError?.(item.instance_key)}
+        onError={() => {
+          // Only the item's OWN crop failing means "this cow cannot be shown".
+          // Another rung can fail on its own — a tighter crop of a cow low in
+          // the frame is refused for the timestamp band while the default one
+          // renders — and treating that as a dead crop blocked the whole cow
+          // behind a flag. So a failed rung just goes back to the default.
+          const home = clamp(item.crop_level ?? 0, 0, Math.max(0, levels.length - 1));
+          if (clamp(levelIndex, 0, Math.max(0, levels.length - 1)) === home) {
+            onError?.(item.instance_key);
+          } else {
+            onLevelChange(home);
+            onLevelFailed?.();
+          }
+        }}
       />
       <svg
         ref={svgRef}

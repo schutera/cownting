@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { canManageData, useAuth } from "../lib/auth";
 import type {
   BodyPoint,
@@ -39,6 +39,7 @@ import {
   hide as hidePointIn,
   insideBounds,
   isComplete as pointsComplete,
+  leavable as pointsLeavable,
   nextIndex as nextPointIndex,
   place as placePointIn,
   sameDraft,
@@ -248,9 +249,12 @@ export interface FlowState {
   hasPoints: boolean;
   inPoints: boolean;
   pointsDone: boolean;
-  /** On the points step, the draft may be left as it is: all five given, or
-      an unchanged 'too small'. */
+  /** On the points step, the draft may be left without a write: it is exactly
+      the stored points, or an untouched stored 'too small'. */
   pointsReady: boolean;
+  /** Points-only mode: the points are the LAST step, so leaving them is
+      leaving the item. */
+  pointsOnly: boolean;
   outlineOpen: boolean;
   complete: boolean;      // every REQUIRED question answered
 }
@@ -283,10 +287,15 @@ export function forwardTarget(
     return s.hasPoints ? "points" : "question";
   }
   if (s.inPoints) {
-    // The same gate for the points: all five given (or 'too small') before the
-    // questions. Completing the fifth point already moves on by itself, so an
-    // arrow only gets here on a revisit, where leaving unchanged writes nothing.
-    return s.pointsReady && s.pointsDone ? "question" : "blocked";
+    // The same gate for the points: the questions only once the points are
+    // SAVED. Enter accepts a complete draft; the arrow never does, for the
+    // outline step's reason — looking is not judging. So the arrow leaves only
+    // a revisit whose draft is still exactly what is stored.
+    if (!(s.pointsReady && s.pointsDone)) return "blocked";
+    // In points-only mode there is no question after it: a saved item at the
+    // head has already moved on, so this is a revisit, and forward is the head.
+    if (s.pointsOnly) return s.cursor < s.frontier ? "frontier" : "blocked";
+    return "question";
   }
   if (s.step < s.stepCount - 1) return "question";
   // On the last question: leaving review returns to the head of the tape, and
@@ -326,7 +335,18 @@ function newSessionId(): string {
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** The route. `?mode=points` is the POINTS-ONLY mode (M6 §3.7): the backlog of
+    cows that already have answers but no body points, asked for the outline and
+    the points only. A URL parameter rather than a stored preference — this page
+    keeps none — and the screen is REMOUNTED on a switch (the key), so no tape,
+    draft or answer of one mode can leak into the other. */
 export default function Label() {
+  const [params] = useSearchParams();
+  const pointsOnly = params.get("mode") === "points";
+  return <LabelScreen key={pointsOnly ? "points" : "full"} pointsOnly={pointsOnly} />;
+}
+
+function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
   const { user } = useAuth();
   const canManage = canManageData(user);
 
@@ -405,6 +425,11 @@ export default function Label() {
   const [pointDraft, setPointDraft] = useState<PointDraft>([]);
   // Walked BACK into the points step after passing it — revisitGeom's twin.
   const [revisitPoints, setRevisitPoints] = useState(false);
+  // Cows this session declared NOT A COW. They have no body to place points
+  // on, and nothing on the item says so (a removal echoes no geometry), so
+  // without this a walk back to one opened the points step and held the
+  // labeler there until they wrote points for a detection they had removed.
+  const [removedByKey, setRemovedByKey] = useState<Record<string, boolean>>({});
 
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -592,7 +617,12 @@ export default function Label() {
      questions are not reachable until five points are given or the cow is
      marked too small. A server that predates M6 sends no `points_done`, and the
      step is then skipped rather than asked of a route that does not exist. */
-  const hasPoints = current !== null && current.points_done !== undefined;
+  // A cow already removed (not a cow) or flagged has no points step: there is no
+  // body to point at, or the labeler already said it cannot be judged.
+  const pointsClosed =
+    currentKey !== null &&
+    (removedByKey[currentKey] === true || flaggedByKey[currentKey] !== undefined);
+  const hasPoints = current !== null && current.points_done !== undefined && !pointsClosed;
   // This session's verdict first, then the server's: `points_done` with null
   // points is a stored 'too_small'.
   const savedPoints: BodyPoint[] | "too_small" | null =
@@ -601,12 +631,20 @@ export default function Label() {
       : (pointsByKey[currentKey] ??
         (current.points_done ? (current.points ?? "too_small") : null));
   const pointsDone = !hasPoints || savedPoints !== null;
+  // In points-only mode there is nothing after this step, so whenever the
+  // outline is not on screen the points are.
   const inPoints =
-    current !== null && !cropFailed && hasPoints && !inGeometry && (!pointsDone || revisitPoints);
-  const pointsReady =
-    pointsComplete(pointDraft) || (savedPoints === "too_small" && pointDraft.length === 0);
+    current !== null &&
+    !cropFailed &&
+    hasPoints &&
+    !inGeometry &&
+    (pointsOnly || !pointsDone || revisitPoints);
+  // The step may be LEFT without a write only when the draft says exactly what
+  // is stored. A complete but unsaved draft is not leavable: Enter accepts it.
+  const pointsReady = pointsLeavable(pointDraft, savedPoints);
   // Every step number on screen counts the steps that exist for THIS item.
   const preSteps = hasPoints ? 2 : 1;
+  const totalSteps = preSteps + (pointsOnly ? 0 : steps.length);
 
   useEffect(() => {
     const onResize = () => setViewportH(window.innerHeight);
@@ -688,6 +726,7 @@ export default function Label() {
       const q = await getLabelQueue({
         exclude: [...have, ...recentWrittenRef.current],
         order: "spread",
+        ...(pointsOnly ? { mode: "points" as const } : {}),
       });
       const known = new Set([...have, ...recentWrittenRef.current]);
       const fresh = q.items.filter((i) => !known.has(i.instance_key));
@@ -706,7 +745,7 @@ export default function Label() {
       fetchingRef.current = false;
       setFetching(false);
     }
-  }, [setTape]);
+  }, [pointsOnly, setTape]);
 
   // Boot: taxonomy, stats, session bracket. StrictMode double-mounts this; the
   // extra start/end pair is harmless fire-and-forget telemetry and the GETs are
@@ -941,6 +980,11 @@ export default function Label() {
         for (const it of dropped) delete next[it.instance_key];
         return next;
       });
+      setRemovedByKey((prev) => {
+        const next = { ...prev };
+        for (const it of dropped) delete next[it.instance_key];
+        return next;
+      });
       setTape({ items: t.items.slice(drop), cursor: cursor - drop, frontier: frontier - drop });
     } else {
       setTape({ items: t.items, cursor, frontier });
@@ -981,7 +1025,11 @@ export default function Label() {
       if (cropFailed) {
         // Not a silent refusal: there are no pixels to judge, and F is the way out.
         shake();
-        showHint("this image can't be shown — press F to flag it");
+        showHint(
+          pointsOnly
+            ? "this image can't be shown — press → to skip it"
+            : "this image can't be shown — press F to flag it",
+        );
         return;
       }
       const item = current;
@@ -1072,6 +1120,7 @@ export default function Label() {
       currentKey,
       firstUnansweredIndex,
       isComplete,
+      pointsOnly,
       reviewing,
       sessionId,
       shake,
@@ -1119,14 +1168,18 @@ export default function Label() {
     if (current === null || seed === null) return;
     if (cropFailed) {
       shake();
-      showHint("this image can't be shown — press F to flag it");
+      showHint(
+        pointsOnly
+          ? "this image can't be shown — press → to skip it"
+          : "this image can't be shown — press F to flag it",
+      );
       return;
     }
     setDraft(seed);
     setFlag({ open: false });
     setOpenDefinitionKey(null);
     setHint(null);
-  }, [cropFailed, current, seed, shake, showHint]);
+  }, [cropFailed, current, pointsOnly, seed, shake, showHint]);
 
   const closeOutline = useCallback(() => {
     setDraft(null);
@@ -1191,6 +1244,7 @@ export default function Label() {
         // IS excluded here: the server will retire it for everyone, and being
         // served it again before that lands reads as a bug.
         markWritten(current.instance_key);
+        setRemovedByKey((prev) => ({ ...prev, [currentKey]: true }));
         closeOutline();
         if (reviewing) goTo(tapeRef.current.frontier);
         else advance();
@@ -1201,6 +1255,15 @@ export default function Label() {
       // and the cow still has to be answered. A verdict given on a walk back to
       // the outline leaves that step too; before, the gate stayed open on
       // screen after Enter and only the arrow left it.
+      // A later 'ok' or outline on a cow this session removed takes the
+      // removal back (the store supersedes it the same way), so the points
+      // step opens for it again.
+      setRemovedByKey((prev) => {
+        if (prev[currentKey] === undefined) return prev;
+        const next = { ...prev };
+        delete next[currentKey];
+        return next;
+      });
       closeOutline();
       setStep(0);
       setRevisitGeom(false);
@@ -1245,7 +1308,7 @@ export default function Label() {
     (
       key: string,
       index: number,
-      action: "placed" | "cant_see" | "undo" | "too_small",
+      action: "placed" | "cant_see" | "undo" | "too_small" | "accepted",
       mode: LabelInputMode,
     ) => {
       const now = activeNow();
@@ -1268,8 +1331,29 @@ export default function Label() {
     [activeNow, reviewing, sessionId],
   );
 
-  /** Write the step's verdict and hand on to the questions. The write goes to
-      the optimistic queue like every other; the UI does not wait for it. */
+  /** Leave the points step on the same animal: on to the questions — or, in
+      points-only mode, where the points are the last step, on to the next cow
+      (from a revisit, back to the head of the tape). */
+  const leavePoints = useCallback(() => {
+    setRevisitPoints(false);
+    setHint(null);
+    if (!pointsOnly) {
+      setStep(0);
+      return;
+    }
+    const t = tapeRef.current;
+    if (t.cursor < t.frontier) {
+      goTo(t.frontier);
+      return;
+    }
+    setRecentMs((prev) =>
+      [Math.max(0, Math.round(activeNow() - itemMarkRef.current)), ...prev].slice(0, 200),
+    );
+    advance();
+  }, [activeNow, advance, goTo, pointsOnly]);
+
+  /** Write the step's verdict and hand on. The write goes to the optimistic
+      queue like every other; the UI does not wait for it. */
   const commitPoints = useCallback(
     (verdict: PointDraft | "too_small") => {
       if (current === null || currentKey === null) return;
@@ -1287,35 +1371,38 @@ export default function Label() {
         client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
       };
       queue.enqueue({ kind: "points", req });
-      // Deliberately NOT markWritten(): points are not an answer, and excluding
-      // the key from refetches would hide a cow whose questions are still open.
+      // NOT markWritten() in the full flow: points are not an answer, and
+      // excluding the key from refetches would hide a cow whose questions are
+      // still open. In points-only mode the points ARE the item, so it is.
+      if (pointsOnly) markWritten(current.instance_key);
       setPointsByKey((prev) => ({ ...prev, [currentKey]: pts ?? "too_small" }));
       setPointDraft(pts ?? []);
-      setRevisitPoints(false);
-      setStep(0);
-      setHint(null);
+      leavePoints();
     },
-    [activeNow, current, currentKey, queue, sessionId],
+    [activeNow, current, currentKey, leavePoints, markWritten, pointsOnly, queue, sessionId],
   );
 
-  /** Where the draft goes after a point is given: on to the questions once all
-      five are, with a write only if it differs from what is already stored —
-      a revisit that ends where it started writes nothing. */
-  const settleDraft = useCallback(
-    (next: PointDraft) => {
-      if (!pointsComplete(next)) {
-        setPointDraft(next);
+  /** Enter (or the Save button): accept the whole set and hand on to the
+      questions. The fifth point does NOT do this by itself — the labeler sees
+      all five first and can still take one back (owner's review, 2026-10-18).
+      A draft that is exactly what is stored leaves without a write. */
+  const acceptPoints = useCallback(
+    (mode: LabelInputMode) => {
+      if (!inPoints || currentKey === null) return;
+      if (!pointsComplete(pointDraft)) {
+        shake();
+        showHint("place all five points first — X if you can't see one, S if the cow is too small");
         return;
       }
-      if (Array.isArray(savedPoints) && sameDraft(next, savedPoints)) {
-        setPointDraft(next);
-        setRevisitPoints(false);
-        setStep(0);
+      pointEvent(currentKey, -1, "accepted", mode);
+      if (Array.isArray(savedPoints) && sameDraft(pointDraft, savedPoints)) {
+        leavePoints();
         return;
       }
-      commitPoints(next);
+      commitPoints(pointDraft);
     },
-    [commitPoints, savedPoints],
+    [commitPoints, currentKey, inPoints, leavePoints, pointDraft, pointEvent, savedPoints, shake,
+      showHint],
   );
 
   /** A click on the photo: the next point goes there. */
@@ -1325,7 +1412,7 @@ export default function Label() {
       const idx = nextPointIndex(pointDraft);
       if (idx === null) {
         shake();
-        showHint("all five points are given — Backspace takes back the last one, → goes on");
+        showHint("all five points are given — Enter saves them, Backspace takes back the last one");
         return;
       }
       // The route's own bound, served on the item. Refused HERE, at the click,
@@ -1336,9 +1423,9 @@ export default function Label() {
         return;
       }
       pointEvent(currentKey, idx, "placed", "mouse");
-      settleDraft(placePointIn(pointDraft, xy));
+      setPointDraft(placePointIn(pointDraft, xy));
     },
-    [current, currentKey, inPoints, pointDraft, pointEvent, settleDraft, shake, showHint],
+    [current, currentKey, inPoints, pointDraft, pointEvent, shake, showHint],
   );
 
   /** X: the next point cannot be seen. */
@@ -1350,15 +1437,15 @@ export default function Label() {
         shake();
         showHint(
           idx === null
-            ? "all five points are given — Backspace takes back the last one"
+            ? "all five points are given — Enter saves them, Backspace takes back the last one"
             : "no point is visible — press S if the cow is too small, or F to flag it",
         );
         return;
       }
       pointEvent(currentKey, idx, "cant_see", mode);
-      settleDraft(hidePointIn(pointDraft));
+      setPointDraft(hidePointIn(pointDraft));
     },
-    [currentKey, inPoints, pointDraft, pointEvent, settleDraft, shake, showHint],
+    [currentKey, inPoints, pointDraft, pointEvent, shake, showHint],
   );
 
   /** Backspace: take back the last point given. Never ArrowLeft — the arrows
@@ -1385,13 +1472,12 @@ export default function Label() {
       if (savedPoints === "too_small") {
         // Already the stored verdict: leave, write nothing.
         setPointDraft([]);
-        setRevisitPoints(false);
-        setStep(0);
+        leavePoints();
         return;
       }
       commitPoints("too_small");
     },
-    [commitPoints, currentKey, inPoints, pointEvent, savedPoints],
+    [commitPoints, currentKey, inPoints, leavePoints, pointEvent, savedPoints],
   );
 
   const flow = useCallback(
@@ -1406,6 +1492,7 @@ export default function Label() {
       inPoints,
       pointsDone,
       pointsReady,
+      pointsOnly,
       outlineOpen,
       complete: isComplete(answers),
     }),
@@ -1418,6 +1505,7 @@ export default function Label() {
       isComplete,
       outlineOpen,
       pointsDone,
+      pointsOnly,
       pointsReady,
       step,
       steps.length,
@@ -1455,6 +1543,15 @@ export default function Label() {
   }, [enterPoints, flow, goTo, shake, showHint, step]);
 
   const goNext = useCallback(() => {
+    // Points-only mode has no flag (see the keyboard handler), so a cow whose
+    // crop cannot be shown is skipped with the arrow. Nothing is written: it
+    // stays in the backlog for a labeler whose copy of the frame loads. A cow
+    // removed as not-a-cow has no points step either, and → leaves it the same
+    // way — there is no question after it to walk on to.
+    if (pointsOnly && (cropFailed || pointsClosed)) {
+      leavePoints();
+      return;
+    }
     switch (forwardTarget(flow())) {
       case "points":
         // Out of the outline step onto the points, the mirror of goPrev.
@@ -1497,12 +1594,15 @@ export default function Label() {
           inGeometry
             ? "check the outline first — Enter accepts it, E fixes it"
             : inPoints
-              ? "place all five points first — X if you can't see one, S if the cow is too small"
+              ? pointsComplete(pointDraft)
+                ? "Enter saves the points and goes on — Backspace takes back the last one"
+                : "place all five points first — X if you can't see one, S if the cow is too small"
               : "answer both questions, or press F to flag",
         );
     }
-  }, [activeNow, advance, answers, commitAnswers, current, enterPoints, flow, goTo,
-      inGeometry, inPoints, shake, showHint, step]);
+  }, [activeNow, advance, answers, commitAnswers, cropFailed, current, enterPoints, flow, goTo,
+      inGeometry, inPoints, leavePoints, pointDraft, pointsClosed, pointsOnly, shake, showHint,
+      step]);
 
   const openFlag = useCallback(() => {
     if (current === null) return;
@@ -1567,6 +1667,19 @@ export default function Label() {
       detail: { phase: t.cursor < t.frontier ? "review" : "fresh" },
     });
   }, [activeNow, currentKey, sessionId]);
+
+  // POINTS-ONLY: arriving on a cow by the tape (← to an earlier one) shows what
+  // was saved for it, not an empty draft — there the points step is the only
+  // step, so nothing else would seed it the way enterPoints does in the full
+  // flow. Declared after the reset effect above so it runs after it on the same
+  // commit, and read through a ref so a write landing does not re-run it.
+  const savedPointsRef = useRef(savedPoints);
+  savedPointsRef.current = savedPoints;
+  useEffect(() => {
+    if (!pointsOnly || currentKey === null) return;
+    const s = savedPointsRef.current;
+    setPointDraft(Array.isArray(s) ? s : []);
+  }, [currentKey, pointsOnly]);
 
   // The per-QUESTION clock. A2 (median Q2 time within 1.25x of Q1) is the
   // sharpest acceptance test in §8.3 and it needs this mark to exist.
@@ -1646,6 +1759,18 @@ export default function Label() {
       return;
     }
 
+    // NO FLAGS IN POINTS-ONLY MODE (M6 §3.7). A flag is stored as an answer
+    // row with outcome 'skipped', and it SUPERSEDES this labeler's own current
+    // answer on the cow — in a pass over cows they already answered, one F
+    // would destroy that answer. X on the outline step (no cow) and S (too
+    // small) are the ways out here, and → skips a crop that cannot be shown.
+    if (pointsOnly && plain && (e.key === "f" || e.key === "F")) {
+      e.preventDefault();
+      shake();
+      showHint("no flags in points-only mode — S if the cow is too small, X on the outline if there is no cow");
+      return;
+    }
+
     // THE GEOMETRY STEP OWNS THE KEYBOARD until it is passed. Enter accepts the
     // outline, E opens the editor, X removes a false detection; the answer
     // letters are deliberately inert, because the whole point of the step is
@@ -1684,11 +1809,12 @@ export default function Label() {
 
     // THE POINTS STEP OWNS THE KEYBOARD the same way (M6 §3.4). The click on the
     // photo places a point; X says the next one cannot be seen, Backspace takes
-    // the last one back, S says the cow is too small. The answer letters are
-    // inert for the outline step's reason, and X is safe here for the same one:
-    // nothing else is listening. Enter does nothing — the step finishes itself
-    // on the fifth point — so it says so instead of passing silently. The arrows
-    // stay with goPrev/goNext, which walk the steps and never delete a point.
+    // the last one back, S says the cow is too small, and Enter accepts all five
+    // and moves on — the outline step's Enter, for the same reason: the last
+    // point is seen before it is saved. The answer letters are inert for the
+    // outline step's reason, and X is safe here for the same one: nothing else
+    // is listening. The arrows stay with goPrev/goNext, which walk the steps and
+    // never delete a point.
     if (inPoints && !flag.open && !outlineOpen) {
       if (plain && !e.repeat) {
         if (e.key === "x" || e.key === "X") {
@@ -1708,8 +1834,7 @@ export default function Label() {
         }
         if (e.key === "Enter") {
           e.preventDefault();
-          shake();
-          showHint("click the point on the photo — X if you can't see it");
+          acceptPoints("key");
           return;
         }
       }
@@ -1932,6 +2057,8 @@ export default function Label() {
             outlineDisabled={!outlineAvailable}
             hasPoints={hasPoints}
             pointsDisabled={!hasPoints || !geomDone || cropFailed}
+            // Points-only mode asks no question, so it has no Classify step.
+            showClassify={!pointsOnly}
             onClassify={() => {
               closeOutline();
               if (inPoints) {
@@ -1996,6 +2123,7 @@ export default function Label() {
                     setFailedKey(k);
                   }
                 }}
+                onLevelFailed={() => showHint("that zoom level could not be loaded — back to the normal view")}
                 className="w-full h-full"
               />
             ) : (
@@ -2042,7 +2170,9 @@ export default function Label() {
                   ? "release Space"
                   : clean
                     ? "release H"
-                    : "hold Space full frame · H clean · F flag"}
+                    : pointsOnly
+                      ? "hold Space full frame · H clean"
+                      : "hold Space full frame · H clean · F flag"}
               </div>
             ) : null}
           </div>
@@ -2097,7 +2227,9 @@ export default function Label() {
           // Terminal state 3: the image is missing or the server refused it
           // (e.g. a mostly-banner crop, §4.5). F records that and moves on.
           <p role="alert" className="mt-2 text-[12px] text-center" style={{ color: ALARM }}>
-            This image can't be shown — press F to flag it and move on.
+            {pointsOnly
+              ? "This image can't be shown — press → to skip it."
+              : "This image can't be shown — press F to flag it and move on."}
           </p>
         ) : null}
 
@@ -2135,7 +2267,7 @@ export default function Label() {
             <GeometryPanel
               hasMask={servedMaskCrop !== null}
               saving={maskSaving}
-              stepCount={steps.length + preSteps}
+              stepCount={totalSteps}
               onConfirm={confirmGeometry}
               onFix={openOutline}
               onRemove={() => commitMask("false_positive")}
@@ -2145,11 +2277,17 @@ export default function Label() {
               draft={pointDraft}
               savedTooSmall={savedPoints === "too_small"}
               stepNumber={2}
-              stepCount={steps.length + preSteps}
+              stepCount={totalSteps}
               onHide={() => hidePoint("mouse")}
               onUndo={() => undoPoint("mouse")}
               onTooSmall={() => markTooSmall("mouse")}
+              onAccept={() => acceptPoints("mouse")}
             />
+          ) : pointsOnly ? (
+            // Points-only mode asks no question. The only way here is a crop
+            // that could not be shown (the alert above says → skips it); the
+            // empty panel keeps PANEL_H so nothing on the card moves.
+            <div style={{ height: PANEL_H }} aria-hidden="true" />
           ) : (
             <QuestionPanel
               group={activeGroup}
@@ -2159,7 +2297,7 @@ export default function Label() {
               // without moving the per-question colours.
               stepIndex={step}
               stepOffset={preSteps}
-              stepCount={steps.length + preSteps}
+              stepCount={totalSteps}
               reserveOptions={reserveOptions}
               selectedClassKey={answers[activeGroup.group_key] ?? null}
               reviewing={reviewing}
@@ -2225,8 +2363,9 @@ export default function Label() {
     main = (
       <TerminalCard title="You're caught up">
         <p className="text-[13px] max-w-md mx-auto" style={{ color: INK_DIM }}>
-          Every instance that still needs your judgement has it. New footage joins the queue by
-          itself, and instances other annotators haven't finished stay available to them.
+          {pointsOnly
+            ? "Every cow that has answers also has its body points now. New answers add new cows here by themselves."
+            : "Every instance that still needs your judgement has it. New footage joins the queue by itself, and instances other annotators haven't finished stay available to them."}
         </p>
         <DarkButton
           className="mt-5"
@@ -2260,12 +2399,28 @@ export default function Label() {
         <span className="font-mono text-[11px] truncate" style={{ color: INK_DIM }}>
           {current === null ? "label" : captionFor(current)}
         </span>
+        {/* The mode switch (M6 §3.7). Links, not state: the mode is the URL,
+            and following one remounts the screen with a fresh tape. Inside the
+            28px strip, so it costs the crop nothing. */}
+        <div
+          className="ml-auto shrink-0 flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.14em]"
+          role="group"
+          aria-label="label mode"
+        >
+          <ModeLink to="/label" active={!pointsOnly}>
+            All steps
+          </ModeLink>
+          <span style={{ color: INK_DIM }}>·</span>
+          <ModeLink to="/label?mode=points" active={pointsOnly}>
+            Points only
+          </ModeLink>
+        </div>
         {/* Hidden, not disabled, for plain users — the same rule as every other
             poweruser affordance (§5.1). */}
         {canManage ? (
           <Link
             to="/label/classes"
-            className="ml-auto shrink-0 font-mono text-[11px] uppercase tracking-[0.14em] hover:opacity-100 opacity-70"
+            className="shrink-0 font-mono text-[11px] uppercase tracking-[0.14em] hover:opacity-100 opacity-70"
             style={{ color: INK_DIM }}
           >
             Manage classes →
@@ -2320,6 +2475,9 @@ export default function Label() {
               pendingNotes: 0,
               bodyPoints: stats?.my_points,
               tooSmall: stats?.my_too_small,
+              // Only where it is the work in hand: the full flow's labeler is
+              // not working this backlog, and a second big number there is noise.
+              pointsBacklog: pointsOnly ? stats?.points_backlog : undefined,
             }}
           />
         </div>
@@ -2680,6 +2838,7 @@ function ModeToggle({
   outlineDisabled,
   hasPoints,
   pointsDisabled,
+  showClassify,
   onClassify,
   onOutline,
   onPoints,
@@ -2691,6 +2850,8 @@ function ModeToggle({
       two-step one it was, numbered to match. */
   hasPoints: boolean;
   pointsDisabled: boolean;
+  /** False in points-only mode, which has no questions. */
+  showClassify: boolean;
   onClassify: () => void;
   onOutline: () => void;
   onPoints: () => void;
@@ -2720,6 +2881,7 @@ function ModeToggle({
           2 · Points
         </ModeButton>
       ) : null}
+      {showClassify ? (
       <ModeButton
         active={stage === "classify"}
         disabled={classifyDisabled}
@@ -2734,7 +2896,25 @@ function ModeToggle({
       >
         {hasPoints ? "3" : "2"} · Classify
       </ModeButton>
+      ) : null}
     </div>
+  );
+}
+
+/** One side of the header's mode switch. The active one is plain text, not a
+    link: following it would only remount the screen and drop the tape. */
+function ModeLink({ to, active, children }: { to: string; active: boolean; children: ReactNode }) {
+  if (active) {
+    return (
+      <span aria-current="page" style={{ color: INK }}>
+        {children}
+      </span>
+    );
+  }
+  return (
+    <Link to={to} className="opacity-70 hover:opacity-100" style={{ color: INK_DIM }}>
+      {children}
+    </Link>
   );
 }
 

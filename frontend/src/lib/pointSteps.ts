@@ -101,6 +101,20 @@ export function sameDraft(a: PointDraft, b: PointDraft): boolean {
   });
 }
 
+/** Whether the step may be LEFT without saving: the draft says exactly what
+ * is already stored. That is all five given and equal to the saved points, or
+ * an untouched draft over a stored 'too_small'.
+ *
+ * A complete draft that differs from what is stored is NOT leavable — not
+ * even on the fifth point. Completing the draft never saves it: the labeler
+ * accepts the whole set with Enter, and until then can still take a point back
+ * (owner's review, 2026-10-18). */
+export function leavable(d: PointDraft, saved: readonly BodyPoint[] | "too_small" | null): boolean {
+  if (saved === "too_small") return d.length === 0;
+  if (saved === null) return false;
+  return isComplete(d) && sameDraft(d, saved);
+}
+
 /** Whether `xy` (full-frame px) is a point the route will accept.
  *
  * `bounds` is the item's `point_bounds`, the route's own check, so this is the

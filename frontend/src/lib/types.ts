@@ -401,7 +401,13 @@ export interface LabelQueueFilters {
   day: string | null;
   mine: LabelQueueMine;
   order: LabelQueueOrder;
+  // M6 §3.7: 'points' is the points-only backlog. Optional: an older server
+  // does not echo it.
+  mode?: LabelQueueMode;
 }
+// 'full' is the ordinary queue; 'points' serves cows that already have answers
+// but no body points from anyone, for the outline and the points only.
+export type LabelQueueMode = "full" | "points";
 // `matching` is the exact number of instances the filters select — count(*) OVER ()
 // from the same scan, free. There is no cursor and no offset on purpose: other
 // annotators change an instance's coverage while you work, so any positional
@@ -434,6 +440,8 @@ export interface LabelStats {
       verdicts only. Optional: a server that predates M6 does not send them. */
   my_points?: number;
   my_too_small?: number;
+  /** Cows with answers and no body points from anyone: the points-only backlog. */
+  points_backlog?: number;
   annotators: number;
   auth_disabled: boolean;
   filters: { dataset: string | null; camera: string | null };

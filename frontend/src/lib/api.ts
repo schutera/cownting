@@ -22,6 +22,7 @@ import type {
   Taxonomy,
   LabelQueue,
   LabelQueueMine,
+  LabelQueueMode,
   LabelQueueOrder,
   LabelStats,
   LabelMinePage,
@@ -581,6 +582,7 @@ export interface LabelQueueOpts {
   day?: string;
   mine?: LabelQueueMine;
   order?: LabelQueueOrder;
+  mode?: LabelQueueMode;    // 'points' = the points-only backlog (M6 §3.7)
 }
 
 // A batch of instances to label. There is no offset and no cursor: `exclude`
@@ -597,6 +599,7 @@ export function getLabelQueue(opts?: LabelQueueOpts): Promise<LabelQueue> {
   if (opts?.day) q.set("day", opts.day);
   if (opts?.mine) q.set("mine", opts.mine);
   if (opts?.order) q.set("order", opts.order);
+  if (opts?.mode) q.set("mode", opts.mode);
   const exclude = (opts?.exclude ?? []).slice(0, 200);
   if (exclude.length) q.set("exclude", exclude.join(","));
   const qs = q.toString();

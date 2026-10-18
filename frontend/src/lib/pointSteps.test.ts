@@ -6,6 +6,7 @@ import {
   hide,
   insideBounds,
   isComplete,
+  leavable,
   nextIndex,
   place,
   placedCount,
@@ -116,6 +117,30 @@ describe("sameDraft", () => {
     expect(sameDraft([P, null], [P])).toBe(false);
     expect(sameDraft([P, null], [P, P])).toBe(false);
     expect(sameDraft([P], [[10, 21]])).toBe(false);
+  });
+});
+
+describe("leavable", () => {
+  it("is false for anything not yet saved, even with all five given", () => {
+    // Completing the draft never saves it: Enter does.
+    expect(leavable(full(), null)).toBe(false);
+    expect(leavable([], null)).toBe(false);
+  });
+
+  it("is true when the draft is exactly the saved points", () => {
+    const saved = full();
+    expect(leavable([...saved], saved)).toBe(true);
+  });
+
+  it("is false once the draft differs from the saved points", () => {
+    const saved = full();
+    expect(leavable(undo(saved), saved)).toBe(false);
+    expect(leavable(place(undo(saved), [99, 99]), saved)).toBe(false);
+  });
+
+  it("is true over a stored 'too small' only while nothing was placed", () => {
+    expect(leavable([], "too_small")).toBe(true);
+    expect(leavable([P], "too_small")).toBe(false);
   });
 });
 

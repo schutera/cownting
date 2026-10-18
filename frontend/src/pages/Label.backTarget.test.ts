@@ -27,6 +27,7 @@ const S = (over: Partial<FlowState> = {}): FlowState => ({
   inPoints: false,
   pointsDone: true,
   pointsReady: true,
+  pointsOnly: false,
   outlineOpen: false,
   complete: false,
   ...over,
@@ -143,6 +144,32 @@ describe("forwardTarget", () => {
 
   it("is inert while the outline editor is open — it owns its own keys", () => {
     expect(fwd({ step: 0, outlineOpen: true })).toBe("blocked");
+  });
+});
+
+describe("points-only mode", () => {
+  // The points are the last step: there is no question to walk on to.
+  const PO: Partial<FlowState> = { inPoints: true, pointsOnly: true, stepCount: 0 };
+
+  it("never walks forward onto a question", () => {
+    expect(fwd({ ...PO, cursor: 0, frontier: 0 })).toBe("blocked");
+  });
+
+  it("leaves a saved, unchanged revisit for the head of the tape", () => {
+    expect(fwd({ ...PO, cursor: 2, frontier: 5 })).toBe("frontier");
+  });
+
+  it("still refuses to leave unsaved points", () => {
+    expect(fwd({ ...PO, cursor: 2, frontier: 5, pointsReady: false })).toBe("blocked");
+  });
+
+  it("walks forward from the outline onto the points", () => {
+    expect(fwd({ ...PO, inPoints: false, inGeometry: true, geomDone: true })).toBe("points");
+  });
+
+  it("walks back from the points to the outline, then to the previous cow", () => {
+    expect(back({ ...PO })).toBe("geometry");
+    expect(back({ ...PO, inPoints: false, inGeometry: true, cursor: 3 })).toBe("item");
   });
 });
 
