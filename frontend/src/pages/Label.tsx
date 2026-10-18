@@ -1906,6 +1906,23 @@ export default function Label() {
     const hitKey = resolveLabelKey(e, optionCount);
 
     if (hitKey === null) {
+      // A PLAIN ENTER that no step took is swallowed, and says so. Enter is
+      // not an answer key, but it is the outline's and the points' accept key,
+      // so labelers press it here too — and a press that reached the browser
+      // "clicked" whatever had focus: after a mouse click on an answer tile,
+      // the tile in that slot of the NEXT question, saving an answer nobody
+      // chose. The tiles no longer take focus on click either; this is the
+      // second half, for any other button that still does.
+      if (e.key === "Enter" && plain) {
+        e.preventDefault();
+        shake();
+        showHint(
+          optionCount > 0
+            ? `Enter does nothing here — use ${OPTION_KEYS.slice(0, optionCount).map((k) => k.letter).join(" ")}`
+            : "Enter does nothing here",
+        );
+        return;
+      }
       if (/^[a-z]$/i.test(e.key)) {
         shake();
         showHint(

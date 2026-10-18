@@ -286,6 +286,12 @@ export function OptionTile({
           // null) and needs no per-tile bookkeeping to get right.
           onCloseDefinition?.();
         }}
+        // A mouse click must not leave focus on the tile. The tile row stays
+        // mounted from one question to the next, so a focused tile is the tile
+        // in the same slot of the NEXT question, and the browser "clicks" a
+        // focused button on Enter — an answer nobody chose. Keyboard focus
+        // (Tab) is unaffected: this only stops the mouse from setting it.
+        onMouseDown={(e) => e.preventDefault()}
         style={{ ...face, padding: BADGE_INSET }}
         className={
           "absolute inset-0 flex flex-col items-center rounded-lg border box-border cursor-pointer " +
