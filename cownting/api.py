@@ -1741,7 +1741,7 @@ def create_app(config: Config) -> FastAPI:
     def label_queue(request: Request, limit: int | None = None,
                     exclude: str | None = None, camera: str | None = None,
                     day: str | None = None, dataset: str | None = None,
-                    mine: str = "todo", order: str = "fresh"):
+                    mine: str = "todo", order: str = "fresh", mode: str = "full"):
         """One batch of instances to label (M3 §4.2). No leasing, no cursor:
         `exclude` is the comma-joined keys already in the client's buffer, and
         the queue is self-consuming, so re-fetching always advances. `dataset`
@@ -1759,7 +1759,8 @@ def create_app(config: Config) -> FastAPI:
         try:
             return labeling.queue(c, config, annotator=user["username"] or "local",
                                   limit=limit, exclude=keys, camera=camera,
-                                  day=day, dataset=dataset, mine=mine, order=order)
+                                  day=day, dataset=dataset, mine=mine, order=order,
+                                  mode=mode)
         finally:
             c.close()
 
@@ -1811,6 +1812,9 @@ def create_app(config: Config) -> FastAPI:
             "my_median_ms": int(me["median_ms"]) if me.get("median_ms") is not None else None,
             "my_points": int(pts[0] or 0) if pts else 0,
             "my_too_small": int(pts[1] or 0) if pts else 0,
+            # Cows with answers and no body points from anyone — what the
+            # points-only mode still has to serve (M6 §3.7).
+            "points_backlog": pool.get("points_backlog", 0),
             "annotators": len(effort),
             "auth_disabled": not auth_on,
             "filters": {"dataset": dataset, "camera": camera},

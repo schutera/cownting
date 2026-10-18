@@ -2663,7 +2663,10 @@ SELECT s.annotator,
                                                        AS abandon_rate,
        median(a.time_on_task_ms)                       AS median_answered_ms,
        median(a.client_elapsed_ms)                     AS median_client_ms
-FROM (SELECT event_id, annotator FROM label_events WHERE kind = 'served') s
+-- A points-only serve (detail 'points', M6 §3.7) never gets an annotation by
+-- design, so it is not an abandonment and is left out of both counts.
+FROM (SELECT event_id, annotator FROM label_events
+      WHERE kind = 'served' AND detail IS DISTINCT FROM 'points') s
 LEFT JOIN annotations a ON a.serve_event_id = s.event_id
 GROUP BY 1 ORDER BY served DESC, s.annotator
 """

@@ -538,7 +538,10 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                    -- them (M6 §5.2). Same role as geom_done: a step the server
                    -- remembers is a step a reload cannot re-ask.
                    mypts.points AS my_points,
-                   (mypts.effective_key IS NOT NULL) AS points_done
+                   (mypts.effective_key IS NOT NULL) AS points_done,
+                   -- ANYONE's body points (M6 §3.7): what the points-only
+                   -- backlog leaves out. One labeler per cow is enough there.
+                   (allpts.effective_key IS NOT NULL) AS any_points
             FROM keyed k
             LEFT JOIN datasets ds ON ds.dataset_id = k.dataset_id
             -- Every join is on effective_key, never instance_key (§2.4): after a
@@ -588,6 +591,10 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
                        QUALIFY row_number() OVER (PARTITION BY effective_key
                                                   ORDER BY edit_id DESC) = 1)
                       mypts ON mypts.effective_key = k.instance_key
+            -- Not annotator-scoped, and DISTINCT so it cannot multiply rows. A
+            -- 'too_small' verdict counts: it is a full statement about the cow.
+            LEFT JOIN (SELECT DISTINCT effective_key FROM {alias}.v_current_point_edits)
+                      allpts ON allpts.effective_key = k.instance_key
             -- THE HARD FLOOR, and it must live at THIS level rather than in
             -- `ranked` above. `ranked` may only be filtered on partition columns
             -- of the ordinal window; `bbox_*` are not, so filtering there would
@@ -609,8 +616,19 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
           limit: int | None = None, exclude: Sequence[str] = (),
           camera: str | None = None, day: str | None = None,
           dataset: str | None = None, mine: str = "todo", order: str = "fresh",
-          session_id: str | None = None) -> dict:
+          session_id: str | None = None, mode: str = "full") -> dict:
     """One batch of instances to label, plus the policy and scope that produced it.
+
+    `mode="points"` is the POINTS-ONLY BACKLOG (M6 §3.7): cows that already
+    carry at least one answer, from anyone, but no body points from anyone.
+    The page asks only the outline (when this labeler has not judged it) and
+    the points for them, never the questions. It exists because the ordinary
+    queue never serves a cow back to the labeler who answered it, and retires a
+    cow at its target — so the cows that already have behaviour answers, the
+    ones where points are worth most, would otherwise never get any. Coverage,
+    `mine`, the target and the skip counter are question-mode rules and do not
+    apply; a false positive is still out for everyone.
+
 
     Returns `{"items": [...], "matching": int, "policy": {...}, "filters": {...}}`;
     the item shape is frozen in §5.3 and mirrored by `LabelItem` in `types.ts`.
@@ -645,6 +663,7 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
     excl = list(dict.fromkeys(k for k in exclude if k))[:_MAX_EXCLUDE]
     mine = "all" if mine == "all" else "todo"
     order = "spread" if order == "spread" else "fresh"
+    mode = "points" if mode == "points" else "full"
 
     with attached_labels(con, config) as alias:
         cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
@@ -653,12 +672,15 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         # `NOT s.false_positive` is unconditional — it is not a preference like
         # `mine`, and no filter combination may bring back an instance somebody
         # has judged not to be an animal.
-        where = ["s.n_labeled < s.target", "s.n_skipped < ?", "NOT s.false_positive"]
-        params.append(cfg.skip_retire)
+        if mode == "points":
+            where = ["s.n_labeled > 0", "NOT s.any_points", "NOT s.false_positive"]
+        else:
+            where = ["s.n_labeled < s.target", "s.n_skipped < ?", "NOT s.false_positive"]
+            params.append(cfg.skip_retire)
         if excl:
             where.append(f"s.instance_key NOT IN ({', '.join('?' * len(excl))})")
             params += excl
-        if mine == "todo":
+        if mine == "todo" and mode == "full":
             where.append("NOT s.mine_done")
         # `order=fresh` drains the newest day first so a new upload observably
         # appears at the head of the queue; `order=spread` drops the day term for a
@@ -684,6 +706,10 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         # problem the size floor was built to fix — the model is least confident
         # on exactly the tiny crops a human cannot read either.
         day_term = "s.day DESC NULLS LAST, " if order == "fresh" else ""
+        # `worth_asking` is a statement about the attribute model's uncertainty on
+        # a QUESTION, so it has no meaning where no question is asked; under a
+        # panel is a statement about the cow, and it ranks in both.
+        worth_term = "" if mode == "points" else "(NOT s.worth_asking), "
         params.append(annotator)
         params.append(n)
         rows = _rows(con, f"""{cte}
@@ -691,7 +717,7 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             FROM scoped s
             WHERE {' AND '.join(where)}
             ORDER BY {day_term}(NOT s.clear), (NOT s.under_panel_now),
-                     (NOT s.worth_asking), md5(? || s.instance_key)
+                     {worth_term}md5(? || s.instance_key)
             LIMIT ?
             """, params)
 
@@ -700,12 +726,16 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         # protects is untouched. It buys a non-forgeable server-side
         # time_on_task_ms, measurable abandonment (served with no matching
         # annotation), and the server/client delta that detects tab-away (§4.2).
+        # A points-only serve is marked 'points' in `detail`: it never gets an
+        # annotation, and SQL_ABANDONED would otherwise count every one of them
+        # as an abandoned cow.
         event_ids: list[int | None] = []
         for r in rows:
             ev = con.execute(
-                f"INSERT INTO {alias}.label_events (session_id, annotator, kind, instance_key) "
-                "VALUES (?, ?, 'served', ?) RETURNING event_id",
-                [session_id, annotator, r["instance_key"]],
+                f"INSERT INTO {alias}.label_events (session_id, annotator, kind, "
+                "instance_key, detail) VALUES (?, ?, 'served', ?, ?) RETURNING event_id",
+                [session_id, annotator, r["instance_key"],
+                 "points" if mode == "points" else None],
             ).fetchone()
             event_ids.append(int(ev[0]) if ev else None)
 
@@ -722,7 +752,8 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             "max_batch_size": cfg.max_batch_size,
         },
         "filters": {"dataset": dataset, "camera": camera, "day": day,
-                    "mine": mine, "order": order, "limit": n, "excluded": len(excl)},
+                    "mine": mine, "order": order, "mode": mode, "limit": n,
+                    "excluded": len(excl)},
     }
 
 
@@ -767,7 +798,11 @@ def progress(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str =
                    -- `target` rather than multiplying by targets_per_instance is
                    -- what makes the 20% deep-overlap slice show up in the total.
                    coalesce(sum(n_labeled), 0)                           AS annotations_labeled,
-                   coalesce(sum(target), 0)                              AS targets_total
+                   coalesce(sum(target), 0)                              AS targets_total,
+                   -- The points-only backlog, by the same rule queue(mode=
+                   -- "points") serves, so the count and the queue agree.
+                   count(*) FILTER (WHERE n_labeled > 0 AND NOT any_points
+                                      AND NOT false_positive)            AS points_backlog
             FROM scoped
             """, params)
     out = {k: int(v or 0) for k, v in rows[0].items()} if rows else {}

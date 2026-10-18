@@ -1050,6 +1050,79 @@ def test_points_roundtrip_and_validation():
         check("a lost race -> 409", r409.status_code == 409, str(r409.status_code))
 
 
+def test_points_only_backlog():
+    """M6 §3.7: `mode=points` serves the cows that already have an answer from
+    anyone but body points from nobody — the cows the ordinary queue never serves
+    back to their own labeler — and nothing else. One labeler's points are
+    enough to take a cow out of it, and its serves are not abandonments."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        rev = _rev(client)
+        pool = client.get("/api/label/queue?mine=all&limit=200").json()["items"]
+        a, b, c = pool[0], pool[1], pool[2]
+        for it in (a, b, c):
+            check("seed answer -> 200", _submit(client, it, rev).status_code == 200)
+
+        def backlog() -> list[str]:
+            body = client.get("/api/label/queue?mode=points&limit=200").json()
+            check("the points mode is echoed", body["filters"]["mode"] == "points",
+                  str(body["filters"]))
+            return sorted(i["instance_key"] for i in body["items"])
+
+        def count() -> int:
+            return int(client.get("/api/label/progress").json()["points_backlog"])
+
+        check("the backlog is exactly the answered cows",
+              backlog() == sorted([a["instance_key"], b["instance_key"], c["instance_key"]]),
+              str(backlog()))
+        check("progress counts the same backlog", count() == 3, str(count()))
+        check("the ordinary queue still hides my answered cows",
+              not {a["instance_key"], b["instance_key"], c["instance_key"]}
+              & {i["instance_key"] for i in client.get("/api/label/queue?limit=200").json()["items"]})
+
+        # Another labeler sees the same backlog: it is not annotator-scoped.
+        mc = db.connect(config.paths.db_path)
+        try:
+            bob = sorted(i["instance_key"] for i in labeling.queue(
+                mc, config, annotator="bob", limit=50, mode="points")["items"])
+        finally:
+            mc.close()
+        check("another labeler is served the same backlog", bob == backlog(), str(bob))
+
+        # Points from one labeler take the cow out; so does 'too small'.
+        check("points on a -> 200",
+              _post_points(client, a, points=_points_for(a)).status_code == 200)
+        check("too small on b -> 200",
+              _post_points(client, b, kind="too_small").status_code == 200)
+        check("both left the backlog, c remains",
+              backlog() == [c["instance_key"]], str(backlog()))
+        check("progress agrees", count() == 1, str(count()))
+
+        # A 'not a cow' verdict takes it out for everyone, as in the ordinary queue.
+        r = client.post("/api/label/mask-fix", json={
+            "instance_key": c["instance_key"], "anchor": _anchor(c),
+            "kind": "false_positive", "polygon": None, "seeded_from": "mask"})
+        check("false positive on c -> 200", r.status_code == 200, r.text[:120])
+        check("the backlog is empty", backlog() == [], str(backlog()))
+        check("progress agrees at zero", count() == 0, str(count()))
+
+        # Points-only serves are marked, so they are not counted as abandoned.
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            marked = lc.execute("SELECT count(*) FROM label_events WHERE kind = 'served' "
+                                "AND detail = 'points'").fetchone()[0]
+            ab = {r[0]: r for r in lc.execute(labels_db.SQL_ABANDONED).fetchall()}
+            served_full = lc.execute(
+                "SELECT count(*) FROM label_events WHERE kind = 'served' "
+                "AND detail IS DISTINCT FROM 'points'").fetchone()[0]
+        finally:
+            lc.close()
+        check("points-only serves carry detail 'points'", marked > 0, str(marked))
+        check("SQL_ABANDONED counts only the ordinary serves",
+              ab.get("local") is not None and ab["local"][1] == served_full,
+              f"{ab.get('local')} vs {served_full}")
+
+
 def test_false_positive_retires_the_instance_for_everyone():
     """M4a §4.2: 'not a cow' is not a skip. It leaves the pool for every
     annotator, because there are no questions to ask about a shadow — and the
@@ -1531,6 +1604,7 @@ def main():
     test_undo_is_scoped_to_me()
     test_mask_fix_roundtrip_and_validation()
     test_points_roundtrip_and_validation()
+    test_points_only_backlog()
     test_false_positive_retires_the_instance_for_everyone()
     test_spread_draws_from_every_day_and_camera()
     test_every_zoom_level_renders_the_square_it_describes()
