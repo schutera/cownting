@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { oneClick } from "../lib/clicks";
 import { Link } from "react-router-dom";
 import { canManageData, useAuth } from "../lib/auth";
 import type {
@@ -36,6 +37,7 @@ import { PointsPanel } from "../components/PointsPanel";
 import {
   POINT_STEPS,
   canHide,
+  clampToBounds,
   cowRules,
   hide as hidePointIn,
   insideBounds,
@@ -906,7 +908,8 @@ export default function Label() {
     [refreshStats, setTape],
   );
 
-  const queue = useAnswerQueue({ onStale, onWritten });
+  // `owner` keeps the unsent-writes mirror per account (see useAnswerQueue).
+  const queue = useAnswerQueue({ onStale, onWritten, owner: user?.username ?? "local" });
 
   const markWritten = useCallback((key: string) => {
     const next = recentWrittenRef.current.filter((k) => k !== key);
@@ -941,7 +944,11 @@ export default function Label() {
     (index: number) => {
       const t = tapeRef.current;
       if (t.items.length === 0) return;
-      const clamped = clamp(index, 0, t.items.length - 1);
+      // Up to items.length, not items.length - 1: the head of a fully answered
+      // tape is PAST its last cow (the caught-up card, or the next refill).
+      // Clamped one short, → from a review of the last cow landed back on it,
+      // and the labeler could never return to "Check again" without a reload.
+      const clamped = clamp(index, 0, t.items.length);
       setTape({ ...t, cursor: clamped });
       setStep(0);
       setFlag({ open: false });
@@ -1225,7 +1232,16 @@ export default function Label() {
         // stored outline to disagree with the pixels it was drawn on, whatever
         // zoom level it was drawn at.
         space: "frame",
-        polygon: kind === "polygon" && draft !== null ? draft.map(([x, y]): [number, number] => [x, y]) : null,
+        // Every node held inside where the route accepts one — the editor
+        // clamps what it drags, and this covers nodes it never touched (a
+        // seeded model outline), so no correction can be built that the
+        // server refuses and the queue retries forever.
+        polygon:
+          kind === "polygon" && draft !== null
+            ? draft.map(([x, y]) =>
+                clampToBounds([x, y], current.point_bounds, current.frame_w, current.frame_h),
+              )
+            : null,
         mask_rev: current.mask_rev ?? null,
         // What this correction was actually drawn over, straight from the item —
         // never re-derived here, or the stored provenance would be the client's
@@ -1268,15 +1284,19 @@ export default function Label() {
       // and the cow still has to be answered. A verdict given on a walk back to
       // the outline leaves that step too; before, the gate stayed open on
       // screen after Enter and only the arrow left it.
-      // A later 'ok' or outline on a cow this session removed takes the
-      // removal back (the store supersedes it the same way), so the points
-      // step opens for it again.
-      setRemovedByKey((prev) => {
-        if (prev[currentKey] === undefined) return prev;
-        const next = { ...prev };
-        delete next[currentKey];
-        return next;
-      });
+      // A corrected OUTLINE on a cow this session removed takes the removal
+      // back: the store supersedes a false_positive with a later polygon, so
+      // the points step opens for it again. Only a polygon — an 'ok' over a
+      // standing false_positive is a no-op in the store (submit_mask_edit), so
+      // confirmGeometry refuses it rather than pretend it worked.
+      if (kind === "polygon") {
+        setRemovedByKey((prev) => {
+          if (prev[currentKey] === undefined) return prev;
+          const next = { ...prev };
+          delete next[currentKey];
+          return next;
+        });
+      }
       closeOutline();
       setStep(0);
       setRevisitGeom(false);
@@ -1309,9 +1329,19 @@ export default function Label() {
       measurement, §5.1) and hands straight to question 1. */
   const confirmGeometry = useCallback(() => {
     if (current === null || currentKey === null || maskSaving) return;
+    // On a cow this labeler removed as not-a-cow, Enter is NOT the undo. The
+    // store keeps a removal against a later 'ok' (an 'ok' never overrules a
+    // stronger verdict), so the page used to open the points and questions for
+    // a cow that stayed removed for everyone, and saved them against it. A
+    // corrected outline (E) does supersede the removal; say so.
+    if (removedByKey[currentKey]) {
+      shake();
+      showHint("this cow is removed — E draws its outline to bring it back");
+      return;
+    }
     commitMask("ok");
     setStep(0);
-  }, [commitMask, current, currentKey, maskSaving]);
+  }, [commitMask, current, currentKey, maskSaving, removedByKey, shake, showHint]);
 
   // ------------------------------------------------------ body points (M6)
 
@@ -2495,7 +2525,12 @@ export default function Label() {
               // ...plus what the queue can still serve ME. A corpus-coverage bar
               // was removed on purpose (§7) — it is a number the annotator
               // cannot move.
-              target: (stats?.my_labeled ?? 0) + (stats?.remaining ?? 0),
+              // `mine_remaining`, not `remaining`: the pool-level count still
+              // includes every cow this labeler answered that is below its
+              // target, so a labeler with nothing left saw 6 of 12, forever.
+              // `remaining` stays the fallback for a server that predates it.
+              target:
+                (stats?.my_labeled ?? 0) + (stats?.mine_remaining ?? stats?.remaining ?? 0),
               recentMs,
               flags: stats?.my_skipped ?? flagCount,
               // Always zero: decision 6 makes the written explanation mandatory
@@ -2603,7 +2638,7 @@ function GeometryPanel({
           <button
             key={c.key}
             type="button"
-            onClick={c.onClick}
+            onClick={oneClick(c.onClick)}
             disabled={saving}
             className="flex flex-col items-center rounded-lg border box-border cursor-pointer
                        disabled:opacity-40 disabled:cursor-default
@@ -2837,7 +2872,7 @@ function RepairChip({ children, onClick }: { children: ReactNode; onClick: () =>
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={oneClick(onClick)}
       className="inline-flex items-center h-[22px] px-2 rounded-md border box-border text-[11px]
                  whitespace-nowrap cursor-pointer transition-opacity duration-150 hover:opacity-80
                  focus-visible:outline focus-visible:outline-2"
@@ -3231,7 +3266,7 @@ function FlagRow({
               "cancel" flagged the instance. */}
           <button
             type="button"
-            onClick={onCancel}
+            onClick={oneClick(onCancel)}
             className="underline underline-offset-2 cursor-pointer"
             style={{ color: INK_DIM }}
           >
@@ -3254,7 +3289,7 @@ function FlagRow({
           <button
             key={r.reason}
             type="button"
-            onClick={() => onPick(r.reason)}
+            onClick={oneClick(() => onPick(r.reason))}
             className="flex flex-col items-center rounded-lg border box-border cursor-pointer
                        focus-visible:outline-2 focus-visible:outline-offset-2"
             style={{

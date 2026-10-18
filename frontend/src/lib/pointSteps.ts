@@ -131,6 +131,31 @@ export function cowRules(item: { points_only?: boolean } | null): {
   return { questions: !backlog, flag: !backlog };
 }
 
+/** `xy` moved to the nearest place the write routes accept: inside `bounds`
+ * (the item's `point_bounds`, the routes' own widest-crop check) and inside the
+ * frame when its size is known.
+ *
+ * For the OUTLINE editor, whose nodes are dragged rather than clicked: a drag
+ * keeps going past the SVG edge under pointer capture, and the editor's zoom
+ * ladder after a correction is cut around the corrected shape, so a node could
+ * be put where the mask-fix route refuses it — and the client retries a refusal
+ * forever. A clamped node is visibly held at the edge instead. */
+export function clampToBounds(
+  xy: [number, number],
+  bounds: readonly [number, number, number, number] | undefined,
+  frameW?: number | null,
+  frameH?: number | null,
+): [number, number] {
+  let [x, y] = xy;
+  if (bounds !== undefined) {
+    x = Math.min(bounds[2], Math.max(bounds[0], x));
+    y = Math.min(bounds[3], Math.max(bounds[1], y));
+  }
+  if (frameW) x = Math.min(frameW, Math.max(0, x));
+  if (frameH) y = Math.min(frameH, Math.max(0, y));
+  return [x, y];
+}
+
 /** Whether `xy` (full-frame px) is a point the route will accept.
  *
  * `bounds` is the item's `point_bounds`, the route's own check, so this is the

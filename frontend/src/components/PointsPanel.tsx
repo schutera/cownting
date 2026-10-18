@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { oneClick } from "../lib/clicks";
 import {
   POINT_COUNT,
   POINT_STEPS,
@@ -157,7 +158,7 @@ function KeyButton({
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={oneClick(onClick)}
       // A click must not leave focus here: the panel stays mounted from one
       // backlog cow to the next, and a focused button is one the browser
       // "clicks" on Enter — on a cow nobody has looked at yet.

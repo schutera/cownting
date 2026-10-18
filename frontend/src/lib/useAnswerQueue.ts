@@ -109,6 +109,11 @@ export interface UseAnswerQueueOpts {
       queue fetch. Absent when the write landed via the unload beacon, which by
       construction has no response to read. */
   onWritten?: (write: LabelWrite, result?: unknown) => void;
+  /** The signed-in account. The sessionStorage mirror is kept per account, so
+      a write queued by one labeler is never replayed — and stamped — under
+      another who signs in on the same tab. Read once, at mount: the Label page
+      unmounts on sign-out. */
+  owner?: string;
 }
 
 export interface AnswerQueue {
@@ -358,9 +363,45 @@ export function parseWrite(v: unknown): LabelWrite | null {
   return null;
 }
 
-function readStore(): LabelWrite[] {
+/** The mirror's key for one account. Keyed by the account because the mirror
+    is replayed on the next mount, and the server stamps a write with whoever
+    is signed in THEN: a write queued by one labeler, replayed after another
+    signed in on the same tab, was filed under the second. */
+export function storeKeyFor(owner: string): string {
+  return `${STORE_KEY}:${owner}`;
+}
+
+/** What one new write does to the queue — the coalescing rules, pure.
+ *
+ * Writes for one cow coalesce within a FAMILY: a later unsent write replaces
+ * an earlier unsent one of the same family, because the server would let it
+ * supersede that one anyway, and posting both only mints two versions for one
+ * decision. `answer` and `flag` are ONE family: both are rows of the same
+ * annotations table and supersede each other there. As two kinds they were
+ * both kept and then posted concurrently in one batch, where the lighter flag
+ * landed first, the answer lost the version race, was retried, and landed LAST
+ * — so the labeler's later choice was replaced by their earlier one.
+ *
+ * One exception, mirroring the server: an outline `ok` never replaces a
+ * waiting `polygon` or `false_positive` for the same cow. Server-side an `ok`
+ * over a standing stronger verdict is a no-op; client-side it used to delete the
+ * stronger one from the queue before it was ever sent. */
+export function coalesce(queue: readonly LabelWrite[], write: LabelWrite): LabelWrite[] {
+  const key = write.req.instance_key;
+  const family = (w: LabelWrite): string => (w.kind === "flag" ? "answer" : w.kind);
+  if (write.kind === "mask" && write.req.kind === "ok") {
+    const stronger = queue.some(
+      (w) => w.kind === "mask" && w.req.instance_key === key && w.req.kind !== "ok",
+    );
+    if (stronger) return [...queue];
+  }
+  const kept = queue.filter((w) => w.req.instance_key !== key || family(w) !== family(write));
+  return [...kept, write];
+}
+
+function readStore(storeKey: string): LabelWrite[] {
   try {
-    const raw = sessionStorage.getItem(STORE_KEY);
+    const raw = sessionStorage.getItem(storeKey);
     if (raw === null) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -378,13 +419,26 @@ function readStore(): LabelWrite[] {
   }
 }
 
-function writeStore(queue: readonly LabelWrite[]): void {
+function writeStore(storeKey: string, queue: readonly LabelWrite[]): void {
   try {
-    if (queue.length === 0) sessionStorage.removeItem(STORE_KEY);
-    else sessionStorage.setItem(STORE_KEY, JSON.stringify(queue));
+    if (queue.length === 0) sessionStorage.removeItem(storeKey);
+    else sessionStorage.setItem(storeKey, JSON.stringify(queue));
   } catch {
     /* see readStore */
   }
+}
+
+/** The mirror an older build wrote under the bare key, taken ONCE and removed.
+    That build ran in this same tab, so its owner is almost always the labeler
+    now signed in; leaving it would lose those writes outright. */
+function takeLegacyStore(): LabelWrite[] {
+  const out = readStore(STORE_KEY);
+  try {
+    sessionStorage.removeItem(STORE_KEY);
+  } catch {
+    /* see readStore */
+  }
+  return out;
 }
 
 function beacon(write: LabelWrite): void {
@@ -425,6 +479,19 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
   const flushingRef = useRef(false);
   const attemptRef = useRef(0);
   const timerRef = useRef<number | null>(null);
+  // The mirror's key, fixed for this mount's account (see `owner`).
+  const storeKeyRef = useRef(storeKeyFor(opts.owner ?? "local"));
+  // Cleared on unmount. A retry timer or a flush loop that outlives the page
+  // must stop: the unmount already beacons what is pending, and the next mount
+  // replays the mirror, so a third copy posting from a dead page only adds
+  // duplicate versions — under whichever account is signed in by then.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   // The callbacks are re-read through refs so a page that rebuilds them every
   // render does not re-arm the unload listener or restart the flusher.
   const optsRef = useRef(opts);
@@ -442,7 +509,7 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
       if (queueRef.current.length === 0) return;
       flushingRef.current = true;
       try {
-        while (queueRef.current.length > 0) {
+        while (mountedRef.current && queueRef.current.length > 0) {
           const batch = queueRef.current.slice(0, BATCH_MAX);
           const results = await Promise.allSettled(
             batch.map((w) => {
@@ -477,7 +544,7 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
           }
           if (settled.size > 0) {
             queueRef.current = queueRef.current.filter((w) => !settled.has(w));
-            writeStore(queueRef.current);
+            writeStore(storeKeyRef.current, queueRef.current);
           }
           if (staleCount > 0) {
             setSync((prev) => ({ ...prev, dropped: prev.dropped + staleCount }));
@@ -489,9 +556,14 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
             const wait = BACKOFF_MS[Math.min(attemptRef.current, BACKOFF_MS.length - 1)];
             attemptRef.current += 1;
             publish({ retrying: true, lastError: failure });
+            // ONE retry chain. Every enqueue during a backoff starts a flush,
+            // and each failure used to arm a fresh timer over the old one
+            // without clearing it, so a write refused for good was re-posted
+            // by a growing number of chains.
+            if (timerRef.current !== null) window.clearTimeout(timerRef.current);
             timerRef.current = window.setTimeout(() => {
               timerRef.current = null;
-              void flush();
+              if (mountedRef.current) void flush();
             }, wait);
             return;
           }
@@ -516,17 +588,11 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
 
   const enqueue = useCallback(
     (write: LabelWrite) => {
-      const key = write.req.instance_key;
-      // Coalesce WITHIN a kind, never across kinds. Two writes of the same kind
-      // for one instance are a corrected draft the server never saw. Two writes
-      // of DIFFERENT kinds are two different judgements about the same cow — an
-      // outline correction and the answers to its questions both have to land,
-      // and the old key-only filter would have silently thrown one away.
-      const kept = queueRef.current.filter(
-        (w) => w.req.instance_key !== key || w.kind !== write.kind,
-      );
-      queueRef.current = [...kept, write];
-      writeStore(queueRef.current);
+      // The rules live in `coalesce`: one cow's writes replace each other only
+      // within a family, so an outline fix and the answers both land, while an
+      // answer and a flag — one annotations row — never race each other.
+      queueRef.current = coalesce(queueRef.current, write);
+      writeStore(storeKeyRef.current, queueRef.current);
       publish({});
       void flush();
     },
@@ -538,9 +604,11 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
   useEffect(() => {
     if (replayedRef.current) return;
     replayedRef.current = true;
-    const stored = readStore();
+    const stored = [...takeLegacyStore(), ...readStore(storeKeyRef.current)];
     if (stored.length === 0) return;
     queueRef.current = [...stored, ...queueRef.current];
+    // Re-saved under this account's key at once: the legacy key is gone now.
+    writeStore(storeKeyRef.current, queueRef.current);
     publish({});
     void flush();
   }, [flush, publish]);

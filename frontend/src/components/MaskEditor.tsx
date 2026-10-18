@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { clampToBounds } from "../lib/pointSteps";
 import type { CropLevel, LabelItem } from "../lib/types";
 
 /* The instance-outline editor (docs/roadmap/M4a_instance_mask_fixup.md §5.2):
@@ -208,13 +209,15 @@ export function MaskEditor({
       }
       if (bestAt >= 0) {
         const next: [number, number][] = [...polygon];
-        next.splice(bestAt + 1, 0, [cx, cy]);
+        next.splice(bestAt + 1, 0,
+          clampToBounds([cx, cy], item.point_bounds, item.frame_w, item.frame_h));
         onChange(next);
         e.currentTarget.setPointerCapture(e.pointerId);
         setDragIndex(bestAt + 1); // drag the new node straight away
       }
     },
-    [hidden, nodeAt, onChange, polygon, scale, toFrame],
+    [hidden, item.frame_h, item.frame_w, item.point_bounds, nodeAt, onChange, polygon, scale,
+      toFrame],
   );
 
   const onPointerMove = useCallback(
@@ -227,18 +230,18 @@ export function MaskEditor({
         return;
       }
       const next: [number, number][] = [...polygon];
-      // Clamped to the FRAME, not to the current viewport: a node dragged to the
-      // edge of a tight crop is still a legitimate point of the animal, and
-      // zooming out must be able to reach it again.
-      const fw = item.frame_w ?? 0;
-      const fh = item.frame_h ?? 0;
-      next[dragIndex] = [
-        fw > 0 ? clamp(cx, 0, fw) : cx,
-        fh > 0 ? clamp(cy, 0, fh) : cy,
-      ];
+      // Clamped to where the mask-fix route ACCEPTS a node — the item's
+      // point_bounds (the route's own widest-crop check) and the frame — not to
+      // the current viewport: a node dragged to the edge of a tight crop is
+      // still a legitimate point of the animal, and zooming out must be able to
+      // reach it again. Clamped only to the frame, a drag under pointer capture
+      // past the SVG edge, or a node on a re-centred zoom ladder, could be
+      // saved where the route refuses it, and the client retries that forever.
+      next[dragIndex] = clampToBounds([cx, cy], item.point_bounds, item.frame_w, item.frame_h);
       onChange(next);
     },
-    [dragIndex, hidden, item.frame_h, item.frame_w, nodeAt, onChange, polygon, toFrame],
+    [dragIndex, hidden, item.frame_h, item.frame_w, item.point_bounds, nodeAt, onChange,
+      polygon, toFrame],
   );
 
   const endDrag = useCallback((e: React.PointerEvent<SVGSVGElement>) => {

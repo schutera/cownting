@@ -436,7 +436,9 @@ export interface LabelStats {
   pool_total: number;      // instances the queue could ever serve
   pool_labeled: number;    // ...with at least one labeled annotation
   pool_covered: number;    // ...at or over their coverage target
-  remaining: number;       // ...still servable to ME
+  remaining: number;       // ...still servable to SOMEBODY (pool level)
+  /** ...still servable to ME: `remaining` minus the cows I already answered. */
+  mine_remaining?: number;
   my_labeled: number;
   my_skipped: number;
   my_median_ms: number | null;

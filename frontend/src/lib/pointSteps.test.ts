@@ -3,6 +3,7 @@ import {
   POINT_COUNT,
   POINT_STEPS,
   canHide,
+  clampToBounds,
   cowRules,
   hide,
   insideBounds,
@@ -155,6 +156,22 @@ describe("cowRules", () => {
     expect(cowRules({ points_only: false })).toEqual({ questions: true, flag: true });
     expect(cowRules({})).toEqual({ questions: true, flag: true });
     expect(cowRules(null)).toEqual({ questions: true, flag: true });
+  });
+});
+
+describe("clampToBounds", () => {
+  const B: [number, number, number, number] = [100, 100, 200, 200];
+  it("holds a node at the route's bound", () => {
+    expect(clampToBounds([250, 50], B)).toEqual([200, 100]);
+    expect(clampToBounds([150, 150], B)).toEqual([150, 150]);
+  });
+  it("and inside the photo", () => {
+    expect(clampToBounds([-5, 2000], undefined, 1920, 1080)).toEqual([0, 1080]);
+  });
+  it("every clamped point is one insideBounds accepts", () => {
+    for (const p of [[0, 0], [999, -999], [150, 150]] as [number, number][]) {
+      expect(insideBounds(clampToBounds(p, B, 1920, 1080), B, 1920, 1080)).toBe(true);
+    }
   });
 });
 

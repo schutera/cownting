@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { oneClick } from "../lib/clicks";
 import { createPortal } from "react-dom";
 import { ClassIcon } from "./ClassIcon";
 import { InfoIcon } from "./ui";
@@ -277,7 +278,7 @@ export function OptionTile({
         type="button"
         aria-pressed={selected}
         tabIndex={focusable ? 0 : -1}
-        onClick={() => {
+        onClick={oneClick(() => {
           onSelect(classKey);
           // Choosing an answer dismisses any open definition outright (§3.6
           // round 2's dismissal list) — called unconditionally rather than
@@ -285,7 +286,7 @@ export function OptionTile({
           // when nothing is open (the page's `openDefinitionKey` is already
           // null) and needs no per-tile bookkeeping to get right.
           onCloseDefinition?.();
-        }}
+        })}
         // A mouse click must not leave focus on the tile. The tile row stays
         // mounted from one question to the next, so a focused tile is the tile
         // in the same slot of the NEXT question, and the browser "clicks" a

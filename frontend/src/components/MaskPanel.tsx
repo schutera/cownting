@@ -1,4 +1,5 @@
 import { PANEL_H } from "./QuestionPanel";
+import { oneClick } from "../lib/clicks";
 
 /* The outline tool's controls (docs/roadmap/M4a_instance_mask_fixup.md §5.3).
  *
@@ -122,7 +123,7 @@ function PanelButton({
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={oneClick(onClick)}
       disabled={disabled}
       className={
         "inline-flex items-center h-8 px-3 rounded-lg border box-border text-[12px] cursor-pointer " +
