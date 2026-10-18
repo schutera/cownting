@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  BodyPoint,
   InstanceAnchor,
   LabelFlagReq,
   LabelInputMode,
   LabelMaskFixReq,
+  LabelPointsReq,
   LabelSkipReason,
   LabelSubmitReq,
   MaskFixKind,
   MaskSeed,
 } from "./types";
-import { flagLabel, submitLabel, submitMaskFix, TaxonomyStaleError } from "./api";
+import { flagLabel, submitLabel, submitMaskFix, submitPoints, TaxonomyStaleError } from "./api";
 
 /* The Label screen's write path (M3 labeling UX §3.5), plus the two per-decision
  * events of §6.1.
@@ -68,6 +70,7 @@ const STORE_KEY = "cownting.label.pending";
 const SUBMIT_URL = "/api/label/submit";
 const FLAG_URL = "/api/label/skip";
 const MASK_URL = "/api/label/mask-fix";
+const POINTS_URL = "/api/label/points";
 
 export type LabelWrite =
   | { kind: "answer"; req: LabelSubmitReq }
@@ -77,7 +80,11 @@ export type LabelWrite =
   // and a flaky link exactly as an answer does — but see `enqueue`: it must NOT
   // coalesce against the answer for the same instance, because the two are
   // different judgements about the same cow and both have to land.
-  | { kind: "mask"; req: LabelMaskFixReq };
+  | { kind: "mask"; req: LabelMaskFixReq }
+  // The body points (M6). Its own kind for the reason "mask" is one: it is a
+  // third judgement about the same cow, and coalescing it against the answers
+  // or the outline would throw one of them away.
+  | { kind: "points"; req: LabelPointsReq };
 
 /** What the footer's sync indicator draws (§5.5): shape and motion, never hue.
     `pending` 0 = filled dot, >0 = hollow dot with the count, `retrying` = the
@@ -209,6 +216,26 @@ function parsePolygon(v: unknown): [number, number][] | null {
   return out;
 }
 
+// Exactly five entries, each [x, y] finite or null, at least one placed — the
+// route's own rule (labels_db._validate_points). A replayed record that breaks it
+// would be refused with a 400 and retried forever, so it is dropped here.
+function parsePoints(v: unknown): BodyPoint[] | null {
+  if (!Array.isArray(v) || v.length !== 5) return null;
+  const out: BodyPoint[] = [];
+  for (const pt of v) {
+    if (pt === null) {
+      out.push(null);
+      continue;
+    }
+    if (!Array.isArray(pt) || pt.length !== 2) return null;
+    const [x, y] = pt;
+    if (typeof x !== "number" || typeof y !== "number") return null;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    out.push([x, y]);
+  }
+  return out.some((p) => p !== null) ? out : null;
+}
+
 function parseMaskKind(v: unknown): MaskFixKind | null {
   return v === "polygon" || v === "false_positive" || v === "ok" ? v : null;
 }
@@ -217,7 +244,10 @@ function parseSeed(v: unknown): MaskSeed | null {
   return v === "model" || v === "edit" || v === "bbox" ? v : null;
 }
 
-function parseWrite(v: unknown): LabelWrite | null {
+/** One record of the sessionStorage mirror, rebuilt field by field, or null.
+    Exported for its tests: the replay is the one path that only runs after a
+    crash or a reload, which is exactly when nobody is watching it. */
+export function parseWrite(v: unknown): LabelWrite | null {
   if (!isRec(v) || !isRec(v.req)) return null;
   const req = v.req;
   if (typeof req.instance_key !== "string" || req.instance_key === "") return null;
@@ -305,6 +335,26 @@ function parseWrite(v: unknown): LabelWrite | null {
       },
     };
   }
+  if (v.kind === "points") {
+    // Points are required for 'points' and forbidden for 'too_small', as the
+    // route enforces both.
+    if (req.kind !== "points" && req.kind !== "too_small") return null;
+    const points = req.kind === "points" ? parsePoints(req.points) : null;
+    if (req.kind === "points" && points === null) return null;
+    if (req.kind === "too_small" && req.points !== null && req.points !== undefined) return null;
+    return {
+      kind: "points",
+      req: {
+        instance_key: req.instance_key,
+        anchor,
+        kind: req.kind,
+        points,
+        serve_event_id: optNum(req.serve_event_id),
+        session_id,
+        client_elapsed_ms: optNum(req.client_elapsed_ms),
+      },
+    };
+  }
   return null;
 }
 
@@ -340,7 +390,13 @@ function writeStore(queue: readonly LabelWrite[]): void {
 function beacon(write: LabelWrite): void {
   if (typeof navigator.sendBeacon !== "function") return;
   const url =
-    write.kind === "answer" ? SUBMIT_URL : write.kind === "mask" ? MASK_URL : FLAG_URL;
+    write.kind === "answer"
+      ? SUBMIT_URL
+      : write.kind === "mask"
+        ? MASK_URL
+        : write.kind === "points"
+          ? POINTS_URL
+          : FLAG_URL;
   const body =
     write.kind === "flag" ? { ...write.req, note: write.req.explanation } : write.req;
   try {
@@ -392,6 +448,7 @@ export function useAnswerQueue(opts: UseAnswerQueueOpts = {}): AnswerQueue {
             batch.map((w) => {
               if (w.kind === "answer") return submitLabel(w.req);
               if (w.kind === "mask") return submitMaskFix(w.req);
+              if (w.kind === "points") return submitPoints(w.req);
               return flagLabel(w.req);
             }),
           );

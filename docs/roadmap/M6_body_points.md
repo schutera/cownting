@@ -65,9 +65,12 @@ counter as the other steps. Nothing moves on the screen when the step changes.
 The panel has three parts, left to right:
 
 1. **The stick cow.** A small fixed SVG figure of a cow, side view, with the five
-   points drawn as dots. The next point is highlighted. A placed point is filled.
-   A hidden point is drawn as a cross. This is the only place the labeler learns
-   where "top of the shoulders" is; the words alone are not enough.
+   points drawn as dots and numbered 1–5. The next point is highlighted. A placed
+   point is filled. A hidden point is drawn as a cross. This is the only place the
+   labeler learns where "top of the shoulders" is; the words alone are not
+   enough. The figure has a **neck** drawn between the head and the body: without
+   one, the shoulder dot sat where the head met the body and could be read as
+   "the end of the head" (owner's review, 2026-10-18).
 2. **The prompt.** One line: the name of the next point, then the "where to
    click" text from the table. Example: `Top of the shoulders — the highest point
    of the back, above the front legs.`
@@ -76,20 +79,27 @@ The panel has three parts, left to right:
 
 ### 3.3 The crop
 
-The points are drawn over the crop as dots with a label letter (N, S, T, F, H).
-A line joins nose → shoulders → tail base when those points exist. The wheel
-zooms through the server's ladder, exactly as the outline editor does. Hold H
-hides the dots. Hold Space shows the full frame, with the dots drawn over it.
+The points are drawn over the crop as dots with their number (1–5), the same
+numbers the stick cow shows. Not letters: N, S, T, F, H would put the letters of
+the S, F and H keys on the photo. Lines join nose → shoulders → tail base, and
+shoulders → front hoof, tail base → hind hoof, when both ends exist. The wheel
+zooms through the server's ladder, exactly as the outline editor does; a point
+keeps its frame position at every zoom level. Hold H hides the dots. Hold Space
+shows the full frame, with the dots drawn over it.
+
+A click outside `point_bounds` (§5.2) or outside the photo is refused with a
+shake and a hint, at the click. The server would refuse it too, and the client
+queue retries a refused write forever.
 
 ### 3.4 Keys
 
 | key | action |
 |---|---|
 | click on the crop | Place the next point there. |
-| `X` | Mark the next point *can't see* and move on. |
+| `X` | Mark the next point *can't see* and move on. Refused for the fifth point when no point was placed: five "can't see" is not a set of points. The hint names `S` and `F`. |
 | `Backspace` | Remove the last point placed or hidden. The prompt goes back one. |
 | `S` | *Too small*: the whole cow is too small for points. Ends the step. |
-| `←` | Before the first point: back to the outline step. After a point: same as Backspace. |
+| `←` | Back to the outline step. It never removes a point: the arrows walk the steps, and an arrow that sometimes deletes is a trap. The draft is kept. |
 | `→` | Blocked until the step is complete. Shake and hint, like the outline step. |
 | `F` | Flag the cow, as today. Leaves the step. |
 | `Space`, `H` | Holds, as today. |
@@ -229,7 +239,13 @@ Two fields added to the item in `labeling._item`, from one more LEFT JOIN in
 ```python
 "points": [...] | None,      # this annotator's current points, full-frame px
 "points_done": bool,         # this annotator has a current point_edits row
+"point_bounds": [x0, y0, x1, y1],  # where the route accepts a point
 ```
+
+`point_bounds` is `labeling.widest_crop_box` around the anchor box — the same
+function the route checks with. The zoom ladder is cut around the display box,
+which after an outline correction is not the anchor box, so the widest zoom can
+show pixels the route refuses; the client refuses those clicks instead.
 
 `points_done` is what makes the step survive a reload. It is the same role
 `geom_done` plays for the outline step, and it exists for the same reason: a
@@ -240,10 +256,16 @@ point row is not an answer and does not count toward coverage.
 
 ### 5.3 Events
 
-`label_events` gets no new kind. The client sends `answered` for each point with
-`detail.group_key = "points"` and `detail.class_key = <point name>` or
-`"cant_see"`, so the per-decision timing of M3 UX §6.1 covers the step with no
-schema change.
+`label_events` gets no new kind. The client sends one `answered` event per
+action, with `class_key` = the point name (null for *too small*) and
+`detail = {group_key: "points", action: "placed" | "cant_see" | "undo" |
+"too_small", ms_since_group_shown, ms_since_item_shown, input_mode, phase}`.
+The per-question clock restarts when the step opens, so the first point's time
+does not include the outline step. The per-decision timing of M3 UX §6.1 covers
+the step with no schema change.
+
+`/api/label/progress` gains `my_points` and `my_too_small`: this annotator's
+current verdicts. The side panel prints "N cows with body points · M too small".
 
 ## 6. Client
 

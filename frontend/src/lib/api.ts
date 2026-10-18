@@ -31,6 +31,8 @@ import type {
   LabelEventReq,
   LabelWriteResult,
   LabelMaskFixResult,
+  LabelPointsReq,
+  LabelPointsResult,
   LabelGroupReq,
   LabelGroupPatchReq,
   LabelClassReq,
@@ -716,6 +718,13 @@ export function flagLabel(req: LabelFlagReq): Promise<LabelWriteResult> {
 // correction was drawn against a polygon that no longer exists.
 export function submitMaskFix(req: LabelMaskFixReq): Promise<LabelMaskFixResult> {
   return labelWrite<LabelMaskFixResult>("/api/label/mask-fix", req);
+}
+
+// The body points one labeler placed on one cow, or the 'too_small' verdict
+// (docs/roadmap/M6_body_points.md §5.1). Shares labelWrite so the anchor 400 and
+// the 401 branch behave exactly as the other writes do.
+export function submitPoints(req: LabelPointsReq): Promise<LabelPointsResult> {
+  return labelWrite<LabelPointsResult>("/api/label/points", req);
 }
 
 // Effort telemetry (session boundaries, info_opened). Fire-and-forget at the call

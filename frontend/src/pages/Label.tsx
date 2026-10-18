@@ -2,12 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { Link } from "react-router-dom";
 import { canManageData, useAuth } from "../lib/auth";
 import type {
+  BodyPoint,
   InstanceAnchor,
   LabelFlagReq,
   LabelGroup,
   LabelInputMode,
   LabelItem,
   LabelMaskFixReq,
+  LabelPointsReq,
   LabelSkipReason,
   LabelStats,
   LabelSubmitReq,
@@ -29,6 +31,20 @@ import { ClassIcon } from "../components/ClassIcon";
 import { InstanceCrop } from "../components/InstanceCrop";
 import { MaskEditor } from "../components/MaskEditor";
 import { MaskPanel } from "../components/MaskPanel";
+import { PointEditor } from "../components/PointEditor";
+import { PointsPanel } from "../components/PointsPanel";
+import {
+  POINT_STEPS,
+  canHide,
+  hide as hidePointIn,
+  insideBounds,
+  isComplete as pointsComplete,
+  nextIndex as nextPointIndex,
+  place as placePointIn,
+  sameDraft,
+  undo as undoPointIn,
+  type PointDraft,
+} from "../lib/pointSteps";
 import { PANEL_H, QuestionPanel } from "../components/QuestionPanel";
 import { TILE_GAP, TILE_H, TILE_W } from "../components/OptionTile";
 import { LabelProgress } from "../components/LabelProgress";
@@ -211,34 +227,45 @@ function clamp(v: number, lo: number, hi: number): number {
 
 /** What the arrows mean right now.
  *
- * The item is a sequence of steps — [1/3] outline, then one per question — and
- * the arrows WALK IT. That is the whole model, and both directions have to obey
- * it or the pair is a trap: for a while ArrowLeft moved the tape while
- * ArrowRight either jumped out of review or committed the item outright, so a
- * mis-answered question could be reached from one side and not the other.
+ * The item is a sequence of steps — [1/4] outline, [2/4] body points, then one
+ * per question — and the arrows WALK IT. That is the whole model, and both
+ * directions have to obey it or the pair is a trap: for a while ArrowLeft moved
+ * the tape while ArrowRight either jumped out of review or committed the item
+ * outright, so a mis-answered question could be reached from one side and not
+ * the other.
  *
  * Extracted from the component because the ORDER of the cases is the behaviour,
  * and that ordering is what regressed by omission. */
 export interface FlowState {
   step: number;
-  stepCount: number;      // questions only; the geometry step is counted apart
+  stepCount: number;      // questions only; the geometry and points steps are counted apart
   cursor: number;
   frontier: number;
   inGeometry: boolean;
   geomDone: boolean;
+  /** The item has a body-points step at all. A server that predates M6 sends
+      no `points_done`, and the step is then skipped, not asked. */
+  hasPoints: boolean;
+  inPoints: boolean;
+  pointsDone: boolean;
+  /** On the points step, the draft may be left as it is: all five given, or
+      an unchanged 'too small'. */
+  pointsReady: boolean;
   outlineOpen: boolean;
   complete: boolean;      // every REQUIRED question answered
 }
 
 export function backTarget(
   s: FlowState,
-): "question" | "geometry" | "item" | "none" {
+): "question" | "points" | "geometry" | "item" | "none" {
   // The editor owns its own keys; an arrow never reaches here from inside it.
   if (s.outlineOpen) return s.cursor > 0 ? "item" : "none";
-  if (!s.inGeometry && s.step > 0) return "question";
-  // From the FIRST question, back is the outline step — it is step 1 of the
-  // item, not a different animal. Only reachable once it has been passed;
-  // before that we are already standing on it.
+  const onQuestions = !s.inGeometry && !s.inPoints;
+  if (onQuestions && s.step > 0) return "question";
+  // From the FIRST question, back is the step before it on the SAME animal:
+  // the body points, and from there the outline. Each is only reachable once
+  // it has been passed; before that we are already standing on it.
+  if (onQuestions && s.hasPoints && s.pointsDone) return "points";
   if (!s.inGeometry && s.geomDone) return "geometry";
   if (s.cursor > 0) return "item";
   return "none";
@@ -246,13 +273,20 @@ export function backTarget(
 
 export function forwardTarget(
   s: FlowState,
-): "question" | "commit" | "frontier" | "blocked" {
+): "question" | "points" | "commit" | "frontier" | "blocked" {
   if (s.outlineOpen) return "blocked";
   if (s.inGeometry) {
     // Stepping forward OUT of the outline step is only allowed once it has been
     // judged — that gate is the point of the step, and an arrow must not be the
     // hole in it. Passing it writes a verdict; returning to look does not.
-    return s.geomDone ? "question" : "blocked";
+    if (!s.geomDone) return "blocked";
+    return s.hasPoints ? "points" : "question";
+  }
+  if (s.inPoints) {
+    // The same gate for the points: all five given (or 'too small') before the
+    // questions. Completing the fifth point already moves on by itself, so an
+    // arrow only gets here on a revisit, where leaving unchanged writes nothing.
+    return s.pointsReady && s.pointsDone ? "question" : "blocked";
   }
   if (s.step < s.stepCount - 1) return "question";
   // On the last question: leaving review returns to the head of the tape, and
@@ -358,6 +392,19 @@ export default function Label() {
   // advance, like every other mode on this screen — a view the annotator chose
   // for one cow must not greet them on the next.
   const [revisitGeom, setRevisitGeom] = useState(false);
+
+  // ------------------------------------------------------ body points (M6)
+  // What THIS SESSION submitted, per instance — the points, or 'too_small'.
+  // Keyed by instance_key for the reason geomByKey is, and read before the
+  // item's own `points`, which only catches up when the write's echo lands.
+  const [pointsByKey, setPointsByKey] = useState<Record<string, BodyPoint[] | "too_small">>({});
+  // The points given so far on the item on screen. Per item: reset on every
+  // advance, because a draft carried onto the next cow would be points placed on
+  // one animal and saved against another. It survives a walk back to the
+  // outline step, so stepping back to look loses no clicks.
+  const [pointDraft, setPointDraft] = useState<PointDraft>([]);
+  // Walked BACK into the points step after passing it — revisitGeom's twin.
+  const [revisitPoints, setRevisitPoints] = useState(false);
 
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -540,6 +587,27 @@ export default function Label() {
   // annotator walked BACK into it with the arrow to look again.
   const inGeometry = current !== null && !cropFailed && (!geomDone || revisitGeom);
 
+  /* THE BODY-POINTS STEP (docs/roadmap/M6_body_points.md §3). Step 2 of the
+     item, after the outline and before the questions, gated the same way: the
+     questions are not reachable until five points are given or the cow is
+     marked too small. A server that predates M6 sends no `points_done`, and the
+     step is then skipped rather than asked of a route that does not exist. */
+  const hasPoints = current !== null && current.points_done !== undefined;
+  // This session's verdict first, then the server's: `points_done` with null
+  // points is a stored 'too_small'.
+  const savedPoints: BodyPoint[] | "too_small" | null =
+    currentKey === null || current === null
+      ? null
+      : (pointsByKey[currentKey] ??
+        (current.points_done ? (current.points ?? "too_small") : null));
+  const pointsDone = !hasPoints || savedPoints !== null;
+  const inPoints =
+    current !== null && !cropFailed && hasPoints && !inGeometry && (!pointsDone || revisitPoints);
+  const pointsReady =
+    pointsComplete(pointDraft) || (savedPoints === "too_small" && pointDraft.length === 0);
+  // Every step number on screen counts the steps that exist for THIS item.
+  const preSteps = hasPoints ? 2 : 1;
+
   useEffect(() => {
     const onResize = () => setViewportH(window.innerHeight);
     window.addEventListener("resize", onResize);
@@ -712,6 +780,32 @@ export default function Label() {
       // The pool moved under us, so any "drained" verdict is stale by definition.
       setQueueDrained(false);
       refreshStats();
+      // Points landed: fold the STORED points back into the item on the tape,
+      // so the item itself says the step is passed — the session map above it
+      // is trimmed with the tape, the item is what a later revisit reads.
+      if (write.kind === "points") {
+        if (result === null || typeof result !== "object") return;
+        const raw = (result as { points?: unknown }).points;
+        const stored: BodyPoint[] | null =
+          Array.isArray(raw) &&
+          raw.length === POINT_STEPS.length &&
+          raw.every(
+            (p) =>
+              p === null ||
+              (Array.isArray(p) && p.length === 2 && p.every((n) => typeof n === "number")),
+          )
+            ? raw.map((p): BodyPoint => (p === null ? null : [p[0], p[1]]))
+            : null;
+        const pkey = write.req.instance_key;
+        const t = tapeRef.current;
+        setTape({
+          ...t,
+          items: t.items.map((it) =>
+            it.instance_key === pkey ? { ...it, points: stored, points_done: true } : it,
+          ),
+        });
+        return;
+      }
       // An outline landed: fold the STORED polygon back into the item on the
       // tape, in both spaces, so hold-Space draws the correction the annotator
       // just made instead of the state before it. Both come from the server —
@@ -838,6 +932,11 @@ export default function Label() {
       // The geometry verdicts go with them, for the same reason: a map that grew
       // for a whole shift would hold every cow the annotator can no longer reach.
       setGeomByKey((prev) => {
+        const next = { ...prev };
+        for (const it of dropped) delete next[it.instance_key];
+        return next;
+      });
+      setPointsByKey((prev) => {
         const next = { ...prev };
         for (const it of dropped) delete next[it.instance_key];
         return next;
@@ -1034,6 +1133,16 @@ export default function Label() {
     setMaskSaving(false);
   }, []);
 
+  /** Walk onto the body-points step from the step before it. A step already
+      passed re-opens on the stored verdict, so a revisit starts from what was
+      saved; one not yet passed is entered by the gate itself (inPoints is true
+      while it is open) and keeps whatever draft was in progress. */
+  const enterPoints = useCallback(() => {
+    if (!hasPoints || savedPoints === null) return;
+    setRevisitPoints(true);
+    setPointDraft(savedPoints === "too_small" ? [] : savedPoints);
+  }, [hasPoints, savedPoints]);
+
   /** Both outline writes: a corrected polygon, or the false-positive verdict.
       They share everything except `kind` and what happens afterwards, so they
       share a function — two copies would drift on the anchor or the timing. */
@@ -1087,10 +1196,15 @@ export default function Label() {
         else advance();
         return;
       }
-      // 'ok' and 'polygon' both hand on to the questions on the SAME animal: the
-      // geometry step is satisfied, and the cow still has to be answered.
+      // 'ok' and 'polygon' both hand on to the NEXT STEP on the SAME animal —
+      // the body points, then the questions: the geometry step is satisfied,
+      // and the cow still has to be answered. A verdict given on a walk back to
+      // the outline leaves that step too; before, the gate stayed open on
+      // screen after Enter and only the arrow left it.
       closeOutline();
       setStep(0);
+      setRevisitGeom(false);
+      enterPoints();
       // Only a CORRECTION gets the chip. Confirming is the routine path taken by
       // most items, and a "saved ✓" flashing on every cow is noise that teaches
       // the annotator to ignore the one place the screen reports a write.
@@ -1103,6 +1217,7 @@ export default function Label() {
       current,
       currentKey,
       draft,
+      enterPoints,
       goTo,
       markWritten,
       queue,
@@ -1122,6 +1237,163 @@ export default function Label() {
     setStep(0);
   }, [commitMask, current, currentKey, maskSaving]);
 
+  // ------------------------------------------------------ body points (M6)
+
+  /** One per-point decision event on the per-question clock, so the step's
+      timing is measurable point by point (M6 §5.3) rather than as one lump. */
+  const pointEvent = useCallback(
+    (
+      key: string,
+      index: number,
+      action: "placed" | "cant_see" | "undo" | "too_small",
+      mode: LabelInputMode,
+    ) => {
+      const now = activeNow();
+      emitDecisionEvent({
+        session_id: sessionId,
+        kind: "answered",
+        instance_key: key,
+        class_key: index >= 0 && index < POINT_STEPS.length ? POINT_STEPS[index].name : null,
+        detail: {
+          group_key: "points",
+          action,
+          ms_since_group_shown: Math.max(0, Math.round(now - groupMarkRef.current)),
+          ms_since_item_shown: Math.max(0, Math.round(now - itemMarkRef.current)),
+          input_mode: mode,
+          phase: reviewing ? "review" : "fresh",
+        },
+      });
+      groupMarkRef.current = now;
+    },
+    [activeNow, reviewing, sessionId],
+  );
+
+  /** Write the step's verdict and hand on to the questions. The write goes to
+      the optimistic queue like every other; the UI does not wait for it. */
+  const commitPoints = useCallback(
+    (verdict: PointDraft | "too_small") => {
+      if (current === null || currentKey === null) return;
+      const pts =
+        verdict === "too_small"
+          ? null
+          : verdict.map((p): BodyPoint => (p === null ? null : [p[0], p[1]]));
+      const req: LabelPointsReq = {
+        instance_key: current.instance_key,
+        anchor: anchorOf(current),
+        kind: pts === null ? "too_small" : "points",
+        points: pts,
+        serve_event_id: current.serve_event_id,
+        session_id: sessionId,
+        client_elapsed_ms: Math.max(0, Math.round(activeNow() - itemMarkRef.current)),
+      };
+      queue.enqueue({ kind: "points", req });
+      // Deliberately NOT markWritten(): points are not an answer, and excluding
+      // the key from refetches would hide a cow whose questions are still open.
+      setPointsByKey((prev) => ({ ...prev, [currentKey]: pts ?? "too_small" }));
+      setPointDraft(pts ?? []);
+      setRevisitPoints(false);
+      setStep(0);
+      setHint(null);
+    },
+    [activeNow, current, currentKey, queue, sessionId],
+  );
+
+  /** Where the draft goes after a point is given: on to the questions once all
+      five are, with a write only if it differs from what is already stored —
+      a revisit that ends where it started writes nothing. */
+  const settleDraft = useCallback(
+    (next: PointDraft) => {
+      if (!pointsComplete(next)) {
+        setPointDraft(next);
+        return;
+      }
+      if (Array.isArray(savedPoints) && sameDraft(next, savedPoints)) {
+        setPointDraft(next);
+        setRevisitPoints(false);
+        setStep(0);
+        return;
+      }
+      commitPoints(next);
+    },
+    [commitPoints, savedPoints],
+  );
+
+  /** A click on the photo: the next point goes there. */
+  const placePoint = useCallback(
+    (xy: [number, number]) => {
+      if (!inPoints || current === null || currentKey === null) return;
+      const idx = nextPointIndex(pointDraft);
+      if (idx === null) {
+        shake();
+        showHint("all five points are given — Backspace takes back the last one, → goes on");
+        return;
+      }
+      // The route's own bound, served on the item. Refused HERE, at the click,
+      // because a write the route refuses is retried by the queue forever.
+      if (!insideBounds(xy, current.point_bounds, current.frame_w, current.frame_h)) {
+        shake();
+        showHint("that is outside the photo of this cow — click on the cow");
+        return;
+      }
+      pointEvent(currentKey, idx, "placed", "mouse");
+      settleDraft(placePointIn(pointDraft, xy));
+    },
+    [current, currentKey, inPoints, pointDraft, pointEvent, settleDraft, shake, showHint],
+  );
+
+  /** X: the next point cannot be seen. */
+  const hidePoint = useCallback(
+    (mode: LabelInputMode) => {
+      if (!inPoints || currentKey === null) return;
+      const idx = nextPointIndex(pointDraft);
+      if (idx === null || !canHide(pointDraft)) {
+        shake();
+        showHint(
+          idx === null
+            ? "all five points are given — Backspace takes back the last one"
+            : "no point is visible — press S if the cow is too small, or F to flag it",
+        );
+        return;
+      }
+      pointEvent(currentKey, idx, "cant_see", mode);
+      settleDraft(hidePointIn(pointDraft));
+    },
+    [currentKey, inPoints, pointDraft, pointEvent, settleDraft, shake, showHint],
+  );
+
+  /** Backspace: take back the last point given. Never ArrowLeft — the arrows
+      walk the steps, and an arrow that sometimes deletes a point is a trap. */
+  const undoPoint = useCallback(
+    (mode: LabelInputMode) => {
+      if (!inPoints || currentKey === null) return;
+      if (pointDraft.length === 0) {
+        shake();
+        showHint("nothing to take back — ← goes back to the outline");
+        return;
+      }
+      pointEvent(currentKey, pointDraft.length - 1, "undo", mode);
+      setPointDraft(undoPointIn(pointDraft));
+    },
+    [currentKey, inPoints, pointDraft, pointEvent, shake, showHint],
+  );
+
+  /** S: the whole cow is too small for points. Ends the step. */
+  const markTooSmall = useCallback(
+    (mode: LabelInputMode) => {
+      if (!inPoints || currentKey === null) return;
+      pointEvent(currentKey, -1, "too_small", mode);
+      if (savedPoints === "too_small") {
+        // Already the stored verdict: leave, write nothing.
+        setPointDraft([]);
+        setRevisitPoints(false);
+        setStep(0);
+        return;
+      }
+      commitPoints("too_small");
+    },
+    [commitPoints, currentKey, inPoints, pointEvent, savedPoints],
+  );
+
   const flow = useCallback(
     (): FlowState => ({
       step,
@@ -1130,10 +1402,26 @@ export default function Label() {
       frontier: tapeRef.current.frontier,
       inGeometry,
       geomDone,
+      hasPoints,
+      inPoints,
+      pointsDone,
+      pointsReady,
       outlineOpen,
       complete: isComplete(answers),
     }),
-    [answers, geomDone, inGeometry, isComplete, outlineOpen, step, steps.length],
+    [
+      answers,
+      geomDone,
+      hasPoints,
+      inGeometry,
+      inPoints,
+      isComplete,
+      outlineOpen,
+      pointsDone,
+      pointsReady,
+      step,
+      steps.length,
+    ],
   );
 
   const goPrev = useCallback(() => {
@@ -1143,6 +1431,12 @@ export default function Label() {
         // the question, not by abandoning the animal; the tile still shows what
         // was chosen, so another letter replaces it and the same one clears it.
         setStep(step - 1);
+        setHint(null);
+        return;
+      case "points":
+        // Back onto step 2 from the first question. What was given is shown
+        // again, not asked again — the same rule as the outline below.
+        enterPoints();
         setHint(null);
         return;
       case "geometry":
@@ -1158,15 +1452,27 @@ export default function Label() {
         shake();
         showHint("this is as far back as the tape goes");
     }
-  }, [flow, goTo, shake, showHint, step]);
+  }, [enterPoints, flow, goTo, shake, showHint, step]);
 
   const goNext = useCallback(() => {
     switch (forwardTarget(flow())) {
-      case "question":
-        // Forward one step, the mirror of goPrev. Leaving the outline step this
-        // way does NOT re-write its verdict: looking is not judging.
+      case "points":
+        // Out of the outline step onto the points, the mirror of goPrev.
         setRevisitGeom(false);
-        setStep(inGeometry ? 0 : step + 1);
+        enterPoints();
+        setHint(null);
+        return;
+      case "question":
+        // Forward one step, the mirror of goPrev. Leaving the outline or the
+        // points step this way does NOT re-write its verdict: looking is not
+        // judging.
+        setRevisitGeom(false);
+        if (inGeometry || inPoints) {
+          setRevisitPoints(false);
+          setStep(0);
+        } else {
+          setStep(step + 1);
+        }
         setHint(null);
         return;
       case "frontier":
@@ -1190,11 +1496,13 @@ export default function Label() {
         showHint(
           inGeometry
             ? "check the outline first — Enter accepts it, E fixes it"
-            : "answer both questions, or press F to flag",
+            : inPoints
+              ? "place all five points first — X if you can't see one, S if the cow is too small"
+              : "answer both questions, or press F to flag",
         );
     }
-  }, [activeNow, advance, answers, commitAnswers, current, flow, goTo, inGeometry,
-      shake, showHint, step]);
+  }, [activeNow, advance, answers, commitAnswers, current, enterPoints, flow, goTo,
+      inGeometry, inPoints, shake, showHint, step]);
 
   const openFlag = useCallback(() => {
     if (current === null) return;
@@ -1243,6 +1551,10 @@ export default function Label() {
     setMaskSaving(false);
     setZoom(null);
     setRevisitGeom(false);
+    // The body-points draft is the strongest case of all: points carried onto
+    // the next cow would be placed on one animal and saved against another.
+    setPointDraft([]);
+    setRevisitPoints(false);
     // A popover must not survive the advance: the same class_key exists in the
     // next item, so it would silently reappear anchored to a cow nobody opened
     // it for.
@@ -1258,9 +1570,12 @@ export default function Label() {
 
   // The per-QUESTION clock. A2 (median Q2 time within 1.25x of Q1) is the
   // sharpest acceptance test in §8.3 and it needs this mark to exist.
+  // `inPoints` restarts it as the body-points step opens and again as it hands
+  // on: `step` stays 0 across both edges, so without it the first point's time
+  // ran from when the COW was shown, outline step included.
   useEffect(() => {
     groupMarkRef.current = activeNow();
-  }, [activeNow, currentKey, step]);
+  }, [activeNow, currentKey, step, inPoints]);
 
   // ---------------------------------------------------------------- keyboard
 
@@ -1363,6 +1678,44 @@ export default function Label() {
       } else if (resolveLabelKey(e, activeOptions.length)?.kind === "option") {
         shake();
         showHint("check the outline first — Enter accepts it, E fixes it");
+        return;
+      }
+    }
+
+    // THE POINTS STEP OWNS THE KEYBOARD the same way (M6 §3.4). The click on the
+    // photo places a point; X says the next one cannot be seen, Backspace takes
+    // the last one back, S says the cow is too small. The answer letters are
+    // inert for the outline step's reason, and X is safe here for the same one:
+    // nothing else is listening. Enter does nothing — the step finishes itself
+    // on the fifth point — so it says so instead of passing silently. The arrows
+    // stay with goPrev/goNext, which walk the steps and never delete a point.
+    if (inPoints && !flag.open && !outlineOpen) {
+      if (plain && !e.repeat) {
+        if (e.key === "x" || e.key === "X") {
+          e.preventDefault();
+          hidePoint("key");
+          return;
+        }
+        if (e.key === "Backspace") {
+          e.preventDefault();
+          undoPoint("key");
+          return;
+        }
+        if (e.key === "s" || e.key === "S") {
+          e.preventDefault();
+          markTooSmall("key");
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          shake();
+          showHint("click the point on the photo — X if you can't see it");
+          return;
+        }
+      }
+      if (resolveLabelKey(e, activeOptions.length)?.kind === "option") {
+        shake();
+        showHint("place the body points first — X if you can't see one, S if the cow is too small");
         return;
       }
     }
@@ -1569,16 +1922,29 @@ export default function Label() {
             crop below it does not lose a pixel. */}
         <div className="flex justify-center" style={{ marginBottom: CROP_GAP }}>
           <ModeToggle
-            stage={outlineOpen || inGeometry ? "outline" : "classify"}
-            // Classify cannot be selected until the geometry step is passed:
+            stage={outlineOpen || inGeometry ? "outline" : inPoints ? "points" : "classify"}
+            // Classify cannot be selected until the steps before it are passed:
             // the sequence is the feature, and a control that let you click past
-            // step 1 would make the gate a suggestion. Once passed, going BACK
-            // to the outline stays available — the tape's whole ethos is that a
-            // decision can be revisited, and a second look costs nothing.
-            classifyDisabled={inGeometry}
+            // a gate would make it a suggestion. Once passed, going BACK stays
+            // available — the tape's whole ethos is that a decision can be
+            // revisited, and a second look costs nothing.
+            classifyDisabled={inGeometry || (inPoints && !(pointsReady && pointsDone))}
             outlineDisabled={!outlineAvailable}
-            onClassify={closeOutline}
+            hasPoints={hasPoints}
+            pointsDisabled={!hasPoints || !geomDone || cropFailed}
+            onClassify={() => {
+              closeOutline();
+              if (inPoints) {
+                setRevisitPoints(false);
+                setStep(0);
+              }
+            }}
             onOutline={openOutline}
+            onPoints={() => {
+              closeOutline();
+              setRevisitGeom(false);
+              enterPoints();
+            }}
           />
         </div>
 
@@ -1609,6 +1975,26 @@ export default function Label() {
                 onRefusedDelete={() => {
                   shake();
                   showHint("an outline needs at least three points");
+                }}
+                className="w-full h-full"
+              />
+            ) : inPoints && !flag.open ? (
+              // The photo is where the point is given, so the step's editor IS
+              // the crop: same box, same stretch contract as the other two.
+              // With the flag row open the plain crop comes back, because a
+              // click there must not place a point on a cow being flagged.
+              <PointEditor
+                item={current}
+                points={pointDraft}
+                levels={cropLevels}
+                levelIndex={zoomIndex}
+                onLevelChange={setZoom}
+                onPlace={placePoint}
+                hidden={clean || inspect}
+                onError={(k) => {
+                  if (k === tapeRef.current.items[tapeRef.current.cursor]?.instance_key) {
+                    setFailedKey(k);
+                  }
                 }}
                 className="w-full h-full"
               />
@@ -1685,7 +2071,7 @@ export default function Label() {
                 composition the two holds were designed for — the clean full
                 frame is a legitimate thing to want, and sun exposure is judged
                 on unobstructed pixels. */}
-            <FramePeek item={current} hideMarks={clean} />
+            <FramePeek item={current} hideMarks={clean} points={inPoints ? pointDraft : null} />
             <div
               className="absolute left-4 bottom-4 flex items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px]"
               style={{
@@ -1749,21 +2135,31 @@ export default function Label() {
             <GeometryPanel
               hasMask={servedMaskCrop !== null}
               saving={maskSaving}
-              stepCount={steps.length + 1}
+              stepCount={steps.length + preSteps}
               onConfirm={confirmGeometry}
               onFix={openOutline}
               onRemove={() => commitMask("false_positive")}
             />
+          ) : inPoints ? (
+            <PointsPanel
+              draft={pointDraft}
+              savedTooSmall={savedPoints === "too_small"}
+              stepNumber={2}
+              stepCount={steps.length + preSteps}
+              onHide={() => hidePoint("mouse")}
+              onUndo={() => undoPoint("mouse")}
+              onTooSmall={() => markTooSmall("mouse")}
+            />
           ) : (
             <QuestionPanel
               group={activeGroup}
-              // The questions are steps 2..n+1 of the item now: geometry is
-              // step 1, and a counter that still read [1/2] would be telling the
-              // annotator they are somewhere they are not. The offset moves the
-              // counter without moving the per-question colours.
+              // The questions come after the outline and the body points: a
+              // counter that still read [1/2] would be telling the annotator
+              // they are somewhere they are not. The offset moves the counter
+              // without moving the per-question colours.
               stepIndex={step}
-              stepOffset={1}
-              stepCount={steps.length + 1}
+              stepOffset={preSteps}
+              stepCount={steps.length + preSteps}
               reserveOptions={reserveOptions}
               selectedClassKey={answers[activeGroup.group_key] ?? null}
               reviewing={reviewing}
@@ -1922,6 +2318,8 @@ export default function Label() {
               // Always zero: decision 6 makes the written explanation mandatory
               // at flag time, so there is no deferred-notes queue to owe.
               pendingNotes: 0,
+              bodyPoints: stats?.my_points,
+              tooSmall: stats?.my_too_small,
             }}
           />
         </div>
@@ -2077,9 +2475,23 @@ function GeometryPanel({
  * misplace every mark by the downscale factor, which is worse than drawing
  * nothing: it would point confidently at the wrong animal.
  */
-function FramePeek({ item, hideMarks }: { item: LabelItem; hideMarks: boolean }) {
+function FramePeek({
+  item,
+  hideMarks,
+  points = null,
+}: {
+  item: LabelItem;
+  hideMarks: boolean;
+  /** The body points given so far, full-frame px — drawn while the points step
+      is open, so the peek shows the same marks the crop does. */
+  points?: PointDraft | null;
+}) {
   const fw = item.frame_w ?? 0;
   const fh = item.frame_h ?? 0;
+  // A dot sized to the FRAME, because this viewBox is the whole frame and the
+  // image is shown downscaled: ~7 px on a 1920 px frame lands at a few screen
+  // px, findable without covering the hoof it marks.
+  const dotR = Math.max(fw, fh) * 0.0035;
   // No dimensions (an older server, or the JPEG has gone) -> the photo alone.
   // Guessing would be worse than not drawing.
   const canMark = fw > 0 && fh > 0;
@@ -2209,6 +2621,21 @@ function FramePeek({ item, hideMarks }: { item: LabelItem; hideMarks: boolean })
               />
             </>
           ) : null}
+          {points?.map((p, i) =>
+            p === null ? null : (
+              <circle
+                key={i}
+                cx={p[0]}
+                cy={p[1]}
+                r={dotR}
+                fill={ON_IMAGE_ACCENT}
+                stroke="#000"
+                strokeOpacity={0.7}
+                strokeWidth={1.5}
+                vectorEffect="non-scaling-stroke"
+              />
+            ),
+          )}
         </svg>
       ) : null}
     </div>
@@ -2251,14 +2678,22 @@ function ModeToggle({
   stage,
   classifyDisabled,
   outlineDisabled,
+  hasPoints,
+  pointsDisabled,
   onClassify,
   onOutline,
+  onPoints,
 }: {
-  stage: "outline" | "classify";
+  stage: "outline" | "points" | "classify";
   classifyDisabled: boolean;
   outlineDisabled: boolean;
+  /** The item has a body-points step (M6). Without one the toggle is the
+      two-step one it was, numbered to match. */
+  hasPoints: boolean;
+  pointsDisabled: boolean;
   onClassify: () => void;
   onOutline: () => void;
+  onPoints: () => void;
 }) {
   return (
     <div
@@ -2275,13 +2710,29 @@ function ModeToggle({
       >
         1 · Outline
       </ModeButton>
+      {hasPoints ? (
+        <ModeButton
+          active={stage === "points"}
+          disabled={pointsDisabled}
+          onClick={onPoints}
+          title={pointsDisabled ? "check the outline first" : "place the body points"}
+        >
+          2 · Points
+        </ModeButton>
+      ) : null}
       <ModeButton
         active={stage === "classify"}
         disabled={classifyDisabled}
         onClick={onClassify}
-        title={classifyDisabled ? "check the outline first" : "answer the questions"}
+        title={
+          classifyDisabled
+            ? hasPoints
+              ? "check the outline and place the body points first"
+              : "check the outline first"
+            : "answer the questions"
+        }
       >
-        2 · Classify
+        {hasPoints ? "3" : "2"} · Classify
       </ModeButton>
     </div>
   );

@@ -218,6 +218,37 @@ export interface LabelGroup {
 export interface Taxonomy {
   revision: number;
   groups: LabelGroup[];
+  // The body-points vocabulary in storage order (labels_db.POINT_NAMES). Optional
+  // because a server that predates M6 does not send it.
+  points?: string[];
+}
+
+// M6 body points (docs/roadmap/M6_body_points.md §2). The order is click order
+// AND storage order: entry i of every stored `points` list is the point named at
+// index i here. lib/pointSteps.ts carries the same names with the labeler copy.
+export type PointName = "nose" | "shoulders" | "tail_base" | "front_hoof" | "hind_hoof";
+/** One body point in FULL-FRAME px, or null for "can't see". */
+export type BodyPoint = [number, number] | null;
+// 'points' carries exactly five entries; 'too_small' carries none and says the
+// whole cow is too small for any of them.
+export type PointsKind = "points" | "too_small";
+// POST /api/label/points. Full-frame px only — the editor works in that space,
+// so nothing converts and nothing can shear.
+export interface LabelPointsReq {
+  instance_key: string;
+  anchor: InstanceAnchor;
+  kind: PointsKind;
+  points: BodyPoint[] | null;
+  serve_event_id?: number | null;
+  session_id?: string | null;
+  client_elapsed_ms?: number | null;
+}
+// The route echoes what it STORED, so the page patches the item it holds.
+export interface LabelPointsResult {
+  ok: boolean;
+  edit_id: number;
+  version: number;
+  points: BodyPoint[] | null;
 }
 
 // FROZEN queue-item contract, mirrored field for field. `crop_url` is built
@@ -288,6 +319,16 @@ export interface LabelItem {
   // crop_geometry out of TypeScript and makes a sheared save unrepresentable.
   crop_levels?: CropLevel[];
   crop_level?: number;
+  // M6 body points (docs/roadmap/M6_body_points.md §5.2). THIS annotator's
+  // points — five entries, full-frame px, null for "can't see" — or null when
+  // they have none or answered 'too small'. `points_done` says the step is
+  // passed, and is served for the reason `geom_done` is: a reload must not
+  // re-ask it. `point_bounds` is where the route accepts a point, so the editor
+  // can refuse a click the server would reject. All optional: a server that
+  // predates M6 sends none of them, and the page then skips the step.
+  points?: BodyPoint[] | null;
+  points_done?: boolean;
+  point_bounds?: [number, number, number, number];
 }
 
 /** One rung of the outline editor's zoom ladder. `src` is the square this crop
@@ -388,6 +429,10 @@ export interface LabelStats {
   my_labeled: number;
   my_skipped: number;
   my_median_ms: number | null;
+  /** M6: cows I placed body points on, and cows I marked too small — current
+      verdicts only. Optional: a server that predates M6 does not send them. */
+  my_points?: number;
+  my_too_small?: number;
   annotators: number;
   auth_disabled: boolean;
   filters: { dataset: string | null; camera: string | null };

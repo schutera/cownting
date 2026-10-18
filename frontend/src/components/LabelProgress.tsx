@@ -84,6 +84,11 @@ export interface LabelStream {
   /** Flagged items still owing their written explanation. The session cannot
       be marked complete while this is non-zero. */
   pendingNotes: number;
+  /** M6: cows with body points from this annotator, and cows marked too
+      small, from the same persisted stats as `done`. Undefined against a server
+      that predates the step — the line is then left out, not printed as 0. */
+  bodyPoints?: number;
+  tooSmall?: number;
 }
 
 export interface LabelProgressProps {
@@ -438,6 +443,13 @@ export function LabelProgress({
             </>
           )}
         </p>
+        {stream.bodyPoints !== undefined ? (
+          <p className="text-[11.5px] leading-snug mt-0.5" style={{ color: INK_DIM }}>
+            {stream.bodyPoints.toLocaleString()} {stream.bodyPoints === 1 ? "cow" : "cows"} with
+            body points
+            {stream.tooSmall ? ` · ${stream.tooSmall.toLocaleString()} too small` : ""}
+          </p>
+        ) : null}
       </Block>
 
       <Block title="Classes labeled">
