@@ -1113,7 +1113,16 @@ def resolve_choices(
                         "class_name": meta["name"], "ordinal": i})
     if require_complete:
         answered = {c["group_key"] for c in out}
-        missing = [k for k, g in groups.items() if g["required"] and k not in answered]
+        # A required group with NO active option cannot be answered, and the
+        # Label page does not show it (Label.tsx drops a group whose classes are
+        # all archived, or that has none yet). Requiring it anyway 400'd every
+        # submit from every labeler while a poweruser was between "add question"
+        # and "add its first option" — and the client retries a 400 forever,
+        # until the next revision bump turned all of it into dropped 409s.
+        # `taxonomy()` lists active classes only, so an empty list is exactly
+        # the page's rule.
+        missing = [k for k, g in groups.items()
+                   if g["required"] and g["classes"] and k not in answered]
         if missing:
             raise ValueError("unanswered required group(s): " + ", ".join(sorted(missing)))
     return out
@@ -1435,11 +1444,29 @@ def resolve_effective_key(con, instance_key: str) -> str:
 
     `idx_alias_old` on `(old_key)` already existed for this lookup; nothing had
     ever used it.
+
+    One hop is not enough after a SECOND re-ingest. The first run recorded
+    K1->K2; the second records K2->K3 (reconcile_dataset writes the alias from
+    the cow's live key), so K1 reaches K3 only by following the chain. And an
+    older store may hold K1->K2 AND K1->K3 under one old_key (the PK allows it),
+    where a bare fetchone() over the unordered scan returned the dead K2 — a
+    stale resubmit then superseded the labeler's live row and filed the new one
+    under a key no detection has. So: newest alias per hop, followed to the end,
+    with a hop cap and a cycle guard so a damaged table cannot loop.
     """
-    row = con.execute(
-        "SELECT new_key FROM instance_key_aliases WHERE old_key = ?",
-        [instance_key]).fetchone()
-    return row[0] if row and row[0] else instance_key
+    key = instance_key
+    seen = {key}
+    for _ in range(16):
+        row = con.execute(
+            # `rowid` breaks a same-timestamp tie in insertion order.
+            "SELECT new_key FROM instance_key_aliases WHERE old_key = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [key]).fetchone()
+        if not row or not row[0] or row[0] in seen:
+            break
+        key = str(row[0])
+        seen.add(key)
+    return key
 
 
 class VersionRace(ValueError):
@@ -2236,15 +2263,27 @@ def reconcile_dataset(
             outcomes.append({"instance_key": key, "state": "orphan", "new_key": None,
                              "iou": None, "detail": None})
 
-    # Injectivity, enforced across the whole run rather than per annotation.
-    claims: dict[str, list[str]] = {}
+    # Injectivity, enforced across the whole run rather than per annotation — and
+    # per COW, not per key. After one re-ingest aliased K1->K2, rows written
+    # directly under K2 and K1's rows (now effective K2) are the same animal; on
+    # the next re-ingest both propose K3, and counting claims by instance_key
+    # called that a merge of two cows, refused it, and left every labeler's work
+    # on that cow stranded on the dead K2. Claims are counted by the effective
+    # cow, and the alias is written from the cow's live key, so a chain
+    # K1->K2->K3 is what resolve_effective_key follows.
+    cow_of = {str(r["instance_key"]): str(r["effective_key"] or r["instance_key"])
+              for r in labels}
+    claims: dict[str, set[str]] = {}
     for old_key, cand in proposals.items():
-        claims.setdefault(str(cand["instance_key"]), []).append(old_key)
+        claims.setdefault(str(cand["instance_key"]), set()).add(cow_of.get(old_key, old_key))
     for old_key, cand in proposals.items():
         new_key = str(cand["instance_key"])
+        cow = cow_of.get(old_key, old_key)
         rival = _alias_owner(lcon, new_key, cand["dataset_id"])
-        if len(claims[new_key]) > 1 or (rival is not None and rival != old_key):
-            others = sorted(set(claims[new_key]) - {old_key} | ({rival} if rival else set()))
+        same_cow_rival = rival is None or rival in (old_key, cow) or cow_of.get(rival) == cow
+        if len(claims[new_key]) > 1 or not same_cow_rival:
+            others = sorted((claims[new_key] - {cow})
+                            | ({rival} if rival and not same_cow_rival else set()))
             outcomes.append({
                 "instance_key": old_key, "state": "ambiguous_merge", "new_key": new_key,
                 "iou": cand["iou"],
@@ -2255,7 +2294,11 @@ def reconcile_dataset(
                          "iou": cand["iou"], "detail": None,
                          "moved": {t: 0 for t, _ in KEYED_TABLES}})
         if not dry_run:
-            _write_alias(lcon, old_key=old_key, new_key=new_key, reason="reingest_iou",
+            # From the cow's LIVE key: on a first re-ingest that is the row's own
+            # key, as before; on a second it extends the chain K1->K2->K3, where
+            # writing K1->K3 again would collide with the store's
+            # UNIQUE (new_key, dataset_id) the moment a sibling key claims K3.
+            _write_alias(lcon, old_key=cow, new_key=new_key, reason="reingest_iou",
                          iou=cand["iou"], dataset_id=cand["dataset_id"],
                          camera_id=cand["camera_id"], frame_basename=cand["frame_basename"],
                          actor=actor)

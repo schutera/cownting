@@ -1079,6 +1079,74 @@ def test_a_submit_under_a_pre_reconciliation_key_lands_on_the_live_one():
         lcon.close()
 
 
+def test_a_second_reingest_keeps_one_cow():
+    """REGRESSION (review 3). After a first re-ingest aliased K1->K2, bob labels
+    the cow under K2 directly. On a SECOND re-ingest both keys propose K3. They
+    are one animal, but claims were counted per instance_key, so the run called
+    it a merge of two cows, refused it, and stranded both answers on the dead
+    K2; and the alias lookup took an arbitrary row of two for K1."""
+    with tempfile.TemporaryDirectory() as d:
+        mcon, lcon, ds, cam, base, bbox, prov = _reingest_fixture(d)
+        k1 = labels_db.instance_key(ds, cam, base, bbox, 0)
+        labels_db.submit_annotation(lcon, instance_key=k1, annotator="alice",
+                                    outcome="labeled", choices=[_SHADED], provenance=prov)
+        k2 = _shift_boxes(mcon)
+        labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+        prov2 = {**prov, "bbox_x1": bbox[0] + 3, "bbox_x2": bbox[2] + 3}
+        labels_db.submit_annotation(lcon, instance_key=k2, annotator="bob",
+                                    outcome="labeled", choices=[_SHADED], provenance=prov2)
+
+        k3 = _shift_boxes(mcon)
+        rep = labels_db.reconcile_dataset(lcon, mcon, ds, actor="test")
+        check("the second re-ingest aliases the cow, it is not a merge",
+              rep["states"]["aliased"] == 2 and rep["states"]["ambiguous_merge"] == 0,
+              str(rep["states"]))
+
+        def coverage():
+            return dict(lcon.execute(
+                "SELECT effective_key, count(DISTINCT annotator) FROM v_current_answers "
+                "GROUP BY 1").fetchall())
+
+        check("both labelers' answers sit on the live key", coverage() == {k3: 2},
+              str({k[:6]: v for k, v in coverage().items()}))
+        check("an old key resolves to the live one through the chain",
+              labels_db.resolve_effective_key(lcon, k1) == k3
+              and labels_db.resolve_effective_key(lcon, k2) == k3)
+
+        # alice's tab still holds the first item and resubmits it.
+        labels_db.submit_annotation(lcon, instance_key=k1, annotator="alice",
+                                    outcome="labeled", choices=[_SUN], provenance=prov)
+        check("a stale resubmit lands on the live key, the cow keeps both labelers",
+              coverage() == {k3: 2}, str({k[:6]: v for k, v in coverage().items()}))
+        mcon.close(); lcon.close()
+
+
+def test_a_required_group_without_options_is_not_required():
+    """REGRESSION (review 3). The Label page hides a group that has no active
+    option; the server still required an answer for it, so every submit was
+    refused while a poweruser was between adding a question and its first
+    option — and the client retries a refusal forever."""
+    with tempfile.TemporaryDirectory() as d:
+        con = _store(d)
+        both = {"sun_exposure": "sun_exposure.shaded", "behaviour": "behaviour.standing"}
+        labels_db.create_group(con, group_key="coat", name="Coat", required=True, actor="pow")
+        check("a required group with no options does not block a submit",
+              len(labels_db.resolve_choices(con, both)) == 2)
+        for c in labels_db.taxonomy(con)["groups"]:
+            if c["group_key"] == "behaviour":
+                for cls in c["classes"]:
+                    labels_db.update_class(con, cls["class_key"], active=False, actor="pow")
+        check("nor does one whose options were all archived",
+              len(labels_db.resolve_choices(con, {"sun_exposure": "sun_exposure.shaded"})) == 1)
+        try:
+            labels_db.resolve_choices(con, {"behaviour": "behaviour.standing"})
+            check("a required group WITH options is still required", False, "accepted")
+        except ValueError as e:
+            check("a required group WITH options is still required", "sun_exposure" in str(e),
+                  str(e))
+        con.close()
+
+
 def main():
     print("=== test_labels_schema ===")
     test_key_is_path_and_platform_stable()
@@ -1091,6 +1159,8 @@ def main():
     test_rekey_collides_with_nothing_when_one_annotator_has_rows_in_both_tables()
     test_point_edits_store_and_validate()
     test_point_edits_follow_their_instance_and_a_stale_key()
+    test_a_second_reingest_keeps_one_cow()
+    test_a_required_group_without_options_is_not_required()
     test_mask_survives_clip_restore_on_a_deployed_shape_db()
     test_mask_columns_are_last_so_the_archive_stays_aligned()
     test_schema_is_idempotent_and_seeded()

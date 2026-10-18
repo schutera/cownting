@@ -1949,6 +1949,10 @@ def create_app(config: Config) -> FastAPI:
         bbox = [x1, y1, x2, y2]
         if not all(math.isfinite(v) for v in bbox):
             raise HTTPException(400, "bbox coordinates must be finite")
+        # NaN survives the clamp below (min/max keep it) and crop_geometry then
+        # raised on floor(nan): a 500 where a 400 belongs.
+        if pad is not None and not math.isfinite(float(pad)):
+            raise HTTPException(400, "pad must be finite")
         cfg = config.annotation
         # The ceiling is the WIDEST rung the editors can ask for, not a round
         # number. It was 2.0 while ZOOM_PADS reached 2.5, so the widest rung was

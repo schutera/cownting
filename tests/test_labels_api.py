@@ -1171,6 +1171,32 @@ def test_the_mix_keeps_its_share_when_the_lists_overlap():
               str(got))
 
 
+def test_identical_detection_rows_are_one_cow():
+    """REGRESSION (review 3). Two byte-identical detection rows share one key —
+    the ordinal is a dense_rank on purpose — but the scan carried both, so the
+    cow was served twice in one batch, next to itself, and counted twice."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        before = client.get("/api/label/progress").json()
+        mc = db.connect(config.paths.db_path)
+        try:
+            mc.execute(f"INSERT INTO detections ({', '.join(db.DET_COLS)}) "
+                       f"SELECT {', '.join(db.DET_COLS)} FROM detections "
+                       "ORDER BY bbox_x1 LIMIT 1")
+        finally:
+            mc.close()
+        items = client.get("/api/label/queue?mine=all&limit=50").json()["items"]
+        keys = [i["instance_key"] for i in items]
+        check("a duplicated detection row is served once", len(keys) == len(set(keys)) == 6,
+              str(len(keys)))
+        after = client.get("/api/label/progress").json()
+        check("...and counted once", after["pool_total"] == before["pool_total"] == 6
+              and after["remaining"] == before["remaining"],
+              f'{before["pool_total"]} -> {after["pool_total"]}')
+        r = client.get("/api/img/label-crop/camera_01/00000001.jpg?x1=1&y1=1&x2=50&y2=50&pad=nan")
+        check("a NaN pad is a 400, not a 500", r.status_code == 400, str(r.status_code))
+
+
 def test_points_only_backlog():
     """M6 §3.7: `mode=points` serves the cows that already have an answer from
     anyone but body points from nobody — the cows the ordinary queue never serves
@@ -1740,6 +1766,7 @@ def main():
     test_points_roundtrip_and_validation()
     test_the_default_queue_mixes_in_the_backlog()
     test_the_mix_keeps_its_share_when_the_lists_overlap()
+    test_identical_detection_rows_are_one_cow()
     test_points_only_backlog()
     test_false_positive_retires_the_instance_for_everyone()
     test_spread_draws_from_every_day_and_camera()

@@ -373,8 +373,19 @@ def _scan_sql(cfg: AnnotationCfg, alias: str, *, annotator: str,
             FROM detections d
             WHERE {' AND '.join(clauses)}
         ),
-        keyed AS (
+        keyed_all AS (
             SELECT r.*, {labels_db.instance_key_sql('r')} AS instance_key FROM ranked r
+        ),
+        -- ONE ROW PER KEY. The ordinal is a dense_rank on purpose, so two
+        -- byte-identical detection rows share a key (a crop nobody can tell
+        -- apart is one cow). Without this the scan carried both: the cow was
+        -- served twice, next to itself, to the same labeler — a second answer
+        -- superseding the first — and counted twice in every total. Collapsing
+        -- AFTER the key is fixed removes rows only; it renumbers nothing.
+        keyed AS (
+            SELECT * FROM keyed_all
+            QUALIFY row_number() OVER (PARTITION BY instance_key
+                                       ORDER BY detection_id NULLS LAST) = 1
         ),
         scoped AS (
             SELECT k.instance_key, k.dataset_id, k.camera_id, k.frame_path, k.ordinal,
