@@ -582,7 +582,9 @@ export interface LabelQueueOpts {
   day?: string;
   mine?: LabelQueueMine;
   order?: LabelQueueOrder;
-  mode?: LabelQueueMode;    // 'points' = the points-only backlog (M6 §3.7)
+  // 'points' = the points-only backlog alone (M6 §3.7). The Label page does
+  // not send it: the default queue mixes the backlog in by itself.
+  mode?: LabelQueueMode;
 }
 
 // A batch of instances to label. There is no offset and no cursor: `exclude`

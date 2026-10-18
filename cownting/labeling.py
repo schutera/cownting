@@ -619,15 +619,25 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
           session_id: str | None = None, mode: str = "full") -> dict:
     """One batch of instances to label, plus the policy and scope that produced it.
 
-    `mode="points"` is the POINTS-ONLY BACKLOG (M6 §3.7): cows that already
-    carry at least one answer, from anyone, but no body points from anyone.
-    The page asks only the outline (when this labeler has not judged it) and
-    the points for them, never the questions. It exists because the ordinary
-    queue never serves a cow back to the labeler who answered it, and retires a
-    cow at its target — so the cows that already have behaviour answers, the
-    ones where points are worth most, would otherwise never get any. Coverage,
-    `mine`, the target and the skip counter are question-mode rules and do not
-    apply; a false positive is still out for everyone.
+    THE POINTS-ONLY BACKLOG (M6 §3.7): cows that already carry at least one
+    answer, from anyone, but no body points from anyone. The page asks only the
+    outline (when this labeler has not judged it) and the points for them,
+    never the questions. It exists because the ordinary queue never serves a
+    cow back to the labeler who answered it, and retires a cow at its target —
+    so the cows that already have behaviour answers, the ones where points are
+    worth most, would otherwise never get any. Coverage, `mine`, the target and
+    the skip counter are question-mode rules and do not apply to it; a false
+    positive is still out for everyone.
+
+    In the default mode the batch MIXES the two: `annotation.points_backfill_share`
+    of its slots, spread evenly, come from the backlog while it lasts, and the
+    rest from the ordinary queue. Each item says which it is in `points_only`,
+    and the page switches its steps per cow — labelers never pick a mode. A cow
+    that is in this batch's ordinary half is not also served from the backlog:
+    it gets its points in the ordinary flow, together with this labeler's
+    answer. When either list runs dry the other fills the slots, so an empty
+    backlog means an ordinary queue again with no switch to flip.
+    `mode="points"` serves the backlog alone.
 
 
     Returns `{"items": [...], "matching": int, "policy": {...}, "filters": {...}}`;
@@ -666,60 +676,25 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
     mode = "points" if mode == "points" else "full"
 
     with attached_labels(con, config) as alias:
-        cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
-                                camera=camera, day=day,
-                                cow_threshold=config.instance_attrs.cow_threshold)
-        # `NOT s.false_positive` is unconditional — it is not a preference like
-        # `mine`, and no filter combination may bring back an instance somebody
-        # has judged not to be an animal.
+        def scan(kind: str, limit: int) -> list[dict]:
+            return _queue_scan(con, cfg, alias, kind=kind, limit=limit, excl=excl,
+                               annotator=annotator, dataset=dataset, camera=camera,
+                               day=day, mine=mine, order=order,
+                               cow_threshold=config.instance_attrs.cow_threshold)
+
         if mode == "points":
-            where = ["s.n_labeled > 0", "NOT s.any_points", "NOT s.false_positive"]
+            picked = [(r, True) for r in scan("points", n)]
+            matching = int(picked[0][0]["matching"]) if picked else 0
+            points_matching = matching
         else:
-            where = ["s.n_labeled < s.target", "s.n_skipped < ?", "NOT s.false_positive"]
-            params.append(cfg.skip_retire)
-        if excl:
-            where.append(f"s.instance_key NOT IN ({', '.join('?' * len(excl))})")
-            params += excl
-        if mine == "todo" and mode == "full":
-            where.append("NOT s.mine_done")
-        # `order=fresh` drains the newest day first so a new upload observably
-        # appears at the head of the queue; `order=spread` drops the day term for a
-        # stratified sample across the whole season. The md5 tail is a stable
-        # per-annotator permutation: two annotators walk the same pool in different
-        # orders, so they meet in the middle rather than racing down one list.
-        #
-        # Deliberately NOT ordered by `n_labeled ASC` (M3 UX §6.7): sorting
-        # zero-coverage items ahead of once-labeled ones means no instance gets its
-        # second label until the whole pool has been swept once, so every pair
-        # feeding the kappa queries would come from the fatigued back half of each
-        # session. The WHERE clause already caps coverage at target.
-        #
-        # `NOT s.clear` leads the sort so comfortably-legible crops (and the
-        # promoted minority of smaller ones) come first. It is a stable partition
-        # of the pool, not a per-annotator preference, so it cannot desynchronise
-        # two annotators the way ordering on coverage would.
-        #
-        # `NOT s.worth_asking` follows it, and the order of the two is the whole
-        # policy: legibility first, because a crop nobody can answer teaches
-        # nothing however uncertain the model is about it, and only then the
-        # model's uncertainty. Reversing them would walk straight back into the
-        # problem the size floor was built to fix — the model is least confident
-        # on exactly the tiny crops a human cannot read either.
-        day_term = "s.day DESC NULLS LAST, " if order == "fresh" else ""
-        # `worth_asking` is a statement about the attribute model's uncertainty on
-        # a QUESTION, so it has no meaning where no question is asked; under a
-        # panel is a statement about the cow, and it ranks in both.
-        worth_term = "" if mode == "points" else "(NOT s.worth_asking), "
-        params.append(annotator)
-        params.append(n)
-        rows = _rows(con, f"""{cte}
-            SELECT s.*, count(*) OVER () AS matching
-            FROM scoped s
-            WHERE {' AND '.join(where)}
-            ORDER BY {day_term}(NOT s.clear), (NOT s.under_panel_now),
-                     {worth_term}md5(? || s.instance_key)
-            LIMIT ?
-            """, params)
+            ordinary = scan("full", n)
+            share = float(cfg.points_backfill_share)
+            backlog = scan("points", n) if share > 0 else []
+            in_batch = {r["instance_key"] for r in ordinary}
+            backlog = [r for r in backlog if r["instance_key"] not in in_batch]
+            picked = _mix(ordinary, backlog, share, n)
+            matching = int(ordinary[0]["matching"]) if ordinary else 0
+            points_matching = int(backlog[0]["matching"]) if backlog else 0
 
         # A 'served' row per item, written into labels.duckdb through the alias —
         # a write, but not to the main DB, so the read path the no-leasing decision
@@ -730,19 +705,21 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         # annotation, and SQL_ABANDONED would otherwise count every one of them
         # as an abandoned cow.
         event_ids: list[int | None] = []
-        for r in rows:
+        for r, points_only in picked:
             ev = con.execute(
                 f"INSERT INTO {alias}.label_events (session_id, annotator, kind, "
                 "instance_key, detail) VALUES (?, ?, 'served', ?, ?) RETURNING event_id",
-                [session_id, annotator, r["instance_key"],
-                 "points" if mode == "points" else None],
+                [session_id, annotator, r["instance_key"], "points" if points_only else None],
             ).fetchone()
             event_ids.append(int(ev[0]) if ev else None)
 
-    items = [_item(r, cfg, event_ids[i]) for i, r in enumerate(rows)]
+    items = [_item(r, cfg, event_ids[i], points_only=po) for i, (r, po) in enumerate(picked)]
     return {
         "items": items,
-        "matching": int(rows[0]["matching"]) if rows else 0,
+        "matching": matching,
+        # How many backlog cows matched, beside the ordinary count — the two are
+        # different pools and are not added.
+        "points_matching": points_matching,
         "policy": {
             "targets_per_instance": cfg.targets_per_instance,
             "overlap_fraction": cfg.overlap_fraction,
@@ -750,11 +727,101 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             "skip_retire": cfg.skip_retire,
             "batch_size": cfg.batch_size,
             "max_batch_size": cfg.max_batch_size,
+            "points_backfill_share": cfg.points_backfill_share,
         },
         "filters": {"dataset": dataset, "camera": camera, "day": day,
                     "mine": mine, "order": order, "mode": mode, "limit": n,
                     "excluded": len(excl)},
     }
+
+
+def _mix(ordinary: list[dict], backlog: list[dict], share: float, n: int
+         ) -> list[tuple[dict, bool]]:
+    """Up to `n` items, `round(n * share)` slots of them from the backlog, spread
+    evenly through the batch rather than bunched at one end; `(row, points_only)`.
+
+    Slot s is a backlog slot when `(s+1)*k // n > s*k // n` — integer arithmetic,
+    so 3 of 5 is exactly N B N B B and no float rounding moves a slot. Whichever
+    list runs dry, the other fills its slots: an empty backlog is an ordinary
+    batch, and a drained ordinary queue still serves the backlog."""
+    k = max(0, min(n, round(n * share)))
+    out: list[tuple[dict, bool]] = []
+    i = j = 0
+    for s in range(n):
+        wants_backlog = (s + 1) * k // n > s * k // n
+        if wants_backlog and j < len(backlog):
+            out.append((backlog[j], True))
+            j += 1
+        elif i < len(ordinary):
+            out.append((ordinary[i], False))
+            i += 1
+        elif j < len(backlog):
+            out.append((backlog[j], True))
+            j += 1
+        else:
+            break
+    return out
+
+
+def _queue_scan(con: duckdb.DuckDBPyConnection, cfg: AnnotationCfg, alias: str, *,
+                kind: str, limit: int, excl: Sequence[str], annotator: str,
+                dataset: str | None, camera: str | None, day: str | None,
+                mine: str, order: str, cow_threshold: float) -> list[dict]:
+    """One ordered page of the ordinary queue (`kind="full"`) or of the
+    points-only backlog (`kind="points"`), each row carrying `matching`."""
+    cte, params = _scan_sql(cfg, alias, annotator=annotator, dataset=dataset,
+                            camera=camera, day=day, cow_threshold=cow_threshold)
+    # `NOT s.false_positive` is unconditional — it is not a preference like
+    # `mine`, and no filter combination may bring back an instance somebody
+    # has judged not to be an animal.
+    if kind == "points":
+        where = ["s.n_labeled > 0", "NOT s.any_points", "NOT s.false_positive"]
+    else:
+        where = ["s.n_labeled < s.target", "s.n_skipped < ?", "NOT s.false_positive"]
+        params.append(cfg.skip_retire)
+    if excl:
+        where.append(f"s.instance_key NOT IN ({', '.join('?' * len(excl))})")
+        params += list(excl)
+    if mine == "todo" and kind == "full":
+        where.append("NOT s.mine_done")
+    # `order=fresh` drains the newest day first so a new upload observably
+    # appears at the head of the queue; `order=spread` drops the day term for a
+    # stratified sample across the whole season. The md5 tail is a stable
+    # per-annotator permutation: two annotators walk the same pool in different
+    # orders, so they meet in the middle rather than racing down one list.
+    #
+    # Deliberately NOT ordered by `n_labeled ASC` (M3 UX §6.7): sorting
+    # zero-coverage items ahead of once-labeled ones means no instance gets its
+    # second label until the whole pool has been swept once, so every pair
+    # feeding the kappa queries would come from the fatigued back half of each
+    # session. The WHERE clause already caps coverage at target.
+    #
+    # `NOT s.clear` leads the sort so comfortably-legible crops (and the
+    # promoted minority of smaller ones) come first. It is a stable partition
+    # of the pool, not a per-annotator preference, so it cannot desynchronise
+    # two annotators the way ordering on coverage would.
+    #
+    # `NOT s.worth_asking` follows it, and the order of the two is the whole
+    # policy: legibility first, because a crop nobody can answer teaches
+    # nothing however uncertain the model is about it, and only then the
+    # model's uncertainty. Reversing them would walk straight back into the
+    # problem the size floor was built to fix — the model is least confident
+    # on exactly the tiny crops a human cannot read either.
+    day_term = "s.day DESC NULLS LAST, " if order == "fresh" else ""
+    # `worth_asking` is a statement about the attribute model's uncertainty on
+    # a QUESTION, so it has no meaning where no question is asked; under a
+    # panel is a statement about the cow, and it ranks in both.
+    worth_term = "" if kind == "points" else "(NOT s.worth_asking), "
+    params.append(annotator)
+    params.append(limit)
+    return _rows(con, f"""{cte}
+        SELECT s.*, count(*) OVER () AS matching
+        FROM scoped s
+        WHERE {' AND '.join(where)}
+        ORDER BY {day_term}(NOT s.clear), (NOT s.under_panel_now),
+                 {worth_term}md5(? || s.instance_key)
+        LIMIT ?
+        """, params)
 
 
 def progress(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str = "",
@@ -822,7 +889,8 @@ def _rows(con: duckdb.DuckDBPyConnection, sql: str, params: list) -> list[dict]:
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
+def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None, *,
+          points_only: bool = False) -> dict:
     """One queue item in the frozen §5.3 shape.
 
     Deliberately absent: the frame's clock time. The caption shows day + camera and
@@ -969,6 +1037,10 @@ def _item(row: dict, cfg: AnnotationCfg, serve_event_id: int | None) -> dict:
         # around the display box, which after an outline correction is not the
         # anchor box, and a write the server rejects is retried forever.
         "point_bounds": [float(v) for v in widest_crop_box(bbox, cfg)],
+        # Served from the points-only backlog (M6 §3.7): the page asks the
+        # outline (if needed) and the points, and no question. Per item, because
+        # one batch mixes both kinds.
+        "points_only": bool(points_only),
         # The zoom ladder for the outline editor, with the level it opens on.
         # Sent per item because every level's geometry is a function of THIS
         # animal's box, and computing it here is what keeps crop_geometry out of

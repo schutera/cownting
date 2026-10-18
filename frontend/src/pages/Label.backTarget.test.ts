@@ -147,7 +147,7 @@ describe("forwardTarget", () => {
   });
 });
 
-describe("points-only mode", () => {
+describe("a points-only (backlog) cow", () => {
   // The points are the last step: there is no question to walk on to.
   const PO: Partial<FlowState> = { inPoints: true, pointsOnly: true, stepCount: 0 };
 

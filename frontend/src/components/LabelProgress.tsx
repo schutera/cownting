@@ -89,8 +89,8 @@ export interface LabelStream {
       that predates the step — the line is then left out, not printed as 0. */
   bodyPoints?: number;
   tooSmall?: number;
-  /** Points-only mode: cows that have answers and no body points from anyone.
-      Undefined outside that mode, where the line is left out. */
+  /** The body-points backfill: cows that have answers and no body points from
+      anyone. Undefined once the backlog is empty, and the line goes away. */
   pointsBacklog?: number;
 }
 

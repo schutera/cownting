@@ -120,7 +120,7 @@ shown. `Backspace` removes the last one and the prompt reopens. `→` leaves onl
 while the draft is exactly what is stored (`pointSteps.leavable`); after any
 change, `Enter` saves again. A revisit that changes nothing writes nothing.
 
-### 3.7 Points-only mode
+### 3.7 The body-points backfill
 
 The ordinary queue never serves a cow back to the labeler who answered it, and a
 cow leaves the queue at its answer target. So the cows that already have
@@ -128,29 +128,40 @@ answers — the ones where points are worth most, because they pair with the
 behaviour answers — would almost never get points. On production on 2026-10-18
 that was 3,248 cows.
 
-`/label?mode=points` (the "Points only" link in the page header) serves them:
+The ordinary queue MIXES them in by itself while they last (owner's decision,
+2026-10-18: 3 cows in 5, and no manual mode switch):
 
-- **Who is served:** every cow with at least one current answer from anyone, no
+- **The backlog:** every cow with at least one current answer from anyone, no
   current `point_edits` row from anyone, and no false-positive verdict. One
   labeler's points (or *too small*) take it out — one set per cow is enough
   (owner's decision, 2026-10-18). It is not annotator-scoped.
-- **Steps:** the outline (only if this labeler has not judged it) and the points.
-  No questions. `Enter` on the points saves them and the next cow comes.
+- **The mix:** `annotation.points_backfill_share` (0.6) of each batch's slots
+  come from the backlog, spread evenly — `round(n*share)` slots, slot s taken
+  when `(s+1)*k // n > s*k // n`, so 3 of 5 is N B N B B. Whichever list runs
+  dry, the other fills the slots: an empty backlog is an ordinary batch again,
+  with nothing to switch off. A cow in the batch's ordinary half is not also
+  served from the backlog — it gets its points in the ordinary flow, with this
+  labeler's answer. 0 turns the mix off.
+- **Per cow:** each item carries `points_only`, and the page switches its steps
+  with it. A backlog cow is asked the outline (only if this labeler has not
+  judged it) and the points — `[1/2]`, `[2/2]` — no questions, no Classify step.
+  `Enter` on the points saves them and the next cow comes.
+- `GET /api/label/queue?mode=points` serves the backlog alone; the page does not
+  use it.
 - **Order:** day term, legible first, under a panel first, then the per-labeler
   md5 permutation. No `worth_asking`: that is about the attribute model's
   uncertainty on a question, and no question is asked.
-- **No flags.** A flag is stored as an `annotations` row with outcome
-  `skipped`, and it supersedes the labeler's own current answer on the cow. In a
-  pass over cows they already answered, one `F` would destroy their answer. The
-  ways out are `X` on the outline (no cow), `S` (too small), and `→` for a crop
-  that cannot be shown (nothing is written; the cow stays in the backlog).
-- **Telemetry:** its `served` events carry `detail = 'points'`, and
-  `SQL_ABANDONED` leaves them out — a points-only serve never gets an answer.
+- **No flags on a backlog cow.** A flag is stored as an `annotations` row with
+  outcome `skipped`, and it supersedes the labeler's own current answer on the
+  cow. Backlog cows are often ones the labeler already answered, so one `F`
+  would destroy that answer. The ways out are `X` on the outline (no cow), `S`
+  (too small), and `→` for a crop that cannot be shown (nothing is written; the
+  cow stays in the backlog). `F` works as before on an ordinary cow.
+- **Telemetry:** a backlog cow's `served` event carries `detail = 'points'`, and
+  `SQL_ABANDONED` leaves those out — a points-only serve never gets an answer.
 - **Progress:** `/api/label/progress` returns `points_backlog`, by the same rule
-  the queue serves, and the side panel shows "N cows still need body points" in
-  this mode.
-- The mode is a URL parameter, not a stored preference, and switching it
-  remounts the page, so no tape or draft crosses from one mode to the other.
+  the queue serves, and the side panel shows "N cows still need body points"
+  while it is above zero.
 
 ### 3.6 Copy
 

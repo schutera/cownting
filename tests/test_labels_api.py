@@ -77,7 +77,7 @@ _ITEM_FIELDS = (
     "crop_levels", "crop_level",
     # M6: this annotator's body points, whether the step is passed, and where
     # the points route accepts a point.
-    "points", "points_done", "point_bounds",
+    "points", "points_done", "point_bounds", "points_only",
 )
 
 
@@ -296,8 +296,13 @@ def test_queue_policy():
         r = _submit(client, mine, rev)
         check("submit -> 200", r.status_code == 200, str(r.status_code))
         after = client.get("/api/label/queue").json()["items"]
-        check("a labeled instance never comes back to the same annotator",
-              all(it["instance_key"] != mine["instance_key"] for it in after))
+        # It may come back ONCE as a points-only cow (M6 §3.7): it has an
+        # answer and no body points, so it is in the backfill. What must hold is
+        # that its questions are never asked of the same annotator again.
+        check("a labeled instance never comes back to the same annotator for its questions",
+              all(it["instance_key"] != mine["instance_key"] or it["points_only"]
+                  for it in after))
+        after = [it for it in after if not it["points_only"]]
 
         # Flagging removes it from MY queue but leaves it for others (mine=all
         # shows the pool another annotator would still be offered).
@@ -1050,6 +1055,78 @@ def test_points_roundtrip_and_validation():
         check("a lost race -> 409", r409.status_code == 409, str(r409.status_code))
 
 
+def test_the_default_queue_mixes_in_the_backlog():
+    """M6 §3.7: while the points-only backlog lasts, `points_backfill_share` of
+    each batch comes from it, spread evenly, each item flagged `points_only`;
+    when either list runs dry the other fills the batch, so an empty backlog is
+    an ordinary queue again with no switch to flip."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        check("the shipped share is 3 in 5", config.annotation.points_backfill_share == 0.6)
+        rev = _rev(client)
+        pool = client.get("/api/label/queue?mine=all&limit=200").json()["items"]
+        answered = pool[:3]
+        for it in answered:
+            check("seed answer -> 200", _submit(client, it, rev).status_code == 200)
+        answered_keys = {i["instance_key"] for i in answered}
+
+        batch = client.get("/api/label/queue?limit=5").json()
+        flags = [i["points_only"] for i in batch["items"]]
+        check("3 of 5 slots are backlog cows, spread N B N B B",
+              flags == [False, True, False, True, True], str(flags))
+        check("the backlog slots are exactly my answered cows",
+              {i["instance_key"] for i in batch["items"] if i["points_only"]} == answered_keys)
+        check("the ordinary slots are cows I have not answered",
+              not answered_keys & {i["instance_key"] for i in batch["items"] if not i["points_only"]})
+        check("the backlog's size is reported beside the ordinary count",
+              batch["points_matching"] == 3 and batch["matching"] == 3,
+              f'{batch["points_matching"]} / {batch["matching"]}')
+
+        lc = duckdb.connect(config.paths.labels_db_path)
+        try:
+            detail = {r[0]: r[1] for r in lc.execute(
+                "SELECT instance_key, detail FROM label_events WHERE kind = 'served' "
+                "ORDER BY event_id DESC LIMIT 5").fetchall()}
+        finally:
+            lc.close()
+        check("only the backlog serves are marked 'points'",
+              all((detail.get(i["instance_key"]) == "points") == i["points_only"]
+                  for i in batch["items"]), str(detail))
+
+        # Another labeler: my answered cows are in HIS ordinary pool too (below
+        # target, not his). A cow is never served twice in one batch.
+        mc = db.connect(config.paths.db_path)
+        try:
+            bob = labeling.queue(mc, config, annotator="bob", limit=6)["items"]
+        finally:
+            mc.close()
+        keys = [i["instance_key"] for i in bob]
+        check("no cow is served twice in one batch", len(keys) == len(set(keys)), str(keys))
+
+        # Backlog drained: the batch is ordinary again, by itself.
+        for it in answered:
+            check("points -> 200", _post_points(client, it, points=_points_for(it)).status_code == 200)
+        drained = client.get("/api/label/queue?limit=5").json()["items"]
+        check("with the backlog empty the batch is all ordinary cows",
+              len(drained) == 3 and not any(i["points_only"] for i in drained),
+              str([(i["instance_key"][:6], i["points_only"]) for i in drained]))
+
+        # Share 0 turns the mix off entirely.
+        config.annotation.points_backfill_share = 0.0
+        lc = db.connect(config.paths.labels_db_path)
+        try:
+            labels_db.submit_annotation(lc, instance_key=drained[0]["instance_key"],
+                                        annotator="alice", outcome="labeled",
+                                        choices=[{"class_key": "sun_exposure.shaded",
+                                                  "group_key": "sun_exposure",
+                                                  "class_name": "Shaded"}])
+        finally:
+            lc.close()
+        off = client.get("/api/label/queue?limit=5").json()["items"]
+        check("share 0 serves no backlog cow", not any(i["points_only"] for i in off),
+              str([(i["instance_key"][:6], i["points_only"]) for i in off]))
+
+
 def test_points_only_backlog():
     """M6 §3.7: `mode=points` serves the cows that already have an answer from
     anyone but body points from nobody — the cows the ordinary queue never serves
@@ -1076,9 +1153,11 @@ def test_points_only_backlog():
               backlog() == sorted([a["instance_key"], b["instance_key"], c["instance_key"]]),
               str(backlog()))
         check("progress counts the same backlog", count() == 3, str(count()))
-        check("the ordinary queue still hides my answered cows",
-              not {a["instance_key"], b["instance_key"], c["instance_key"]}
-              & {i["instance_key"] for i in client.get("/api/label/queue?limit=200").json()["items"]})
+        mixed = client.get("/api/label/queue?limit=200").json()["items"]
+        check("the default queue never asks my answered cows' questions again",
+              all(i["points_only"] for i in mixed
+                  if i["instance_key"] in {a["instance_key"], b["instance_key"], c["instance_key"]}),
+              str([(i["instance_key"][:6], i["points_only"]) for i in mixed]))
 
         # Another labeler sees the same backlog: it is not annotator-scoped.
         mc = db.connect(config.paths.db_path)
@@ -1604,6 +1683,7 @@ def main():
     test_undo_is_scoped_to_me()
     test_mask_fix_roundtrip_and_validation()
     test_points_roundtrip_and_validation()
+    test_the_default_queue_mixes_in_the_backlog()
     test_points_only_backlog()
     test_false_positive_retires_the_instance_for_everyone()
     test_spread_draws_from_every_day_and_camera()

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { canManageData, useAuth } from "../lib/auth";
 import type {
   BodyPoint,
@@ -252,8 +252,8 @@ export interface FlowState {
   /** On the points step, the draft may be left without a write: it is exactly
       the stored points, or an untouched stored 'too small'. */
   pointsReady: boolean;
-  /** Points-only mode: the points are the LAST step, so leaving them is
-      leaving the item. */
+  /** A backlog cow (points only): the points are the LAST step, so leaving
+      them is leaving the item. */
   pointsOnly: boolean;
   outlineOpen: boolean;
   complete: boolean;      // every REQUIRED question answered
@@ -292,7 +292,7 @@ export function forwardTarget(
     // outline step's reason — looking is not judging. So the arrow leaves only
     // a revisit whose draft is still exactly what is stored.
     if (!(s.pointsReady && s.pointsDone)) return "blocked";
-    // In points-only mode there is no question after it: a saved item at the
+    // On a backlog cow there is no question after it: a saved item at the
     // head has already moved on, so this is a revisit, and forward is the head.
     if (s.pointsOnly) return s.cursor < s.frontier ? "frontier" : "blocked";
     return "question";
@@ -335,18 +335,7 @@ function newSessionId(): string {
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** The route. `?mode=points` is the POINTS-ONLY mode (M6 §3.7): the backlog of
-    cows that already have answers but no body points, asked for the outline and
-    the points only. A URL parameter rather than a stored preference — this page
-    keeps none — and the screen is REMOUNTED on a switch (the key), so no tape,
-    draft or answer of one mode can leak into the other. */
 export default function Label() {
-  const [params] = useSearchParams();
-  const pointsOnly = params.get("mode") === "points";
-  return <LabelScreen key={pointsOnly ? "points" : "full"} pointsOnly={pointsOnly} />;
-}
-
-function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
   const { user } = useAuth();
   const canManage = canManageData(user);
 
@@ -506,6 +495,12 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
   const currentKey = current?.instance_key ?? null;
   const reviewing = current !== null && tape.cursor < tape.frontier;
   const cropFailed = currentKey !== null && failedKey === currentKey;
+  // A cow from the points-only BACKLOG (M6 §3.7): it already has answers, so
+  // it is asked the outline (if needed) and the points, and no question. Per
+  // cow, from the server: the queue mixes these into the ordinary batch while
+  // the backlog lasts, and the screen switches its steps with each cow, so a
+  // labeler never picks a mode.
+  const pointsOnly = current?.points_only === true;
   const flaggedReason = currentKey === null ? undefined : flaggedByKey[currentKey];
 
   const EMPTY_ANSWERS: Record<string, string> = useMemo(() => ({}), []);
@@ -631,7 +626,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
       : (pointsByKey[currentKey] ??
         (current.points_done ? (current.points ?? "too_small") : null));
   const pointsDone = !hasPoints || savedPoints !== null;
-  // In points-only mode there is nothing after this step, so whenever the
+  // On a backlog cow there is nothing after this step, so whenever the
   // outline is not on screen the points are.
   const inPoints =
     current !== null &&
@@ -726,7 +721,6 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
       const q = await getLabelQueue({
         exclude: [...have, ...recentWrittenRef.current],
         order: "spread",
-        ...(pointsOnly ? { mode: "points" as const } : {}),
       });
       const known = new Set([...have, ...recentWrittenRef.current]);
       const fresh = q.items.filter((i) => !known.has(i.instance_key));
@@ -745,7 +739,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
       fetchingRef.current = false;
       setFetching(false);
     }
-  }, [pointsOnly, setTape]);
+  }, [setTape]);
 
   // Boot: taxonomy, stats, session bracket. StrictMode double-mounts this; the
   // extra start/end pair is harmless fire-and-forget telemetry and the GETs are
@@ -1332,7 +1326,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
   );
 
   /** Leave the points step on the same animal: on to the questions — or, in
-      points-only mode, where the points are the last step, on to the next cow
+      on a backlog cow, where the points are the last step, on to the next cow
       (from a revisit, back to the head of the tape). */
   const leavePoints = useCallback(() => {
     setRevisitPoints(false);
@@ -1373,7 +1367,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
       queue.enqueue({ kind: "points", req });
       // NOT markWritten() in the full flow: points are not an answer, and
       // excluding the key from refetches would hide a cow whose questions are
-      // still open. In points-only mode the points ARE the item, so it is.
+      // still open. On a backlog cow the points ARE the item, so it is.
       if (pointsOnly) markWritten(current.instance_key);
       setPointsByKey((prev) => ({ ...prev, [currentKey]: pts ?? "too_small" }));
       setPointDraft(pts ?? []);
@@ -1543,7 +1537,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
   }, [enterPoints, flow, goTo, shake, showHint, step]);
 
   const goNext = useCallback(() => {
-    // Points-only mode has no flag (see the keyboard handler), so a cow whose
+    // A backlog cow has no flag (see the keyboard handler), so one whose
     // crop cannot be shown is skipped with the arrow. Nothing is written: it
     // stays in the backlog for a labeler whose copy of the frame loads. A cow
     // removed as not-a-cow has no points step either, and → leaves it the same
@@ -1668,7 +1662,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
     });
   }, [activeNow, currentKey, sessionId]);
 
-  // POINTS-ONLY: arriving on a cow by the tape (← to an earlier one) shows what
+  // BACKLOG COWS: arriving on one by the tape (← to an earlier one) shows what
   // was saved for it, not an empty draft — there the points step is the only
   // step, so nothing else would seed it the way enterPoints does in the full
   // flow. Declared after the reset effect above so it runs after it on the same
@@ -1759,7 +1753,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
       return;
     }
 
-    // NO FLAGS IN POINTS-ONLY MODE (M6 §3.7). A flag is stored as an answer
+    // NO FLAGS ON A BACKLOG COW (M6 §3.7). A flag is stored as an answer
     // row with outcome 'skipped', and it SUPERSEDES this labeler's own current
     // answer on the cow — in a pass over cows they already answered, one F
     // would destroy that answer. X on the outline step (no cow) and S (too
@@ -1767,7 +1761,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
     if (pointsOnly && plain && (e.key === "f" || e.key === "F")) {
       e.preventDefault();
       shake();
-      showHint("no flags in points-only mode — S if the cow is too small, X on the outline if there is no cow");
+      showHint("no flags on a points-only cow — S if it is too small, X on the outline if there is no cow");
       return;
     }
 
@@ -2057,7 +2051,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
             outlineDisabled={!outlineAvailable}
             hasPoints={hasPoints}
             pointsDisabled={!hasPoints || !geomDone || cropFailed}
-            // Points-only mode asks no question, so it has no Classify step.
+            // A backlog cow is asked no question, so it has no Classify step.
             showClassify={!pointsOnly}
             onClassify={() => {
               closeOutline();
@@ -2284,7 +2278,7 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
               onAccept={() => acceptPoints("mouse")}
             />
           ) : pointsOnly ? (
-            // Points-only mode asks no question. The only way here is a crop
+            // A backlog cow is asked no question. The only way here is a crop
             // that could not be shown (the alert above says → skips it); the
             // empty panel keeps PANEL_H so nothing on the card moves.
             <div style={{ height: PANEL_H }} aria-hidden="true" />
@@ -2363,9 +2357,8 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
     main = (
       <TerminalCard title="You're caught up">
         <p className="text-[13px] max-w-md mx-auto" style={{ color: INK_DIM }}>
-          {pointsOnly
-            ? "Every cow that has answers also has its body points now. New answers add new cows here by themselves."
-            : "Every instance that still needs your judgement has it. New footage joins the queue by itself, and instances other annotators haven't finished stay available to them."}
+          Every instance that still needs your judgement has it. New footage joins the queue by
+          itself, and instances other annotators haven't finished stay available to them.
         </p>
         <DarkButton
           className="mt-5"
@@ -2399,28 +2392,12 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
         <span className="font-mono text-[11px] truncate" style={{ color: INK_DIM }}>
           {current === null ? "label" : captionFor(current)}
         </span>
-        {/* The mode switch (M6 §3.7). Links, not state: the mode is the URL,
-            and following one remounts the screen with a fresh tape. Inside the
-            28px strip, so it costs the crop nothing. */}
-        <div
-          className="ml-auto shrink-0 flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.14em]"
-          role="group"
-          aria-label="label mode"
-        >
-          <ModeLink to="/label" active={!pointsOnly}>
-            All steps
-          </ModeLink>
-          <span style={{ color: INK_DIM }}>·</span>
-          <ModeLink to="/label?mode=points" active={pointsOnly}>
-            Points only
-          </ModeLink>
-        </div>
         {/* Hidden, not disabled, for plain users — the same rule as every other
             poweruser affordance (§5.1). */}
         {canManage ? (
           <Link
             to="/label/classes"
-            className="shrink-0 font-mono text-[11px] uppercase tracking-[0.14em] hover:opacity-100 opacity-70"
+            className="ml-auto shrink-0 font-mono text-[11px] uppercase tracking-[0.14em] hover:opacity-100 opacity-70"
             style={{ color: INK_DIM }}
           >
             Manage classes →
@@ -2475,9 +2452,12 @@ function LabelScreen({ pointsOnly }: { pointsOnly: boolean }) {
               pendingNotes: 0,
               bodyPoints: stats?.my_points,
               tooSmall: stats?.my_too_small,
-              // Only where it is the work in hand: the full flow's labeler is
-              // not working this backlog, and a second big number there is noise.
-              pointsBacklog: pointsOnly ? stats?.points_backlog : undefined,
+              // While the backfill lasts, how much of it is left; the line goes
+              // away by itself once the backlog is empty.
+              pointsBacklog:
+                stats?.points_backlog !== undefined && stats.points_backlog > 0
+                  ? stats.points_backlog
+                  : undefined,
             }}
           />
         </div>
@@ -2850,7 +2830,7 @@ function ModeToggle({
       two-step one it was, numbered to match. */
   hasPoints: boolean;
   pointsDisabled: boolean;
-  /** False in points-only mode, which has no questions. */
+  /** False on a backlog cow, which is asked no question. */
   showClassify: boolean;
   onClassify: () => void;
   onOutline: () => void;
@@ -2898,23 +2878,6 @@ function ModeToggle({
       </ModeButton>
       ) : null}
     </div>
-  );
-}
-
-/** One side of the header's mode switch. The active one is plain text, not a
-    link: following it would only remount the screen and drop the tape. */
-function ModeLink({ to, active, children }: { to: string; active: boolean; children: ReactNode }) {
-  if (active) {
-    return (
-      <span aria-current="page" style={{ color: INK }}>
-        {children}
-      </span>
-    );
-  }
-  return (
-    <Link to={to} className="opacity-70 hover:opacity-100" style={{ color: INK_DIM }}>
-      {children}
-    </Link>
   );
 }
 

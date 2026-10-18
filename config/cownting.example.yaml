@@ -103,6 +103,10 @@ annotation:
                                    # model abstains both on genuinely ambiguous
                                    # postures and on unreadable smudges; only size
                                    # separates them before serving.
+  # The body-points backfill: this share of every batch comes from the cows that
+  # already have answers but no body points yet, asked for the points only. It
+  # stops by itself when that backlog is empty. 0 turns it off.
+  points_backfill_share: 0.6       # 3 cows in 5
   max_batch_size: 50               # ceiling on a client-requested batch size
   # Context around the cow, as a fraction of the LONGER bbox side. Sun exposure and
   # lying/standing are read off the surroundings, not off the animal, so a tight

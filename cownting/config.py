@@ -256,6 +256,18 @@ class AnnotationCfg(BaseModel):
     # Defaults to clear_instance_px when None.
     abstain_min_px: int | None = None
 
+    # THE BODY-POINTS BACKFILL (docs/roadmap/M6_body_points.md §3.7). The share
+    # of every served batch taken from the points-only backlog — cows that
+    # already have answers but no body points from anyone — while it lasts.
+    # Those cows are asked the outline (if needed) and the points only; the page
+    # switches its steps per cow, so labelers never choose a mode. The ordinary
+    # queue never serves a cow back to the labeler who answered it, so without
+    # this the answered cows, where points pair with behaviour answers, would
+    # almost never get any. When the backlog is empty the batch is all ordinary
+    # cows again by itself. 0 turns the mix off. 0.6 = 3 cows in 5 (owner's
+    # decision, 2026-10-18).
+    points_backfill_share: float = Field(default=0.6, ge=0.0, le=1.0)
+
 
 class BackupCfg(BaseModel):
     """Weekly zip of the label store, posted to a Discord webhook.

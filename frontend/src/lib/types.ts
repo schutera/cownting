@@ -330,6 +330,10 @@ export interface LabelItem {
   points?: BodyPoint[] | null;
   points_done?: boolean;
   point_bounds?: [number, number, number, number];
+  // Served from the points-only backlog (M6 §3.7): this cow already has
+  // answers, so it is asked the outline (if needed) and the points, no
+  // question. Per item, because the queue mixes both kinds into one batch.
+  points_only?: boolean;
 }
 
 /** One rung of the outline editor's zoom ladder. `src` is the square this crop
