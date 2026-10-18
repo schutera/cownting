@@ -1158,6 +1158,34 @@ def test_spread_draws_from_every_day_and_camera():
               spread_days != sorted(spread_days, reverse=True), str(spread_days))
 
 
+def test_every_zoom_level_renders_the_square_it_describes():
+    """REGRESSION. The editors draw each zoom rung's image under that rung's
+    `src` as the SVG viewBox, so the image MUST be the square `src` names. The
+    crop route clamped `pad` to 2.0 while the widest rung asked for 2.5: it was
+    served the pad-2.0 square under a pad-2.5 viewBox, and every outline node
+    and body point placed at that zoom was stored ~20% too far from the centre.
+    An image whose size is not the rung's `out` is that mismatch."""
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        _noise_frame(config.paths.artifacts_dir, "2026-07-03", "00000001.jpg", w=640, h=480)
+        items = client.get("/api/label/queue?mine=all&limit=200").json()["items"]
+        item = next(i for i in items if i["dataset_id"] == "2026-07-03"
+                    and i["frame_file"] == "00000001.jpg")
+        pads = [lv["pad"] for lv in item["crop_levels"]]
+        check("the ladder reaches the widest pad", max(pads) == max(labeling.ZOOM_PADS),
+              str(pads))
+        for lv in item["crop_levels"]:
+            r = client.get(lv["url"])
+            check(f"pad={lv['pad']} renders", r.status_code == 200, str(r.status_code))
+            if r.status_code != 200:
+                continue
+            size = Image.open(BytesIO(r.content)).size
+            check(f"pad={lv['pad']} is the {lv['out']}px square its src describes",
+                  size == (lv["out"], lv["out"]), f"{size} vs {lv['out']}")
+
+
 def test_zoom_ladder_and_frame_space_submit():
     """The outline editor edits in FULL-FRAME px and zooms by swapping which crop
     is on screen. Two things have to hold for that to be safe: every rung of the
@@ -1505,6 +1533,7 @@ def main():
     test_points_roundtrip_and_validation()
     test_false_positive_retires_the_instance_for_everyone()
     test_spread_draws_from_every_day_and_camera()
+    test_every_zoom_level_renders_the_square_it_describes()
     test_zoom_ladder_and_frame_space_submit()
     test_ok_verdict_is_a_measurement_not_a_noop()
     test_ok_never_destroys_my_own_correction()

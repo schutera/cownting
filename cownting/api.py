@@ -1945,7 +1945,15 @@ def create_app(config: Config) -> FastAPI:
         if not all(math.isfinite(v) for v in bbox):
             raise HTTPException(400, "bbox coordinates must be finite")
         cfg = config.annotation
-        pad_v = cfg.crop_pad if pad is None else min(max(float(pad), 0.0), 2.0)
+        # The ceiling is the WIDEST rung the editors can ask for, not a round
+        # number. It was 2.0 while ZOOM_PADS reached 2.5, so the widest rung was
+        # served the pad-2.0 square while the editor's viewBox (that rung's
+        # `src`) was the pad-2.5 one — the photo stretched under the coordinate
+        # frame, and every outline node or body point placed at that zoom was
+        # stored ~20% too far from the crop centre. Same value widest_crop_box
+        # bounds the write routes with, so view and bound cannot drift.
+        pad_cap = max(labeling.ZOOM_PADS + (cfg.crop_pad,))
+        pad_v = cfg.crop_pad if pad is None else min(max(float(pad), 0.0), pad_cap)
         w_v = cfg.crop_max_width if w is None else max(16, min(int(w), 4096))
         src, out, _ring = labeling.crop_geometry(bbox, pad_v, w_v)
         if src[2] - src[0] > 8192:
