@@ -1790,6 +1790,13 @@ def create_app(config: Config) -> FastAPI:
             # already draws `my_labeled` — a second endpoint would double the
             # Label page's poll for one extra GROUP BY.
             dist = labels_db.class_distribution(lc)
+            # This annotator's body points (M6 §7), current rows only: cows with
+            # points placed, and cows marked too small. Not part of the effort
+            # SQL, which is over `annotations` — a point row is not an answer.
+            pts = lc.execute(
+                "SELECT count(*) FILTER (WHERE kind = 'points'), "
+                "       count(*) FILTER (WHERE kind = 'too_small') "
+                "FROM v_current_point_edits WHERE annotator = ?", [annotator]).fetchone()
         finally:
             lc.close()
         me = next((r for r in effort if r["annotator"] == annotator), {})
@@ -1802,6 +1809,8 @@ def create_app(config: Config) -> FastAPI:
             "my_labeled": int(me.get("labeled") or 0),
             "my_skipped": int(me.get("skipped") or 0),
             "my_median_ms": int(me["median_ms"]) if me.get("median_ms") is not None else None,
+            "my_points": int(pts[0] or 0) if pts else 0,
+            "my_too_small": int(pts[1] or 0) if pts else 0,
             "annotators": len(effort),
             "auth_disabled": not auth_on,
             "filters": {"dataset": dataset, "camera": camera},

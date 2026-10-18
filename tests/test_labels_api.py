@@ -940,7 +940,10 @@ def test_points_roundtrip_and_validation():
         check("a fresh item has no points and the step is not passed",
               item["points"] is None and item["points_done"] is False,
               f"{item['points']} / {item['points_done']}")
-        remaining = int(client.get("/api/label/progress").json()["remaining"])
+        prog0 = client.get("/api/label/progress").json()
+        remaining = int(prog0["remaining"])
+        check("progress starts with no body points",
+              prog0.get("my_points") == 0 and prog0.get("my_too_small") == 0, str(prog0))
 
         pts = _points_for(item)
         r = _post_points(client, item, points=pts)
@@ -962,8 +965,10 @@ def test_points_roundtrip_and_validation():
         todo = {i["instance_key"] for i in
                 client.get("/api/label/queue?limit=200").json()["items"]}
         check("the cow is still in my todo queue", item["instance_key"] in todo)
-        check("remaining is unchanged",
-              int(client.get("/api/label/progress").json()["remaining"]) == remaining)
+        prog1 = client.get("/api/label/progress").json()
+        check("remaining is unchanged", int(prog1["remaining"]) == remaining)
+        check("progress counts one cow with body points", prog1.get("my_points") == 1,
+              str(prog1.get("my_points")))
         check("the queue order is unchanged by a point row",
               [i["instance_key"] for i in before] == list(again.keys()),
               "order moved")
@@ -990,6 +995,10 @@ def test_points_roundtrip_and_validation():
                 if i["instance_key"] == item["instance_key"]][0]
         check("...and the item carries no points but a passed step",
               got2["points"] is None and got2["points_done"] is True, str(got2["points"]))
+        prog2 = client.get("/api/label/progress").json()
+        check("progress counts the CURRENT verdict: too small, no longer points",
+              prog2.get("my_points") == 0 and prog2.get("my_too_small") == 1,
+              f"{prog2.get('my_points')} / {prog2.get('my_too_small')}")
 
         # Validation. Each would otherwise store something no consumer can index.
         check("a forged anchor is a 400",
