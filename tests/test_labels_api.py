@@ -1132,6 +1132,45 @@ def test_the_default_queue_mixes_in_the_backlog():
               str([(i["instance_key"][:6], i["points_only"]) for i in drained]))
 
 
+def test_the_mix_keeps_its_share_when_the_lists_overlap():
+    """REGRESSION, found on production data. Both lists rank the same cows
+    first — legible, under a panel — so for a labeler who did not answer them,
+    the backlog's head IS the ordinary batch. Those cows are rightly served as
+    ordinary (points and a second answer in one go), but the backlog was read
+    only n deep, so after the dedupe it could not fill its slots and the batch
+    came up short of its share."""
+    with tempfile.TemporaryDirectory() as d:
+        client, config = _mk_app(d)
+        rev = _rev(client)
+        pool = client.get("/api/label/queue?mine=all&limit=200").json()["items"]
+        under, rest = pool[:2], pool[2:4]
+        mc = db.connect(config.paths.db_path)
+        try:
+            for it in under:
+                mc.execute("UPDATE detections SET under_panel = TRUE WHERE dataset_id = ? "
+                           "AND bbox_x1 = ? AND bbox_y1 = ?",
+                           [it["dataset_id"], it["bbox"][0], it["bbox"][1]])
+        finally:
+            mc.close()
+        for it in under + rest:  # local answers four cows: all four are backlog
+            check("seed answer -> 200", _submit(client, it, rev).status_code == 200)
+
+        mc = db.connect(config.paths.db_path)
+        try:
+            # bob answered nothing: the two under-panel cows head BOTH his
+            # ordinary batch and the backlog.
+            batch = labeling.queue(mc, config, annotator="bob", limit=2, mix=True)["items"]
+        finally:
+            mc.close()
+        got = [(i["instance_key"], i["points_only"]) for i in batch]
+        under_keys = {i["instance_key"] for i in under}
+        check("the ordinary slot is an under-panel cow, served as ordinary",
+              got[0][0] in under_keys and got[0][1] is False, str(got))
+        check("...and the backlog slot is still filled, by a cow not in the batch",
+              len(got) == 2 and got[1][1] is True and got[1][0] not in under_keys,
+              str(got))
+
+
 def test_points_only_backlog():
     """M6 §3.7: `mode=points` serves the cows that already have an answer from
     anyone but body points from nobody — the cows the ordinary queue never serves
@@ -1700,6 +1739,7 @@ def main():
     test_mask_fix_roundtrip_and_validation()
     test_points_roundtrip_and_validation()
     test_the_default_queue_mixes_in_the_backlog()
+    test_the_mix_keeps_its_share_when_the_lists_overlap()
     test_points_only_backlog()
     test_false_positive_retires_the_instance_for_everyone()
     test_spread_draws_from_every_day_and_camera()

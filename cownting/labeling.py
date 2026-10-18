@@ -697,7 +697,12 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
         else:
             ordinary = scan("full", n)
             share = float(cfg.points_backfill_share) if mix else 0.0
-            backlog = scan("points", n) if share > 0 else []
+            # 2n, not n: the dedupe below can drop up to one backlog row per
+            # ordinary row, and both lists rank the same cows first (legible,
+            # under a panel), so the backlog's head is often exactly the
+            # ordinary batch's. With only n spares the batch then came up short
+            # of its share — N B N B N on production data instead of N B N B B.
+            backlog = scan("points", 2 * n) if share > 0 else []
             in_batch = {r["instance_key"] for r in ordinary}
             backlog = [r for r in backlog if r["instance_key"] not in in_batch]
             picked = _mix(ordinary, backlog, share, n)
