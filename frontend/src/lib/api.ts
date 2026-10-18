@@ -583,8 +583,12 @@ export interface LabelQueueOpts {
   mine?: LabelQueueMine;
   order?: LabelQueueOrder;
   // 'points' = the points-only backlog alone (M6 §3.7). The Label page does
-  // not send it: the default queue mixes the backlog in by itself.
+  // not send it.
   mode?: LabelQueueMode;
+  // Ask the server to MIX backlog cows into the batch (M6 §3.7). Only a page
+  // that honours `points_only` may send it: an older page would ask a backlog
+  // cow its questions and supersede the labeler's own answer.
+  mix?: boolean;
 }
 
 // A batch of instances to label. There is no offset and no cursor: `exclude`
@@ -602,6 +606,7 @@ export function getLabelQueue(opts?: LabelQueueOpts): Promise<LabelQueue> {
   if (opts?.mine) q.set("mine", opts.mine);
   if (opts?.order) q.set("order", opts.order);
   if (opts?.mode) q.set("mode", opts.mode);
+  if (opts?.mix) q.set("mix", "1");
   const exclude = (opts?.exclude ?? []).slice(0, 200);
   if (exclude.length) q.set("exclude", exclude.join(","));
   const qs = q.toString();

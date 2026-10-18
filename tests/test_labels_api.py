@@ -296,13 +296,11 @@ def test_queue_policy():
         r = _submit(client, mine, rev)
         check("submit -> 200", r.status_code == 200, str(r.status_code))
         after = client.get("/api/label/queue").json()["items"]
-        # It may come back ONCE as a points-only cow (M6 §3.7): it has an
-        # answer and no body points, so it is in the backfill. What must hold is
-        # that its questions are never asked of the same annotator again.
-        check("a labeled instance never comes back to the same annotator for its questions",
-              all(it["instance_key"] != mine["instance_key"] or it["points_only"]
-                  for it in after))
-        after = [it for it in after if not it["points_only"]]
+        # Without `mix` (M6 §3.7) the queue is the ordinary one: an answered cow
+        # never comes back. With it, it may come back for its points only —
+        # test_the_default_queue_mixes_in_the_backlog covers that half.
+        check("a labeled instance never comes back to the same annotator",
+              all(it["instance_key"] != mine["instance_key"] for it in after))
 
         # Flagging removes it from MY queue but leaves it for others (mine=all
         # shows the pool another annotator would still be offered).
@@ -1059,7 +1057,10 @@ def test_the_default_queue_mixes_in_the_backlog():
     """M6 §3.7: while the points-only backlog lasts, `points_backfill_share` of
     each batch comes from it, spread evenly, each item flagged `points_only`;
     when either list runs dry the other fills the batch, so an empty backlog is
-    an ordinary queue again with no switch to flip."""
+    an ordinary queue again with no switch to flip. The mix is OPT-IN: a page
+    that does not ask for it — an old tab across a deploy — gets the ordinary
+    batch, because it would ask a backlog cow its questions and supersede the
+    labeler's own answer."""
     with tempfile.TemporaryDirectory() as d:
         client, config = _mk_app(d)
         check("the shipped share is 3 in 5", config.annotation.points_backfill_share == 0.6)
@@ -1070,7 +1071,15 @@ def test_the_default_queue_mixes_in_the_backlog():
             check("seed answer -> 200", _submit(client, it, rev).status_code == 200)
         answered_keys = {i["instance_key"] for i in answered}
 
-        batch = client.get("/api/label/queue?limit=5").json()
+        old = client.get("/api/label/queue?limit=5").json()
+        check("a page that does not ask for the mix gets no backlog cow",
+              not any(i["points_only"] for i in old["items"])
+              and not answered_keys & {i["instance_key"] for i in old["items"]},
+              str([(i["instance_key"][:6], i["points_only"]) for i in old["items"]]))
+        check("...and the response says the mix was off", old["filters"]["mix"] is False)
+
+        batch = client.get("/api/label/queue?limit=5&mix=1").json()
+        check("the mix is echoed", batch["filters"]["mix"] is True)
         flags = [i["points_only"] for i in batch["items"]]
         check("3 of 5 slots are backlog cows, spread N B N B B",
               flags == [False, True, False, True, True], str(flags))
@@ -1097,34 +1106,30 @@ def test_the_default_queue_mixes_in_the_backlog():
         # target, not his). A cow is never served twice in one batch.
         mc = db.connect(config.paths.db_path)
         try:
-            bob = labeling.queue(mc, config, annotator="bob", limit=6)["items"]
+            bob = labeling.queue(mc, config, annotator="bob", limit=6, mix=True)["items"]
         finally:
             mc.close()
         keys = [i["instance_key"] for i in bob]
         check("no cow is served twice in one batch", len(keys) == len(set(keys)), str(keys))
 
+        # Share 0 turns the mix off even when the page asks for it. Checked while
+        # the backlog still holds MY answered cows — which are not in my ordinary
+        # pool, so only the share can keep them out (the in-batch dedupe cannot).
+        config.annotation.points_backfill_share = 0.0
+        off = client.get("/api/label/queue?limit=5&mix=1").json()["items"]
+        check("share 0 serves no backlog cow",
+              not any(i["points_only"] for i in off)
+              and not answered_keys & {i["instance_key"] for i in off},
+              str([(i["instance_key"][:6], i["points_only"]) for i in off]))
+        config.annotation.points_backfill_share = 0.6
+
         # Backlog drained: the batch is ordinary again, by itself.
         for it in answered:
             check("points -> 200", _post_points(client, it, points=_points_for(it)).status_code == 200)
-        drained = client.get("/api/label/queue?limit=5").json()["items"]
+        drained = client.get("/api/label/queue?limit=5&mix=1").json()["items"]
         check("with the backlog empty the batch is all ordinary cows",
               len(drained) == 3 and not any(i["points_only"] for i in drained),
               str([(i["instance_key"][:6], i["points_only"]) for i in drained]))
-
-        # Share 0 turns the mix off entirely.
-        config.annotation.points_backfill_share = 0.0
-        lc = db.connect(config.paths.labels_db_path)
-        try:
-            labels_db.submit_annotation(lc, instance_key=drained[0]["instance_key"],
-                                        annotator="alice", outcome="labeled",
-                                        choices=[{"class_key": "sun_exposure.shaded",
-                                                  "group_key": "sun_exposure",
-                                                  "class_name": "Shaded"}])
-        finally:
-            lc.close()
-        off = client.get("/api/label/queue?limit=5").json()["items"]
-        check("share 0 serves no backlog cow", not any(i["points_only"] for i in off),
-              str([(i["instance_key"][:6], i["points_only"]) for i in off]))
 
 
 def test_points_only_backlog():
@@ -1153,7 +1158,7 @@ def test_points_only_backlog():
               backlog() == sorted([a["instance_key"], b["instance_key"], c["instance_key"]]),
               str(backlog()))
         check("progress counts the same backlog", count() == 3, str(count()))
-        mixed = client.get("/api/label/queue?limit=200").json()["items"]
+        mixed = client.get("/api/label/queue?limit=200&mix=1").json()["items"]
         check("the default queue never asks my answered cows' questions again",
               all(i["points_only"] for i in mixed
                   if i["instance_key"] in {a["instance_key"], b["instance_key"], c["instance_key"]}),
@@ -1176,6 +1181,17 @@ def test_points_only_backlog():
         check("both left the backlog, c remains",
               backlog() == [c["instance_key"]], str(backlog()))
         check("progress agrees", count() == 1, str(count()))
+        # ...for EVERYONE: one labeler's points are enough. A rule that slid to
+        # "this labeler's points" would still pass the two checks above, which
+        # ask from the writer's own view.
+        mc = db.connect(config.paths.db_path)
+        try:
+            bob_after = sorted(i["instance_key"] for i in labeling.queue(
+                mc, config, annotator="bob", limit=50, mode="points")["items"])
+        finally:
+            mc.close()
+        check("another labeler's backlog lost them too", bob_after == [c["instance_key"]],
+              str(bob_after))
 
         # A 'not a cow' verdict takes it out for everyone, as in the ordinary queue.
         r = client.post("/api/label/mask-fix", json={

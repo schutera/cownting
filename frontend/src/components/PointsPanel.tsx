@@ -158,6 +158,10 @@ function KeyButton({
     <button
       type="button"
       onClick={onClick}
+      // A click must not leave focus here: the panel stays mounted from one
+      // backlog cow to the next, and a focused button is one the browser
+      // "clicks" on Enter — on a cow nobody has looked at yet.
+      onMouseDown={(e) => e.preventDefault()}
       disabled={disabled}
       className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg border box-border text-[12px] cursor-pointer
                  transition-opacity duration-150 hover:opacity-80 disabled:opacity-40 disabled:cursor-default

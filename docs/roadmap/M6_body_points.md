@@ -146,6 +146,15 @@ The ordinary queue MIXES them in by itself while they last (owner's decision,
   with it. A backlog cow is asked the outline (only if this labeler has not
   judged it) and the points — `[1/2]`, `[2/2]` — no questions, no Classify step.
   `Enter` on the points saves them and the next cow comes.
+- **Opt-in.** The server mixes only when the request says `mix=1`, which only a
+  page that honours `points_only` sends. An older page — an open tab across a
+  deploy — would ask a backlog cow its questions and offer its flag, and either
+  write supersedes the labeler's own existing answer. Without the flag a client
+  gets the ordinary batch (adversarial review 2, 2026-10-18).
+- **No question, whatever is on screen.** `cowRules` (lib/pointSteps.ts) is the
+  one place the rule lives: a backlog cow allows no answer and no flag. The
+  guard is in `applyAnswer` itself, not in the panel — a removed backlog cow
+  walked back to shows no panel, and the letters used to reach the submit.
 - `GET /api/label/queue?mode=points` serves the backlog alone; the page does not
   use it.
 - **Order:** day term, legible first, under a panel first, then the per-labeler

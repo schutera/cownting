@@ -115,6 +115,22 @@ export function leavable(d: PointDraft, saved: readonly BodyPoint[] | "too_small
   return isComplete(d) && sameDraft(d, saved);
 }
 
+/** What a served cow may be asked, from the item alone (M6 §3.7).
+ *
+ * A backlog cow (`points_only`) gets the outline and the points: NO questions,
+ * because it already has answers — most often this labeler's own — and an
+ * answer submitted for it supersedes that answer; and NO flag, because a flag
+ * is an annotations row and supersedes it the same way. An ordinary cow gets
+ * everything. The page reads both from here, so the rule has one place and a
+ * test. */
+export function cowRules(item: { points_only?: boolean } | null): {
+  questions: boolean;
+  flag: boolean;
+} {
+  const backlog = item?.points_only === true;
+  return { questions: !backlog, flag: !backlog };
+}
+
 /** Whether `xy` (full-frame px) is a point the route will accept.
  *
  * `bounds` is the item's `point_bounds`, the route's own check, so this is the

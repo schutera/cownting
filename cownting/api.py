@@ -1741,7 +1741,8 @@ def create_app(config: Config) -> FastAPI:
     def label_queue(request: Request, limit: int | None = None,
                     exclude: str | None = None, camera: str | None = None,
                     day: str | None = None, dataset: str | None = None,
-                    mine: str = "todo", order: str = "fresh", mode: str = "full"):
+                    mine: str = "todo", order: str = "fresh", mode: str = "full",
+                    mix: bool = False):
         """One batch of instances to label (M3 §4.2). No leasing, no cursor:
         `exclude` is the comma-joined keys already in the client's buffer, and
         the queue is self-consuming, so re-fetching always advances. `dataset`
@@ -1760,7 +1761,7 @@ def create_app(config: Config) -> FastAPI:
             return labeling.queue(c, config, annotator=user["username"] or "local",
                                   limit=limit, exclude=keys, camera=camera,
                                   day=day, dataset=dataset, mine=mine, order=order,
-                                  mode=mode)
+                                  mode=mode, mix=mix)
         finally:
             c.close()
 

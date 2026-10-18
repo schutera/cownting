@@ -44,7 +44,7 @@ from .config import AnnotationCfg, Config
 # banner geometry). It is ETag material, so a render change invalidates every
 # cached crop; without it an annotator keeps being served last week's rendering
 # from their browser cache and a masking fix never reaches the people it protects.
-RENDER_VERSION = "1"
+RENDER_VERSION = "2"   # 2: the widest zoom rung is rendered at its real pad (2.5)
 
 # The alias the label store is ATTACHed under. Module-level because the queue SQL
 # is written against it and a mismatch is a "table not found" at runtime only.
@@ -616,7 +616,7 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
           limit: int | None = None, exclude: Sequence[str] = (),
           camera: str | None = None, day: str | None = None,
           dataset: str | None = None, mine: str = "todo", order: str = "fresh",
-          session_id: str | None = None, mode: str = "full") -> dict:
+          session_id: str | None = None, mode: str = "full", mix: bool = False) -> dict:
     """One batch of instances to label, plus the policy and scope that produced it.
 
     THE POINTS-ONLY BACKLOG (M6 §3.7): cows that already carry at least one
@@ -638,6 +638,14 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
     answer. When either list runs dry the other fills the slots, so an empty
     backlog means an ordinary queue again with no switch to flip.
     `mode="points"` serves the backlog alone.
+
+    The mix is OPT-IN (`mix=True`), sent only by a page that honours
+    `points_only`. A page that does not — an open tab still running the build
+    from before the mix, across a deploy — would show a backlog cow with its
+    questions and its flag, and an answer or a flag there SUPERSEDES the
+    labeler's own existing answer on the cow (most backlog cows are cows the
+    labeler answered). Without the flag a client gets the ordinary batch it
+    always got.
 
 
     Returns `{"items": [...], "matching": int, "policy": {...}, "filters": {...}}`;
@@ -688,7 +696,7 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             points_matching = matching
         else:
             ordinary = scan("full", n)
-            share = float(cfg.points_backfill_share)
+            share = float(cfg.points_backfill_share) if mix else 0.0
             backlog = scan("points", n) if share > 0 else []
             in_batch = {r["instance_key"] for r in ordinary}
             backlog = [r for r in backlog if r["instance_key"] not in in_batch]
@@ -730,8 +738,8 @@ def queue(con: duckdb.DuckDBPyConnection, config: Config, *, annotator: str,
             "points_backfill_share": cfg.points_backfill_share,
         },
         "filters": {"dataset": dataset, "camera": camera, "day": day,
-                    "mine": mine, "order": order, "mode": mode, "limit": n,
-                    "excluded": len(excl)},
+                    "mine": mine, "order": order, "mode": mode, "mix": bool(mix),
+                    "limit": n, "excluded": len(excl)},
     }
 
 
@@ -1115,7 +1123,14 @@ def crop_url(*, camera_id: str, frame_file: str, bbox: Sequence[float],
     if dataset_id:
         params.append(("dataset", dataset_id))
     params += [("x1", repr(x1)), ("y1", repr(y1)), ("x2", repr(x2)), ("y2", repr(y2)),
-               ("pad", repr(float(pad))), ("w", str(int(max_width)))]
+               ("pad", repr(float(pad))), ("w", str(int(max_width))),
+               # In the URL, not only in the ETag: the response is
+               # `max-age=3600`, so a browser holding a copy never asks and the
+               # ETag is never compared. A render change has to change the URL,
+               # or a fixed rendering reaches nobody for an hour (the widest
+               # rung's pad fix is the case that taught this). The route ignores
+               # the parameter.
+               ("v", RENDER_VERSION)]
     return (f"/api/img/label-crop/{quote(camera_id, safe='')}/{quote(frame_file, safe='')}"
             f"?{urlencode(params)}")
 

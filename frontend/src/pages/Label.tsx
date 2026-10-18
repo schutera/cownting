@@ -36,6 +36,7 @@ import { PointsPanel } from "../components/PointsPanel";
 import {
   POINT_STEPS,
   canHide,
+  cowRules,
   hide as hidePointIn,
   insideBounds,
   isComplete as pointsComplete,
@@ -496,11 +497,15 @@ export default function Label() {
   const reviewing = current !== null && tape.cursor < tape.frontier;
   const cropFailed = currentKey !== null && failedKey === currentKey;
   // A cow from the points-only BACKLOG (M6 §3.7): it already has answers, so
-  // it is asked the outline (if needed) and the points, and no question. Per
-  // cow, from the server: the queue mixes these into the ordinary batch while
-  // the backlog lasts, and the screen switches its steps with each cow, so a
-  // labeler never picks a mode.
-  const pointsOnly = current?.points_only === true;
+  // it is asked the outline (if needed) and the points, and no question and no
+  // flag. Per cow, from the server: the queue mixes these into the ordinary
+  // batch while the backlog lasts, and the screen switches its steps with each
+  // cow, so a labeler never picks a mode. cowRules is the one place the rule
+  // lives.
+  const rules = cowRules(current);
+  const asksQuestions = rules.questions;
+  const allowsFlag = rules.flag;
+  const pointsOnly = !asksQuestions;
   const flaggedReason = currentKey === null ? undefined : flaggedByKey[currentKey];
 
   const EMPTY_ANSWERS: Record<string, string> = useMemo(() => ({}), []);
@@ -721,6 +726,9 @@ export default function Label() {
       const q = await getLabelQueue({
         exclude: [...have, ...recentWrittenRef.current],
         order: "spread",
+        // This page switches its steps per cow on `points_only`, so it may be
+        // served backlog cows. The server mixes them in only on this flag.
+        mix: true,
       });
       const known = new Set([...have, ...recentWrittenRef.current]);
       const fresh = q.items.filter((i) => !known.has(i.instance_key));
@@ -1016,6 +1024,16 @@ export default function Label() {
   const applyAnswer = useCallback(
     (groupKey: string, classKey: string, mode: LabelInputMode) => {
       if (current === null || currentKey === null) return;
+      if (!asksQuestions) {
+        // A backlog cow is asked no question, whatever is on screen: it already
+        // has answers, most often this labeler's own, and one submitted here
+        // would supersede them. The panel is not the guard — a removed backlog
+        // cow, walked back to, shows no panel at all, and the letters used to
+        // reach this point anyway.
+        shake();
+        showHint("no questions on a points-only cow — → goes on");
+        return;
+      }
       if (cropFailed) {
         // Not a silent refusal: there are no pixels to judge, and F is the way out.
         shake();
@@ -1108,6 +1126,7 @@ export default function Label() {
       activeNow,
       advance,
       answers,
+      asksQuestions,
       commitAnswers,
       cropFailed,
       current,
@@ -1733,6 +1752,14 @@ export default function Label() {
     if (plain && (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === " ")) {
       e.preventDefault();
     }
+    // A HELD Enter does nothing. Every step's Enter acts once per press, and an
+    // auto-repeat that reached the browser instead "clicked" whatever button had
+    // focus — after a mouse click on "Too small", one held Enter marked each
+    // following backlog cow too small, unseen.
+    if (e.key === "Enter" && e.repeat) {
+      e.preventDefault();
+      return;
+    }
 
     if (e.key === " ") {
       if (!plain) return;
@@ -1758,7 +1785,7 @@ export default function Label() {
     // answer on the cow — in a pass over cows they already answered, one F
     // would destroy that answer. X on the outline step (no cow) and S (too
     // small) are the ways out here, and → skips a crop that cannot be shown.
-    if (pointsOnly && plain && (e.key === "f" || e.key === "F")) {
+    if (!allowsFlag && plain && (e.key === "f" || e.key === "F")) {
       e.preventDefault();
       shake();
       showHint("no flags on a points-only cow — S if it is too small, X on the outline if there is no cow");
@@ -2278,10 +2305,17 @@ export default function Label() {
               onAccept={() => acceptPoints("mouse")}
             />
           ) : pointsOnly ? (
-            // A backlog cow is asked no question. The only way here is a crop
-            // that could not be shown (the alert above says → skips it); the
-            // empty panel keeps PANEL_H so nothing on the card moves.
-            <div style={{ height: PANEL_H }} aria-hidden="true" />
+            // A backlog cow is asked no question. Two ways lead here: a crop
+            // that could not be shown (the alert above says → skips it), or a
+            // cow this labeler removed as not-a-cow and walked back to. The
+            // panel keeps PANEL_H so nothing on the card moves, and says the
+            // one thing left to do.
+            <div
+              className="box-border w-full grid place-items-center text-[12px]"
+              style={{ height: PANEL_H, color: INK_DIM }}
+            >
+              {cropFailed ? null : "Nothing more to do on this cow — → goes on."}
+            </div>
           ) : (
             <QuestionPanel
               group={activeGroup}

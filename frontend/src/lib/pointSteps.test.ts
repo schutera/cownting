@@ -3,6 +3,7 @@ import {
   POINT_COUNT,
   POINT_STEPS,
   canHide,
+  cowRules,
   hide,
   insideBounds,
   isComplete,
@@ -141,6 +142,19 @@ describe("leavable", () => {
   it("is true over a stored 'too small' only while nothing was placed", () => {
     expect(leavable([], "too_small")).toBe(true);
     expect(leavable([P], "too_small")).toBe(false);
+  });
+});
+
+describe("cowRules", () => {
+  it("asks a backlog cow no question and allows it no flag", () => {
+    // Either would supersede the labeler's own existing answer on the cow.
+    expect(cowRules({ points_only: true })).toEqual({ questions: false, flag: false });
+  });
+
+  it("asks an ordinary cow everything", () => {
+    expect(cowRules({ points_only: false })).toEqual({ questions: true, flag: true });
+    expect(cowRules({})).toEqual({ questions: true, flag: true });
+    expect(cowRules(null)).toEqual({ questions: true, flag: true });
   });
 });
 
